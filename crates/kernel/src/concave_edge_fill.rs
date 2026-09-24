@@ -198,7 +198,9 @@ pub(crate) fn finish_with_fills(
         .ok_or_else(not_found)?;
     let mapped = free_edges
         .iter()
-        .map(|edge| successor_of(&body.topology, edge, precision).map(|index| entity_of(&body, index)))
+        .map(|edge| {
+            successor_of(&body.topology, edge, precision).map(|index| entity_of(&body, index))
+        })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(not_found)?;
     let ladder_refusal = match ladder(&body, &mapped) {
@@ -652,9 +654,13 @@ fn combine(
         precision,
         operation,
     };
-    let outcome =
-        crate::NativeKernel::execute_boolean(body, tool, &request, &crate::CancellationToken::new())
-            .map_err(|error| error.to_string())?;
+    let outcome = crate::NativeKernel::execute_boolean(
+        body,
+        tool,
+        &request,
+        &crate::CancellationToken::new(),
+    )
+    .map_err(|error| error.to_string())?;
     if outcome
         .report
         .rung
@@ -712,19 +718,24 @@ fn cut_against_fill(
         let own_faces = oriented_faces_of_edge(&body.topology, index).unwrap_or([usize::MAX; 2]);
         let angle_tolerance = precision.angular_agreement_radians.max(1.0e-9);
         let along = unit(endpoints[1] - endpoints[0]).unwrap_or_default();
-        let touches_band = body.topology.faces.iter().enumerate().any(|(face, record)| {
-            if own_faces.contains(&face) || !face_has_vertex(&body.topology, face, vertex.0) {
-                return false;
-            }
-            match record.value.surface {
-                Surface::Cylinder(_) => true,
-                Surface::Plane(plane) => unit(plane.normal).is_some_and(|normal| {
-                    let cosine = normal.dot(along).abs();
-                    cosine > angle_tolerance && cosine < 1.0 - angle_tolerance
-                }),
-                _ => false,
-            }
-        });
+        let touches_band = body
+            .topology
+            .faces
+            .iter()
+            .enumerate()
+            .any(|(face, record)| {
+                if own_faces.contains(&face) || !face_has_vertex(&body.topology, face, vertex.0) {
+                    return false;
+                }
+                match record.value.surface {
+                    Surface::Cylinder(_) => true,
+                    Surface::Plane(plane) => unit(plane.normal).is_some_and(|normal| {
+                        let cosine = normal.dot(along).abs();
+                        cosine > angle_tolerance && cosine < 1.0 - angle_tolerance
+                    }),
+                    _ => false,
+                }
+            });
         if touches_band {
             overshoot[slot] = 0.0;
         } else {
@@ -739,15 +750,15 @@ fn cut_against_fill(
     let target = entity_of(body, index);
     let tool = removal_tool_between(&body.topology, target, kind, distance, overshoot, precision)
         .map_err(|error| {
-            refuse(
-                "CONCAVE_EDGE_MIXED_SELECTION_UNSUPPORTED",
-                format!(
-                    "A convex edge of this selection meets a concave one, and its band could not \
+        refuse(
+            "CONCAVE_EDGE_MIXED_SELECTION_UNSUPPORTED",
+            format!(
+                "A convex edge of this selection meets a concave one, and its band could not \
                      be cut against the fill: {}",
-                    error.message
-                ),
-            )
-        })?;
+                error.message
+            ),
+        )
+    })?;
     let cut = combine(body, &tool, BooleanOperation::Difference, precision).map_err(|error| {
         refuse(
             "CONCAVE_EDGE_MIXED_SELECTION_UNSUPPORTED",
@@ -881,14 +892,18 @@ fn end_runs_out(
 
 fn face_has_vertex(topology: &Topology, face: usize, vertex: usize) -> bool {
     topology.faces[face].value.loops().any(|loop_key| {
-        topology.loops[loop_key.0].value.coedges.iter().any(|coedge| {
-            let edge = topology.coedges[coedge.0].value.edge;
-            topology.edges[edge.0]
-                .value
-                .vertices
-                .iter()
-                .any(|key| key.0 == vertex)
-        })
+        topology.loops[loop_key.0]
+            .value
+            .coedges
+            .iter()
+            .any(|coedge| {
+                let edge = topology.coedges[coedge.0].value.edge;
+                topology.edges[edge.0]
+                    .value
+                    .vertices
+                    .iter()
+                    .any(|key| key.0 == vertex)
+            })
     })
 }
 

@@ -602,7 +602,11 @@ pub(crate) fn straight(start: ProtocolPoint2, end: ProtocolPoint2) -> PlanarCurv
 /// towards the edge. The major arc through the far side of the circle is a
 /// different shape entirely, and picking it silently is how a removal solid
 /// stops being a fillet without anything saying so.
-pub(crate) fn minor_arc(start: ProtocolPoint2, end: ProtocolPoint2, center: ProtocolPoint2) -> PlanarCurve2 {
+pub(crate) fn minor_arc(
+    start: ProtocolPoint2,
+    end: ProtocolPoint2,
+    center: ProtocolPoint2,
+) -> PlanarCurve2 {
     let angle = |point: ProtocolPoint2| (point.y - center.y).atan2(point.x - center.x);
     let mut sweep = angle(end) - angle(start);
     while sweep <= -std::f64::consts::PI {

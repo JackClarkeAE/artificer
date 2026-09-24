@@ -679,6 +679,137 @@ fn a_concave_rim_finishes_at_every_size() {
     );
 }
 
+/// Every edge both of whose chord ends pass the filter.
+fn edges_where(snapshot: &Snapshot, keep: impl Fn(Point3) -> bool) -> Vec<EntityRef> {
+    let scene = NativeKernel::debug_scene(snapshot);
+    let mut found: Vec<EntityRef> = Vec::new();
+    for edge in &scene.edges {
+        let [a, b] = edge.endpoints;
+        if keep(a) && keep(b) && !found.contains(&edge.source_edge) {
+            found.push(edge.source_edge);
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "the fixture has edges passing the filter"
+    );
+    found
+}
+
+#[test]
+fn a_boss_on_a_side_wall_fillets_by_pappus() {
+    // The boss stands on the x = 40 wall, about the axis through (y, z) =
+    // (20, 10): nothing about the rim is aligned with the frame a cap gives.
+    let block = cuboid((0.0, 0.0, 0.0), BLOCK, "block");
+    let wall = face_where(&block, |centre| (centre.x - 40.0).abs() < 1.0e-6);
+    let (radius, height, d) = (6.0, 5.0, 1.5);
+    let body = build(
+        &block,
+        KernelCommand::ExtrudeFacePlanarProfile {
+            target_face: wall,
+            // u along y, v along z: the frame's normal is +x, the wall's.
+            frame: PlanarFrame3::new(
+                Point3::new(40.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+            ),
+            profile: PlanarProfile2 {
+                regions: vec![PlanarRegion2 {
+                    outer: circle((20.0, 10.0), radius),
+                    holes: vec![],
+                }],
+            },
+            distance: height,
+            operation: FaceExtrusionOperation::Add,
+        },
+        "side boss",
+    );
+    let before = body.measures().volume;
+    let on_rim = |at_radius: f64, x: f64| {
+        move |point: Point3| {
+            (point.x - x).abs() < 1.0e-6
+                && ((point.y - 20.0).hypot(point.z - 10.0) - at_radius).abs() < 1.0e-6
+        }
+    };
+    let outcome = finish(
+        &body,
+        edges_where(&body, on_rim(radius, 40.0)),
+        EdgeFinishKind::Fillet,
+        d,
+    )
+    .expect("a boss rim on a side wall fillets");
+    assert_exact(&outcome, "edge-finish/concave-rim-blend", "side wall boss");
+    assert_close(
+        outcome.snapshot.measures().volume - before,
+        concave_rim_fillet(radius, d, true),
+        "material a side-wall boss fillet adds",
+    );
+    assert_smooth_along(
+        &outcome.snapshot,
+        on_rim(radius + d, 40.0),
+        "against the wall",
+    );
+    assert_smooth_along(
+        &outcome.snapshot,
+        on_rim(radius, 40.0 + d),
+        "against the boss",
+    );
+}
+
+/// The corner region of a fillet in an air wedge of angle `alpha`, per unit
+/// length: `r²·cot(α/2) − ½r²(π − α)`.
+fn oblique_fillet_area(r: f64, alpha: f64) -> f64 {
+    let half = alpha / 2.0;
+    r * r * (half.cos() / half.sin()) - 0.5 * r * r * (PI - alpha)
+}
+
+#[test]
+fn a_reflex_edge_with_an_oblique_wedge_fills_by_its_own_closed_form() {
+    // The L's upright arm leans: the reflex corner at (6, 4) opens between
+    // the +x direction and (−4, 5), an air wedge of atan2(5, −4).
+    let body = prism(
+        polygon(&[
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 4.0),
+            (6.0, 4.0),
+            (2.0, 9.0),
+            (0.0, 9.0),
+        ]),
+        Vec::new(),
+        7.0,
+        "leaning L",
+    );
+    let body = drill(&body, 7.0, (3.0, 3.0), 1.0, 3.0);
+    let before = body.measures().volume;
+    let alpha = 5.0_f64.atan2(-4.0);
+    let mut trouble = Vec::new();
+    for step in 1..=20 {
+        let size = f64::from(step) * 0.12;
+        for kind in [EdgeFinishKind::Fillet, EdgeFinishKind::Chamfer] {
+            let want = match kind {
+                EdgeFinishKind::Fillet => oblique_fillet_area(size, alpha) * 7.0,
+                EdgeFinishKind::Chamfer => 0.5 * size * size * alpha.sin() * 7.0,
+            };
+            match finish(&body, vec![vertical_edge(&body, 6.0, 4.0)], kind, size) {
+                Ok(outcome) => {
+                    let got = outcome.snapshot.measures().volume - before;
+                    if ((got - want) / want).abs() > 1.0e-9 {
+                        trouble.push(format!("{kind:?} {size:.2}: added {got}, wanted {want}"));
+                    }
+                }
+                Err(error) => trouble.push(format!("{kind:?} {size:.2}: {error}")),
+            }
+        }
+    }
+    assert!(
+        trouble.is_empty(),
+        "{} of 40 oblique fills refused or drifted:\n{}",
+        trouble.len(),
+        trouble.join("\n")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The shared drilled L-block
 // ---------------------------------------------------------------------------
@@ -781,7 +912,7 @@ fn a_reflex_edge_of_a_drilled_block_chamfers_by_prism_arithmetic() {
     assert!(
         scene.edges.iter().all(|edge| {
             let keep = on_vertical(6.0, 4.0 + d);
-            !(keep(edge.endpoints[0]) && keep(edge.endpoints[1])) || !edge.is_tangent
+            !(keep(edge.endpoints[0]) && keep(edge.endpoints[1]) && edge.is_tangent)
         }),
         "a bevel's edge is not a tangent rail"
     );
@@ -817,7 +948,10 @@ fn drilled_u_channel() -> Snapshot {
 fn a_drilled_u_channel_fills_both_inner_edges() {
     let body = drilled_u_channel();
     let before = body.measures().volume;
-    let inner = vec![vertical_edge(&body, 5.0, 5.0), vertical_edge(&body, 25.0, 5.0)];
+    let inner = vec![
+        vertical_edge(&body, 5.0, 5.0),
+        vertical_edge(&body, 25.0, 5.0),
+    ];
     let r = 2.0;
     let rounded = finish(&body, inner.clone(), EdgeFinishKind::Fillet, r)
         .expect("both inner edges of a drilled channel fillet");
@@ -828,7 +962,11 @@ fn a_drilled_u_channel_fills_both_inner_edges() {
         "material two inner fillets add",
     );
     for x in [5.0 + r, 25.0 - r] {
-        assert_smooth_along(&rounded.snapshot, on_vertical(x, 5.0), "U fillet against the base");
+        assert_smooth_along(
+            &rounded.snapshot,
+            on_vertical(x, 5.0),
+            "U fillet against the base",
+        );
     }
     for x in [5.0, 25.0] {
         assert_smooth_along(
@@ -957,7 +1095,10 @@ fn the_l_block_finishes_its_concave_and_convex_edges_in_one_call() {
         })
         .collect::<Vec<_>>();
     assert_eq!(top.len(), 6, "the six straight edges of the top face");
-    for (kind, size) in [(EdgeFinishKind::Fillet, 1.0), (EdgeFinishKind::Chamfer, 0.8)] {
+    for (kind, size) in [
+        (EdgeFinishKind::Fillet, 1.0),
+        (EdgeFinishKind::Chamfer, 0.8),
+    ] {
         let mut targets = vec![vertical_edge(&body, 6.0, 4.0)];
         targets.extend(top.iter().copied());
         let outcome = finish(&body, targets, kind, size)
@@ -994,13 +1135,20 @@ fn a_cube_with_all_twelve_edges_filleted_builds() {
     assert_eq!(all.len(), 12);
     let outcome = finish(&cube, all, EdgeFinishKind::Fillet, r).expect("all twelve edges round");
     assert_valid(&outcome.snapshot);
-    assert!(outcome.report.warnings.is_empty(), "{:?}", outcome.report.warnings);
+    assert!(
+        outcome.report.warnings.is_empty(),
+        "{:?}",
+        outcome.report.warnings
+    );
     // Minkowski: the inner cube, six slabs, twelve quarter rods, eight
     // sphere octants.
     let inner = side - 2.0 * r;
     assert_close(
         outcome.snapshot.measures().volume,
-        inner.powi(3) + 6.0 * inner * inner * r + 3.0 * inner * PI * r * r + 4.0 / 3.0 * PI * r.powi(3),
+        inner.powi(3)
+            + 6.0 * inner * inner * r
+            + 3.0 * inner * PI * r * r
+            + 4.0 / 3.0 * PI * r.powi(3),
         "a cube rounded on every edge",
     );
 }
