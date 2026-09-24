@@ -1729,23 +1729,32 @@ impl NativeKernel {
                             }
                             Ok((topology, approximation))
                         };
+                        // The prism reduction's answer is held to the solid
+                        // validator like every other exact candidate: a
+                        // notch cut part-way into a plate with holes in it
+                        // used to come back from it with edges used the
+                        // wrong number of times, and the general engine,
+                        // which builds that notch cleanly, never got its
+                        // turn.
                         let prism = prism_boolean::build_prism_boolean(
                             &input.topology,
                             &tool,
                             boolean_operation,
                             request.precision,
-                        );
+                        )
+                        .ok()
+                        .and_then(|topology| exact_candidate(topology, request.precision).ok());
                         // Both operations go on to the general engine. A cut
                         // is the difference it certifies; an add is the union
                         // — which since ADR 0045 resolves a boss whose rim
                         // coincides with the face's own boundary or a hole's,
                         // the commonest boss there is.
                         let topology = match prism {
-                            Ok(topology) => {
+                            Some(topology) => {
                                 rung = "face-feature/exact-prism";
                                 topology
                             }
-                            Err(_) => match analytic() {
+                            None => match analytic() {
                                 Ok((topology, approximation)) => {
                                     rung = match approximation {
                                         Some((approximation, decline)) => {

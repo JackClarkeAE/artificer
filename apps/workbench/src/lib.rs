@@ -51,7 +51,6 @@ use artificer_catalog::CatalogStore;
 use artificer_compute::{
     ComputePool, ExecutionMode, JobError, JobHandle, JobPriority, JobScheduler,
 };
-use artificer_geometry::{Orientation2, Point2 as GeometryPoint2, orient2d};
 use artificer_kernel::{
     CancellationToken, DebugScene, ExecutionOutcome, FaceBoundaryCurve2, FaceRole, NativeKernel,
     PlanarFaceSupport, Snapshot, SnapshotMeasures,
@@ -1650,7 +1649,6 @@ pub enum SketchExtrusionEligibility {
     NumericallyIndeterminate,
     FaceRectangleRequired,
     ProfileOutsideSupport,
-    BooleanUnionRequired,
 }
 
 impl SketchExtrusionEligibility {
@@ -1721,11 +1719,7 @@ impl SketchExtrusionEligibility {
                     .to_owned(),
             ),
             Self::ProfileOutsideSupport => Some(
-                "The feature loop must stay inside the selected face material and outside every face hole."
-                    .to_owned(),
-            ),
-            Self::BooleanUnionRequired => Some(
-                "The selected regions cross a face edge or hole. Rejoining those material islands is a same-body Boolean union, not a regular face extrusion; that exact merge is not implemented yet."
+                "The selected profile lies wholly outside the face's material: off its edge, or inside a hole. Draw at least part of it on the face."
                     .to_owned(),
             ),
         }
@@ -1748,8 +1742,7 @@ impl SketchExtrusionEligibility {
             | Self::Concave
             | Self::CollinearTurn
             | Self::FaceRectangleRequired
-            | Self::ProfileOutsideSupport
-            | Self::BooleanUnionRequired => KernelErrorCode::InvalidInput,
+            | Self::ProfileOutsideSupport => KernelErrorCode::InvalidInput,
         }
     }
 }
@@ -26368,6 +26361,13 @@ fn classify_selected_planar_profile(
     SketchExtrusionEligibility::Ready
 }
 
+/// Whether a straight-sided profile on a face is one the kernel can build a
+/// feature from: it must reach the face's material somewhere. A profile that
+/// crosses the face's edge or a hole's rim is not refused here — half a
+/// rectangle over the edge is an everyday boss or notch, and the kernel
+/// reformulates it exactly as a Boolean with the whole solid — only one that
+/// lies wholly off the face or wholly inside a hole, which no feature could
+/// come from.
 fn classify_face_profile_domain(
     vertices: &[SketchPoint],
     boundary: &[ProtocolPoint2],
@@ -26382,12 +26382,14 @@ fn classify_face_profile_domain(
     {
         return SketchExtrusionEligibility::FaceRectangleRequired;
     }
-    const MARGIN: f64 = 1.0e-5;
     let profile = vertices
         .iter()
         .map(|point| ProtocolPoint2::new(point.u, point.v))
         .collect::<Vec<_>>();
-    let intersects_material = profile
+    // A vertex or an edge's midpoint on the material, or the material's own
+    // outline caught inside the profile: any of these is a profile that
+    // touches the face.
+    let reaches_material = profile
         .iter()
         .copied()
         .any(|point| point_in_face_material_2d(point, boundary, inner_boundaries))
@@ -26399,45 +26401,16 @@ fn classify_face_profile_domain(
                 boundary,
                 inner_boundaries,
             )
-        });
-    if profile.iter().any(|point| {
-        !point_strictly_inside_loop(*point, boundary, MARGIN)
-            || inner_boundaries.iter().any(|inner| {
-                point_in_loop(*point, inner) || point_loop_distance(*point, inner) <= MARGIN
-            })
-    }) {
-        return if intersects_material {
-            SketchExtrusionEligibility::BooleanUnionRequired
-        } else {
-            SketchExtrusionEligibility::ProfileOutsideSupport
-        };
+        })
+        || boundary
+            .iter()
+            .chain(inner_boundaries.iter().flatten())
+            .any(|point| point_in_loop(*point, &profile));
+    if reaches_material {
+        SketchExtrusionEligibility::Ready
+    } else {
+        SketchExtrusionEligibility::ProfileOutsideSupport
     }
-    for index in 0..profile.len() {
-        let edge = [profile[index], profile[(index + 1) % profile.len()]];
-        if segment_loop_distance(edge, boundary) <= MARGIN
-            || inner_boundaries
-                .iter()
-                .any(|inner| segment_loop_distance(edge, inner) <= MARGIN)
-        {
-            return if intersects_material {
-                SketchExtrusionEligibility::BooleanUnionRequired
-            } else {
-                SketchExtrusionEligibility::ProfileOutsideSupport
-            };
-        }
-    }
-    if inner_boundaries.iter().any(|inner| {
-        inner
-            .first()
-            .is_some_and(|point| point_in_loop(*point, &profile))
-    }) {
-        return if intersects_material {
-            SketchExtrusionEligibility::BooleanUnionRequired
-        } else {
-            SketchExtrusionEligibility::ProfileOutsideSupport
-        };
-    }
-    SketchExtrusionEligibility::Ready
 }
 
 fn point_in_face_material_2d(
@@ -26451,6 +26424,8 @@ fn point_in_face_material_2d(
             .all(|inner| !point_in_loop(point, inner))
 }
 
+/// As [`classify_face_profile_domain`], for a whole circle: it is refused
+/// only when it lies wholly off the face or wholly inside a hole.
 fn classify_face_circle_domain(
     center: SketchPoint,
     rim: SketchPoint,
@@ -26467,29 +26442,35 @@ fn classify_face_circle_domain(
         return SketchExtrusionEligibility::FaceRectangleRequired;
     }
     const MARGIN: f64 = 1.0e-5;
-    let center = ProtocolPoint2::new(center.u, center.v);
-    let radius = rim
-        .distance_squared(SketchPoint::new(center.x, center.y))
-        .sqrt();
-    if !radius.is_finite()
-        || radius <= MARGIN
-        || !point_in_loop(center, boundary)
-        || point_loop_distance(center, boundary) <= radius + MARGIN
-        || inner_boundaries.iter().any(|inner| {
-            point_in_loop(center, inner) || point_loop_distance(center, inner) <= radius + MARGIN
-        })
-    {
+    let radius = rim.distance_squared(center).sqrt();
+    if !radius.is_finite() || radius <= MARGIN {
         return SketchExtrusionEligibility::ProfileOutsideSupport;
     }
-    SketchExtrusionEligibility::Ready
-}
-
-fn point_strictly_inside_loop(
-    point: ProtocolPoint2,
-    loop_points: &[ProtocolPoint2],
-    margin: f64,
-) -> bool {
-    point_in_loop(point, loop_points) && point_loop_distance(point, loop_points) > margin
+    // The centre, thirty-two points round the rim, or a point of the face's
+    // outline inside the circle: any on the material is a circle that
+    // touches the face.
+    let centre = ProtocolPoint2::new(center.u, center.v);
+    let reaches_material = point_in_face_material_2d(centre, boundary, inner_boundaries)
+        || (0..32).any(|step| {
+            let angle = f64::from(step) * std::f64::consts::TAU / 32.0;
+            point_in_face_material_2d(
+                ProtocolPoint2::new(
+                    radius.mul_add(angle.cos(), centre.x),
+                    radius.mul_add(angle.sin(), centre.y),
+                ),
+                boundary,
+                inner_boundaries,
+            )
+        })
+        || boundary
+            .iter()
+            .chain(inner_boundaries.iter().flatten())
+            .any(|point| (point.x - centre.x).hypot(point.y - centre.y) < radius - MARGIN);
+    if reaches_material {
+        SketchExtrusionEligibility::Ready
+    } else {
+        SketchExtrusionEligibility::ProfileOutsideSupport
+    }
 }
 
 fn point_in_loop(point: ProtocolPoint2, loop_points: &[ProtocolPoint2]) -> bool {
@@ -26505,91 +26486,6 @@ fn point_in_loop(point: ProtocolPoint2, loop_points: &[ProtocolPoint2]) -> bool 
         }
     }
     inside
-}
-
-fn point_loop_distance(point: ProtocolPoint2, loop_points: &[ProtocolPoint2]) -> f64 {
-    (0..loop_points.len())
-        .map(|index| {
-            point_segment_distance_2d(
-                point,
-                loop_points[index],
-                loop_points[(index + 1) % loop_points.len()],
-            )
-        })
-        .fold(f64::INFINITY, f64::min)
-}
-
-fn segment_loop_distance(segment: [ProtocolPoint2; 2], loop_points: &[ProtocolPoint2]) -> f64 {
-    (0..loop_points.len())
-        .map(|index| {
-            segment_distance_2d(
-                segment,
-                [
-                    loop_points[index],
-                    loop_points[(index + 1) % loop_points.len()],
-                ],
-            )
-        })
-        .fold(f64::INFINITY, f64::min)
-}
-
-fn segment_distance_2d(first: [ProtocolPoint2; 2], second: [ProtocolPoint2; 2]) -> f64 {
-    let orientations = [
-        orient2d(
-            GeometryPoint2::new(first[0].x, first[0].y),
-            GeometryPoint2::new(first[1].x, first[1].y),
-            GeometryPoint2::new(second[0].x, second[0].y),
-        ),
-        orient2d(
-            GeometryPoint2::new(first[0].x, first[0].y),
-            GeometryPoint2::new(first[1].x, first[1].y),
-            GeometryPoint2::new(second[1].x, second[1].y),
-        ),
-        orient2d(
-            GeometryPoint2::new(second[0].x, second[0].y),
-            GeometryPoint2::new(second[1].x, second[1].y),
-            GeometryPoint2::new(first[0].x, first[0].y),
-        ),
-        orient2d(
-            GeometryPoint2::new(second[0].x, second[0].y),
-            GeometryPoint2::new(second[1].x, second[1].y),
-            GeometryPoint2::new(first[1].x, first[1].y),
-        ),
-    ];
-    let opposite = |left: Orientation2, right: Orientation2| {
-        matches!(
-            (left, right),
-            (Orientation2::Clockwise, Orientation2::CounterClockwise)
-                | (Orientation2::CounterClockwise, Orientation2::Clockwise)
-        )
-    };
-    if opposite(orientations[0], orientations[1]) && opposite(orientations[2], orientations[3]) {
-        return 0.0;
-    }
-    [
-        point_segment_distance_2d(first[0], second[0], second[1]),
-        point_segment_distance_2d(first[1], second[0], second[1]),
-        point_segment_distance_2d(second[0], first[0], first[1]),
-        point_segment_distance_2d(second[1], first[0], first[1]),
-    ]
-    .into_iter()
-    .fold(f64::INFINITY, f64::min)
-}
-
-fn point_segment_distance_2d(
-    point: ProtocolPoint2,
-    start: ProtocolPoint2,
-    end: ProtocolPoint2,
-) -> f64 {
-    let delta = ProtocolPoint2::new(end.x - start.x, end.y - start.y);
-    let length_squared = delta.x.mul_add(delta.x, delta.y * delta.y);
-    if !length_squared.is_finite() || length_squared <= 0.0 {
-        return f64::INFINITY;
-    }
-    let projection =
-        ((point.x - start.x) * delta.x + (point.y - start.y) * delta.y) / length_squared;
-    let parameter = projection.clamp(0.0, 1.0);
-    (point.x - (start.x + parameter * delta.x)).hypot(point.y - (start.y + parameter * delta.y))
 }
 
 fn workbench_extrusion_error(
@@ -28685,6 +28581,49 @@ mod extrusion_workbench_tests {
         app
     }
 
+    /// A rectangle drawn half off the face is an everyday boss or notch. The
+    /// preflight used to refuse it as a Boolean union "not implemented yet"
+    /// while the kernel had long built it; now it is ready, stages, and
+    /// commits, as a boss over the edge and as a notch part-way down.
+    #[test]
+    fn a_rectangle_hanging_off_the_face_extrudes_as_a_boss_and_a_notch() {
+        for (mode, distance, expected) in [
+            (ExtrusionMode::Add, 1.0, 24.0 + 1.0),
+            (ExtrusionMode::Cut, -0.5, 24.0 - 0.25),
+        ] {
+            let mut app = finished_face_rectangle_app(mode);
+            // The face is 2 × 3 about its own centre: a unit square from
+            // u = 0.5 hangs half over the u = 1 edge.
+            replace_finished_face_geometry(
+                &mut app,
+                [SketchGeometry::rectangle(point(0.5, -0.5), point(1.5, 0.5))],
+                mode,
+                distance,
+            );
+            assert_eq!(
+                app.sketch_extrusion_eligibility(),
+                SketchExtrusionEligibility::Ready,
+                "{mode:?}"
+            );
+            assert!(
+                app.stage_sketch_extrusion(),
+                "{mode:?}: {:?}",
+                app.document_status
+            );
+            assert!(
+                app.confirm_pending_operation(),
+                "{mode:?}: {:?}",
+                app.document_status
+            );
+            assert_eq!(app.last_error_code(), None, "{mode:?}");
+            let volume = app.displayed_measures().expect("a body").volume;
+            assert!(
+                (volume - expected).abs() < 1.0e-9,
+                "{mode:?}: {volume} vs {expected}"
+            );
+        }
+    }
+
     fn replace_finished_face_geometry(
         app: &mut KernelLabApp,
         geometries: impl IntoIterator<Item = SketchGeometry>,
@@ -28865,6 +28804,9 @@ mod extrusion_workbench_tests {
             ProtocolPoint2::new(0.5, 0.5),
             ProtocolPoint2::new(0.5, -0.5),
         ];
+        let classify = |profile: &[SketchPoint]| {
+            classify_face_profile_domain(profile, &outer, std::slice::from_ref(&hole))
+        };
         let material_profile = [
             point(1.0, -0.5),
             point(2.0, -0.5),
@@ -28872,10 +28814,12 @@ mod extrusion_workbench_tests {
             point(1.0, 0.5),
         ];
         assert_eq!(
-            classify_face_profile_domain(&material_profile, &outer, std::slice::from_ref(&hole)),
+            classify(&material_profile),
             SketchExtrusionEligibility::Ready
         );
 
+        // Wholly inside the hole, or wholly off the face: no feature could
+        // come from it.
         let inside_hole = [
             point(-0.25, -0.25),
             point(0.25, -0.25),
@@ -28883,21 +28827,41 @@ mod extrusion_workbench_tests {
             point(-0.25, 0.25),
         ];
         assert_eq!(
-            classify_face_profile_domain(&inside_hole, &outer, std::slice::from_ref(&hole)),
+            classify(&inside_hole),
+            SketchExtrusionEligibility::ProfileOutsideSupport
+        );
+        let off_the_face = [
+            point(4.0, -1.0),
+            point(6.0, -1.0),
+            point(6.0, 1.0),
+            point(4.0, 1.0),
+        ];
+        assert_eq!(
+            classify(&off_the_face),
             SketchExtrusionEligibility::ProfileOutsideSupport
         );
 
+        // Crossing the face's edge, crossing a hole's rim, enclosing a hole,
+        // or enclosing the whole face: the kernel builds each as a Boolean
+        // with the solid, so each is ready.
+        let half_over_the_edge = [
+            point(2.0, -1.0),
+            point(4.0, -1.0),
+            point(4.0, 1.0),
+            point(2.0, 1.0),
+        ];
+        assert_eq!(
+            classify(&half_over_the_edge),
+            SketchExtrusionEligibility::Ready,
+            "a rectangle hanging off the face is a boss or a notch"
+        );
         let encloses_hole = [
             point(-1.0, -1.0),
             point(1.0, -1.0),
             point(1.0, 1.0),
             point(-1.0, 1.0),
         ];
-        assert_eq!(
-            classify_face_profile_domain(&encloses_hole, &outer, std::slice::from_ref(&hole),),
-            SketchExtrusionEligibility::BooleanUnionRequired
-        );
-
+        assert_eq!(classify(&encloses_hole), SketchExtrusionEligibility::Ready);
         let spoke_crossing_the_void = [
             point(0.0, -0.2),
             point(2.0, -0.2),
@@ -28905,13 +28869,50 @@ mod extrusion_workbench_tests {
             point(0.0, 0.2),
         ];
         assert_eq!(
-            classify_face_profile_domain(
-                &spoke_crossing_the_void,
+            classify(&spoke_crossing_the_void),
+            SketchExtrusionEligibility::Ready,
+            "a spoke that reaches from a face void into material is a union bridge"
+        );
+        let encloses_the_face = [
+            point(-5.0, -5.0),
+            point(5.0, -5.0),
+            point(5.0, 5.0),
+            point(-5.0, 5.0),
+        ];
+        assert_eq!(
+            classify(&encloses_the_face),
+            SketchExtrusionEligibility::Ready
+        );
+
+        // Circles by the same rule.
+        let circle = |centre: (f64, f64), radius: f64| {
+            classify_face_circle_domain(
+                point(centre.0, centre.1),
+                point(centre.0 + radius, centre.1),
                 &outer,
                 std::slice::from_ref(&hole),
-            ),
-            SketchExtrusionEligibility::BooleanUnionRequired,
-            "a spoke that reaches from a face void into material is a union bridge, not an invalid closed profile"
+            )
+        };
+        assert_eq!(circle((2.0, 0.0), 0.5), SketchExtrusionEligibility::Ready);
+        assert_eq!(
+            circle((3.0, 0.0), 1.0),
+            SketchExtrusionEligibility::Ready,
+            "half a circle over the edge"
+        );
+        assert_eq!(
+            circle((0.0, 0.0), 1.0),
+            SketchExtrusionEligibility::Ready,
+            "a ring round the hole"
+        );
+        assert_eq!(
+            circle((0.0, 0.0), 0.25),
+            SketchExtrusionEligibility::ProfileOutsideSupport,
+            "wholly inside the hole"
+        );
+        assert_eq!(
+            circle((6.0, 0.0), 1.0),
+            SketchExtrusionEligibility::ProfileOutsideSupport,
+            "wholly off the face"
         );
     }
 

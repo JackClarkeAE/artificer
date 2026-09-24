@@ -32,14 +32,15 @@ use artificer_sketch::{
     FilletBranchHints as CoreFilletBranchHints, Integer as CoreInteger, Length as CoreLength,
     MAX_CURVE_EDITS_PER_TRANSACTION, MAX_POLYGON_SIDES as CORE_MAX_POLYGON_SIDES,
     MIN_POLYGON_SIDES as CORE_MIN_POLYGON_SIDES, PointInput as CorePointInput,
-    ProfileCompileError as CoreProfileCompileError, RegionSignature as CoreRegionSignature,
-    RetirementPolicy as CoreRetirementPolicy, SignedLength as CoreSignedLength,
-    SketchArrangement as CoreSketchArrangement, SketchConstraintId as CoreConstraintId,
-    SketchConstraintKind as CoreConstraintKind, SketchCurve2 as CoreCurve2,
-    SketchDefinition as CoreSketchDefinition, SketchEntityId as CoreEntityId,
-    SketchEntityRole as CoreEntityRole, SketchOperationId as CoreOperationId,
-    SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchPointId as CorePointId,
-    SketchRecipe as CoreRecipe, SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
+    ProfileCompileError as CoreProfileCompileError, RegionGroup as CoreRegionGroup,
+    RegionSignature as CoreRegionSignature, RetirementPolicy as CoreRetirementPolicy,
+    SignedLength as CoreSignedLength, SketchArrangement as CoreSketchArrangement,
+    SketchConstraintId as CoreConstraintId, SketchConstraintKind as CoreConstraintKind,
+    SketchCurve2 as CoreCurve2, SketchDefinition as CoreSketchDefinition,
+    SketchEntityId as CoreEntityId, SketchEntityRole as CoreEntityRole,
+    SketchOperationId as CoreOperationId, SketchOutputRef as CoreOutputRef,
+    SketchPoint2 as CorePoint2, SketchPointId as CorePointId, SketchRecipe as CoreRecipe,
+    SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
     SketchTransaction as CoreTransaction, SketchUndoJournal as CoreUndoJournal,
     SketchValue as CoreValue, SketchValueTarget, TrimCurve as CoreTrimCurve, build_arrangement,
     compile_selected_profile, hit_test_curves, intersect_curves, query_snap_candidates,
@@ -5610,13 +5611,28 @@ pub struct SketchGestureProgress {
 /// The cache owns no modeling approximation: signatures, hit testing, and
 /// profile compilation all refer to exact arrangement curves. Sampling occurs
 /// only when the selected cells are painted.
+impl AnalyticRegionSelection {
+    /// The cells of the region `signature` belongs to: its group, or the
+    /// cell alone when it is in none.
+    fn region_of(&self, signature: &CoreRegionSignature) -> Vec<CoreRegionSignature> {
+        self.groups
+            .iter()
+            .find(|group| group.cells.contains(signature))
+            .map_or_else(|| vec![signature.clone()], |group| group.cells.clone())
+    }
+}
+
 #[derive(Debug, Default)]
 struct AnalyticRegionSelection {
     revision: Option<CoreSketchRevision>,
     arrangement: Option<CoreSketchArrangement>,
     selected: BTreeSet<CoreRegionSignature>,
     selection_anchors: BTreeMap<CoreRegionSignature, CorePoint2>,
-    hovered: Option<CoreRegionSignature>,
+    /// The cells grouped into the regions the strokes alone close: a stroke
+    /// drawn across the face's edge is one region on both sides of it.
+    groups: Vec<CoreRegionGroup>,
+    /// The region under the pointer, every cell of it.
+    hovered: BTreeSet<CoreRegionSignature>,
     /// Whether the selection came from a deliberate pick rather than the
     /// lone-cell fallback that keeps Extrude working on single-profile
     /// sketches. Only deliberate picks earn a selection fill in the model
@@ -5877,7 +5893,7 @@ impl SketchCanvasState {
         }
         self.analytic_regions.selected = selected;
         self.analytic_regions.selection_anchors = anchors;
-        self.analytic_regions.hovered = None;
+        self.analytic_regions.hovered.clear();
         if !selected_regions.is_empty() && self.selected_planar_profile().is_none() {
             return Err(SketchEditError::AuthoringRejected);
         }
@@ -6645,9 +6661,10 @@ impl SketchCanvasState {
         self.clear_selected_regions()
     }
 
+    /// The cells of the region under the pointer.
     #[must_use]
-    pub fn hovered_region_signature(&self) -> Option<&CoreRegionSignature> {
-        self.analytic_regions.hovered.as_ref()
+    pub const fn hovered_region_signatures(&self) -> &BTreeSet<CoreRegionSignature> {
+        &self.analytic_regions.hovered
     }
 
     /// Compiles the selected cell union directly from the exact analytic
@@ -6697,20 +6714,39 @@ impl SketchCanvasState {
         let old_selected = std::mem::take(&mut self.analytic_regions.selected);
         let old_anchors = std::mem::take(&mut self.analytic_regions.selection_anchors);
         let precision = PrecisionPolicy::default();
-        let mut arrangement = self
-            .authoring
-            .arrangement_inputs()
-            .ok()
-            .map(|inputs| build_arrangement(&inputs, &precision, CoreArrangementLimits::default()))
-            .unwrap_or_else(|| {
-                build_arrangement(&[], &precision, CoreArrangementLimits::default())
-            });
+        let inputs = self.authoring.arrangement_inputs().unwrap_or_default();
+        let mut arrangement =
+            build_arrangement(&inputs, &precision, CoreArrangementLimits::default());
         // The face's outline and its hole rims close regions alongside the
         // strokes, so "the face minus what was drawn" is a region that can be
         // picked. A cell bounded by support curves alone is the host's own
         // face with nothing drawn across it, and is not a region of the
         // sketch at all.
         arrangement.cells.retain(|cell| !cell.is_support_only());
+        // What the strokes alone close is what was drawn; the support curves
+        // only subdivide it. A stroke across the face's edge is split there
+        // into a cell on either side, and the two are one region.
+        let groups = if inputs
+            .iter()
+            .any(|input| CoreSketchDefinition::is_support_curve_entity(input.entity))
+        {
+            let strokes = inputs
+                .iter()
+                .filter(|input| !CoreSketchDefinition::is_support_curve_entity(input.entity))
+                .cloned()
+                .collect::<Vec<_>>();
+            let strokes = build_arrangement(&strokes, &precision, CoreArrangementLimits::default());
+            arrangement.groups_by_strokes(&strokes, &precision)
+        } else {
+            arrangement
+                .cells
+                .iter()
+                .map(|cell| CoreRegionGroup {
+                    cells: vec![cell.signature.clone()],
+                    drawn: true,
+                })
+                .collect()
+        };
         let boundary_tolerance = precision
             .linear_agreement
             .max(precision.modeling_resolution);
@@ -6740,28 +6776,31 @@ impl SketchCanvasState {
         // taken unasked. A region the face's own boundary helps close is
         // offered, never assumed: a rectangle on a face makes two cells, the
         // rectangle and the face around it, and the rectangle is the one
-        // meant.
-        let drawn = arrangement
-            .cells
+        // meant. A stroke drawn across the face's edge, or over a hole, is
+        // split there into a cell on either side; the two are one region,
+        // the stroke's own, and count as drawn together.
+        let drawn = groups
             .iter()
-            .filter(|cell| !cell.touches_support())
-            .count();
-        let sole = if drawn == 1 {
-            arrangement
-                .cells
-                .iter()
-                .find(|cell| !cell.touches_support())
-        } else if arrangement.cells.len() == 1 {
-            arrangement.cells.first()
+            .filter(|group| group.drawn)
+            .collect::<Vec<_>>();
+        let sole = if let [only] = drawn.as_slice() {
+            Some(*only)
+        } else if let [only] = groups.as_slice() {
+            Some(only)
         } else {
             None
         };
         if selected.is_empty()
-            && let Some(cell) = sole
+            && let Some(group) = sole
         {
-            selected.insert(cell.signature.clone());
-            if let Some(anchor) = arrangement.cell_interior_sample(cell, &precision) {
-                anchors.insert(cell.signature.clone(), anchor);
+            for signature in &group.cells {
+                if let Some(anchor) = arrangement
+                    .cell(signature)
+                    .and_then(|cell| arrangement.cell_interior_sample(cell, &precision))
+                {
+                    anchors.insert(signature.clone(), anchor);
+                }
+                selected.insert(signature.clone());
             }
             explicit = false;
         }
@@ -6770,7 +6809,8 @@ impl SketchCanvasState {
             arrangement: Some(arrangement),
             selected,
             selection_anchors: anchors,
-            hovered: None,
+            groups,
+            hovered: BTreeSet::new(),
             explicit,
         };
     }
@@ -6783,46 +6823,76 @@ impl SketchCanvasState {
         changed
     }
 
-    /// Selects the exact bounded cell containing `point`. Additive selection
-    /// toggles that cell; replacement selection clears every other cell.
-    /// This renderer-independent seam is shared by pointer UI, automation,
-    /// and headless modeling tests.
+    /// Selects the region containing `point`: the exact bounded cell there,
+    /// with every cell joined to it across the face's own edges, since a
+    /// stroke drawn across the face's edge is one region on both sides of
+    /// it. Additive selection toggles that region; replacement selection
+    /// clears every other one. This renderer-independent seam is shared by
+    /// pointer UI, automation, and headless modeling tests.
     pub fn select_region_at_point(&mut self, point: SketchPoint, additive: bool) -> bool {
         self.refresh_analytic_regions();
         let point = core_point(point);
-        let signature = self
+        let precision = PrecisionPolicy::default();
+        let members = self
             .analytic_regions
             .arrangement
             .as_ref()
             .and_then(|arrangement| {
-                arrangement
-                    .cell_at_point(point, &PrecisionPolicy::default())
-                    .map(|cell| cell.signature.clone())
+                let cell = arrangement.cell_at_point(point, &precision)?;
+                Some(
+                    self.analytic_regions
+                        .region_of(&cell.signature)
+                        .into_iter()
+                        .map(|signature| {
+                            let anchor = if signature == cell.signature {
+                                Some(point)
+                            } else {
+                                arrangement.cell(&signature).and_then(|member| {
+                                    arrangement.cell_interior_sample(member, &precision)
+                                })
+                            };
+                            (signature, anchor)
+                        })
+                        .collect::<Vec<_>>(),
+                )
             });
-        let Some(signature) = signature else {
+        let Some(members) = members else {
             return !additive && self.clear_selected_regions();
         };
+        let regions = &mut self.analytic_regions;
         if additive {
-            if self.analytic_regions.selected.remove(&signature) {
-                self.analytic_regions.selection_anchors.remove(&signature);
+            if members
+                .iter()
+                .any(|(signature, _)| regions.selected.contains(signature))
+            {
+                for (signature, _) in &members {
+                    regions.selected.remove(signature);
+                    regions.selection_anchors.remove(signature);
+                }
             } else {
-                self.analytic_regions.selected.insert(signature.clone());
-                self.analytic_regions
-                    .selection_anchors
-                    .insert(signature, point);
+                for (signature, anchor) in members {
+                    if let Some(anchor) = anchor {
+                        regions.selection_anchors.insert(signature.clone(), anchor);
+                    }
+                    regions.selected.insert(signature);
+                }
             }
-            self.analytic_regions.explicit = !self.analytic_regions.selected.is_empty();
+            regions.explicit = !regions.selected.is_empty();
             true
         } else {
-            let unchanged = self.analytic_regions.selected.len() == 1
-                && self.analytic_regions.selected.contains(&signature);
-            self.analytic_regions.selected.clear();
-            self.analytic_regions.selection_anchors.clear();
-            self.analytic_regions.selected.insert(signature.clone());
-            self.analytic_regions
-                .selection_anchors
-                .insert(signature, point);
-            self.analytic_regions.explicit = true;
+            let unchanged = regions.selected.len() == members.len()
+                && members
+                    .iter()
+                    .all(|(signature, _)| regions.selected.contains(signature));
+            regions.selected.clear();
+            regions.selection_anchors.clear();
+            for (signature, anchor) in members {
+                if let Some(anchor) = anchor {
+                    regions.selection_anchors.insert(signature.clone(), anchor);
+                }
+                regions.selected.insert(signature);
+            }
+            regions.explicit = true;
             !unchanged
         }
     }
@@ -6830,18 +6900,25 @@ impl SketchCanvasState {
     fn update_region_hover(&mut self, point: Option<SketchPoint>) -> bool {
         self.refresh_analytic_regions();
         let hovered = if self.pending.is_none() {
-            point.and_then(|point| {
-                self.analytic_regions
-                    .arrangement
-                    .as_ref()
-                    .and_then(|arrangement| {
-                        arrangement
-                            .cell_at_point(core_point(point), &PrecisionPolicy::default())
-                            .map(|cell| cell.signature.clone())
-                    })
-            })
+            point
+                .and_then(|point| {
+                    self.analytic_regions
+                        .arrangement
+                        .as_ref()
+                        .and_then(|arrangement| {
+                            let cell = arrangement
+                                .cell_at_point(core_point(point), &PrecisionPolicy::default())?;
+                            Some(
+                                self.analytic_regions
+                                    .region_of(&cell.signature)
+                                    .into_iter()
+                                    .collect::<BTreeSet<_>>(),
+                            )
+                        })
+                })
+                .unwrap_or_default()
         } else {
-            None
+            BTreeSet::new()
         };
         let changed = self.analytic_regions.hovered != hovered;
         self.analytic_regions.hovered = hovered;
@@ -13435,7 +13512,7 @@ fn paint_profile_fill(painter: &egui::Painter, rect: Rect, state: &SketchCanvasS
         let standing_fill = translucent(sketch_colours().region_fill, 12);
         for cell in &arrangement.cells {
             if state.analytic_regions.selected.contains(&cell.signature)
-                || state.analytic_regions.hovered.as_ref() == Some(&cell.signature)
+                || state.analytic_regions.hovered.contains(&cell.signature)
             {
                 continue;
             }
@@ -13452,17 +13529,19 @@ fn paint_profile_fill(painter: &egui::Painter, rect: Rect, state: &SketchCanvasS
             paint_analytic_cell_fill(painter, rect, state.view, cell, selected_fill);
         }
     }
-    if let Some(hovered) = state.analytic_regions.hovered.as_ref()
-        && !state.analytic_regions.selected.contains(hovered)
-        && let Some(cell) = arrangement.cell(hovered)
-    {
-        paint_analytic_cell_fill(
-            painter,
-            rect,
-            state.view,
-            cell,
-            translucent(sketch_colours().region_hover, 42),
-        );
+    for hovered in &state.analytic_regions.hovered {
+        if state.analytic_regions.selected.contains(hovered) {
+            continue;
+        }
+        if let Some(cell) = arrangement.cell(hovered) {
+            paint_analytic_cell_fill(
+                painter,
+                rect,
+                state.view,
+                cell,
+                translucent(sketch_colours().region_hover, 42),
+            );
+        }
     }
 }
 
@@ -22000,6 +22079,232 @@ mod tests {
             "the face minus the disc: {}",
             selected_area(&state)
         );
+    }
+
+    /// A face eight by eight with two round holes, as a sketch on it sees
+    /// it: the outline and each rim as support curves.
+    fn twice_drilled_face() -> SketchCanvasState {
+        let mut state = SketchCanvasState::default();
+        let corners = [
+            SketchPoint::new(-4.0, -4.0),
+            SketchPoint::new(4.0, -4.0),
+            SketchPoint::new(4.0, 4.0),
+            SketchPoint::new(-4.0, 4.0),
+        ];
+        let rim = |centre: SketchPoint, radius: f64| {
+            [
+                SketchContextCurve::Arc {
+                    center: centre,
+                    u: [1.0, 0.0],
+                    v: [0.0, 1.0],
+                    radius,
+                    start: 0.0,
+                    end: std::f64::consts::PI,
+                },
+                SketchContextCurve::Arc {
+                    center: centre,
+                    u: [1.0, 0.0],
+                    v: [0.0, 1.0],
+                    radius,
+                    start: std::f64::consts::PI,
+                    end: std::f64::consts::TAU,
+                },
+            ]
+        };
+        let mut support = vec![
+            SketchContextCurve::segment(corners[0], corners[1]),
+            SketchContextCurve::segment(corners[1], corners[2]),
+            SketchContextCurve::segment(corners[2], corners[3]),
+            SketchContextCurve::segment(corners[3], corners[0]),
+        ];
+        support.extend(rim(SketchPoint::new(-2.0, 0.0), 0.5));
+        support.extend(rim(SketchPoint::new(0.0, 2.0), 0.5));
+        state.set_support_curves(&support);
+        state
+    }
+
+    fn draw_rectangle(state: &mut SketchCanvasState, from: SketchPoint, to: SketchPoint) {
+        state
+            .stage_geometry(SketchGeometry::rectangle(from, to))
+            .expect("the rectangle should stage");
+        state.commit_pending().expect("the rectangle should commit");
+    }
+
+    fn selected_area(state: &SketchCanvasState) -> f64 {
+        let arrangement = state
+            .analytic_regions
+            .arrangement
+            .as_ref()
+            .expect("regions are built");
+        state
+            .analytic_regions
+            .selected
+            .iter()
+            .filter_map(|signature| arrangement.cell(signature))
+            .map(|cell| cell.signed_area.abs())
+            .sum()
+    }
+
+    /// A rectangle drawn half off the face is split by the face's edge into
+    /// a cell on either side, and the two are one region: what was drawn.
+    /// It is taken unasked, a click on either half takes both, its profile
+    /// is the rectangle, and the face around it is still offered on its own.
+    #[test]
+    fn a_stroke_across_the_face_edge_is_one_region_on_both_sides() {
+        let mut state = twice_drilled_face();
+        draw_rectangle(
+            &mut state,
+            SketchPoint::new(2.0, -1.0),
+            SketchPoint::new(6.0, 1.0),
+        );
+        assert_eq!(
+            state.available_region_count(),
+            3,
+            "the on-face half, the off-face half, and the face around them"
+        );
+        assert_eq!(state.selected_region_count(), 2, "both halves are taken");
+        assert!(
+            (selected_area(&state) - 8.0).abs() < 1.0e-9,
+            "{}",
+            selected_area(&state)
+        );
+        let profile = state
+            .selected_planar_profile()
+            .expect("the two halves compile to the rectangle");
+        assert_eq!(profile.regions.len(), 1);
+        assert!(profile.regions[0].holes.is_empty());
+        // The face's edge is not a side of the rectangle; the two halves'
+        // shared piece of it cancels, leaving the four sides (the two the
+        // edge crossed in two pieces each).
+        let mut bounds = [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for curve in &profile.regions[0].outer.curves {
+            let artificer_protocol::PlanarCurve2::Line { start, end } = curve else {
+                panic!("a straight side: {curve:?}");
+            };
+            for point in [start, end] {
+                bounds[0] = bounds[0].min(point.x);
+                bounds[1] = bounds[1].max(point.x);
+                bounds[2] = bounds[2].min(point.y);
+                bounds[3] = bounds[3].max(point.y);
+                assert!(
+                    (point.x - 4.0).abs() > 1.0e-9 || (point.y.abs() - 1.0).abs() < 1.0e-9,
+                    "no vertex on the face's edge but the sides' own: {point:?}"
+                );
+            }
+        }
+        assert_eq!(bounds, [2.0, 6.0, -1.0, 1.0]);
+
+        // Hovering either half lights both.
+        assert!(state.update_region_hover(Some(SketchPoint::new(5.0, 0.0))));
+        assert_eq!(state.hovered_region_signatures().len(), 2);
+
+        // The face around it can still be picked on its own, and a click on
+        // the off-face half brings the whole rectangle back.
+        assert!(state.select_region_at_point(SketchPoint::new(-3.0, -3.0), false));
+        assert_eq!(state.selected_region_count(), 1);
+        let face_less_rectangle = 64.0 - 4.0 - 2.0 * std::f64::consts::PI * 0.25;
+        assert!(
+            (selected_area(&state) - face_less_rectangle).abs() < 1.0e-9,
+            "{}",
+            selected_area(&state)
+        );
+        assert!(state.select_region_at_point(SketchPoint::new(5.0, 0.0), false));
+        assert_eq!(state.selected_region_count(), 2);
+        assert!((selected_area(&state) - 8.0).abs() < 1.0e-9);
+        assert!(
+            !state.select_region_at_point(SketchPoint::new(3.0, 0.0), false),
+            "the on-face half is the same region: nothing changes"
+        );
+        // Shift-click toggles the whole region off again.
+        assert!(state.select_region_at_point(SketchPoint::new(3.0, 0.0), true));
+        assert_eq!(state.selected_region_count(), 0);
+
+        // A second rectangle, drawn wholly on the face, is a region of its
+        // own; with two drawn, neither is assumed and each is a click away.
+        draw_rectangle(
+            &mut state,
+            SketchPoint::new(-1.0, -3.5),
+            SketchPoint::new(1.0, -2.5),
+        );
+        assert_eq!(state.available_region_count(), 4);
+        assert!(state.select_region_at_point(SketchPoint::new(0.0, -3.0), false));
+        assert!((selected_area(&state) - 2.0).abs() < 1.0e-9);
+        assert!(state.select_region_at_point(SketchPoint::new(5.0, 0.0), true));
+        assert_eq!(state.selected_region_count(), 3);
+        assert!((selected_area(&state) - 10.0).abs() < 1.0e-9);
+    }
+
+    /// The same across a hole's rim: a rectangle drawn over the edge of a
+    /// hole is one region, and the hole itself is never part of it.
+    #[test]
+    fn a_stroke_across_a_hole_rim_is_one_region() {
+        let mut state = twice_drilled_face();
+        draw_rectangle(
+            &mut state,
+            SketchPoint::new(-2.25, -0.25),
+            SketchPoint::new(-1.0, 0.25),
+        );
+        assert_eq!(
+            state.available_region_count(),
+            4,
+            "over the hole, on the material, the rest of the hole, and the face around them"
+        );
+        assert_eq!(
+            state.selected_region_count(),
+            2,
+            "the two halves of the rectangle"
+        );
+        assert!(
+            (selected_area(&state) - 0.625).abs() < 1.0e-9,
+            "{}",
+            selected_area(&state)
+        );
+        let profile = state.selected_planar_profile().expect("one rectangle");
+        assert_eq!(profile.regions.len(), 1);
+        assert!(profile.regions[0].holes.is_empty());
+        assert!(
+            profile.regions[0]
+                .outer
+                .curves
+                .iter()
+                .all(|curve| matches!(curve, artificer_protocol::PlanarCurve2::Line { .. })),
+            "the rim is not a side of the rectangle: {:?}",
+            profile.regions[0].outer.curves
+        );
+        // The rest of the hole is a region of its own, and picking it does
+        // not drag the face around it along.
+        assert!(state.select_region_at_point(SketchPoint::new(-2.4, 0.0), false));
+        assert_eq!(state.selected_region_count(), 1);
+        assert!(selected_area(&state) < std::f64::consts::PI * 0.25);
+    }
+
+    /// A rectangle drawn round a hole is closed by the hole's rim on its
+    /// inside: it is offered, not assumed, as before, and the hole is a
+    /// hole in it.
+    #[test]
+    fn a_stroke_round_a_hole_keeps_the_hole() {
+        let mut state = twice_drilled_face();
+        draw_rectangle(
+            &mut state,
+            SketchPoint::new(-3.0, -1.0),
+            SketchPoint::new(-1.0, 1.0),
+        );
+        assert_eq!(state.available_region_count(), 2);
+        assert_eq!(
+            state.selected_region_count(),
+            0,
+            "the rim closes it: offered, not assumed"
+        );
+        assert!(state.select_region_at_point(SketchPoint::new(-2.9, -0.9), false));
+        assert_eq!(state.selected_region_count(), 1);
+        let profile = state.selected_planar_profile().expect("the ring");
+        assert_eq!(profile.regions.len(), 1);
+        assert_eq!(profile.regions[0].holes.len(), 1);
     }
 
     /// The boundary is context, not a stroke: nothing appears among the

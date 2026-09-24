@@ -960,13 +960,23 @@ fn glue_layers(
 
     // Edge weld: an upper edge whose endpoints both mapped onto lower
     // vertices and whose carrier matches an existing lower edge adopts that
-    // record, flipping the sense when the vertex order swapped.
+    // record, flipping the sense when the vertex order swapped. Endpoints
+    // and carrier alone cannot tell the two semicircles of a hole's rim
+    // apart — they share both seam vertices and the circle — so the
+    // midpoint decides, as it does for the floor loops below; without it
+    // both halves of a hole through a stacked pocket welded onto one lower
+    // half, and the other lay orphaned.
+    let middle_of = |edge: &Record<crate::topology::Edge>| {
+        let range = edge.value.parameter_range;
+        edge.value.curve.evaluate((range.start + range.end) / 2.0)
+    };
     let mut edge_map: Vec<(EdgeKey, bool)> = Vec::with_capacity(upper.edges.len());
     for edge in &upper.edges {
         let mapped = [
             vertex_map[edge.value.vertices[0].0],
             vertex_map[edge.value.vertices[1].0],
         ];
+        let middle = middle_of(edge);
         let welded = (mapped[0].0 < lower.vertices.len() && mapped[1].0 < lower.vertices.len())
             .then(|| {
                 lower.edges.iter().position(|candidate| {
@@ -975,6 +985,7 @@ fn glue_layers(
                     let swapped = vertices == [mapped[1], mapped[0]];
                     (aligned || swapped)
                         && same_carrier(&candidate.value.curve, &edge.value.curve, weld)
+                        && (middle_of(candidate) - middle).length() <= weld
                 })
             })
             .flatten();
