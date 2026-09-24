@@ -420,6 +420,7 @@ dependencies = [
  "artificer-kernel",
  "artificer-model",
  "artificer-protocol",
+ "artificer-sim",
  "artificer-sketch",
  "artificer-sketch-ui",
  "artificer-spacemouse",

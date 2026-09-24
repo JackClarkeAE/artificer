@@ -21,6 +21,7 @@ artificer-geometry = { path = "../../crates/geometry" }
 artificer-kernel = { path = "../../crates/kernel" }
 artificer-protocol = { path = "../../crates/protocol" }
 artificer-model = { path = "../../crates/model" }
+artificer-sim = { path = "../../crates/sim" }
 artificer-sketch = { path = "../../crates/sketch" }
 artificer-sketch-ui = { path = "../../crates/sketch-ui" }
 artificer-spacemouse = { path = "../../crates/spacemouse" }

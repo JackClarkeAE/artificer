@@ -31,16 +31,20 @@ pub enum RibbonTab {
     Assembly,
     View,
     Parametric,
+    /// Studies over the model: motion, structural, thermal, and the
+    /// experimental topology optimisation (ADR 0058).
+    Simulation,
     Theme,
 }
 
 impl RibbonTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Model,
         Self::Sketch,
         Self::Assembly,
         Self::View,
         Self::Parametric,
+        Self::Simulation,
         Self::Theme,
     ];
 
@@ -51,6 +55,7 @@ impl RibbonTab {
             Self::Assembly => "Assembly",
             Self::View => "View",
             Self::Parametric => "Parametric",
+            Self::Simulation => "Simulation",
             Self::Theme => "Theme",
         }
     }
@@ -72,6 +77,7 @@ impl RibbonTab {
             Self::Assembly => "Assembly ribbon tab",
             Self::View => "View ribbon tab",
             Self::Parametric => "Parametric ribbon tab",
+            Self::Simulation => "Simulation ribbon tab",
             Self::Theme => "Theme ribbon tab",
         }
     }
@@ -104,11 +110,17 @@ pub enum RibbonGroupId {
     ThemeChoice,
     ThemeColours,
     ParametricVariables,
+    /// The studies a Simulation tab runs over the model.
+    SimulationStudies,
+    /// The mechanism's motion under a timeline.
+    SimulationMotion,
 }
 
 impl RibbonGroupId {
     pub const fn caption(self) -> &'static str {
         match self {
+            Self::SimulationStudies => "STUDIES",
+            Self::SimulationMotion => "TIMELINE",
             Self::Create => "CREATE",
             Self::Place => "PLACE",
             Self::Solid | Self::SketchSolid => "SOLID",
@@ -135,6 +147,8 @@ impl RibbonGroupId {
     /// two groups may share a caption without colliding.
     pub const fn stable_key(self) -> &'static str {
         match self {
+            Self::SimulationStudies => "group_simulation_studies",
+            Self::SimulationMotion => "group_simulation_motion",
             Self::Create => "group_create",
             Self::Place => "group_place",
             Self::Solid => "group_solid",
@@ -225,6 +239,10 @@ pub enum ModelCommand {
     NewLengthVariable,
     NewAngleVariable,
     NewFactorVariable,
+    StructuralStudy,
+    ThermalStudy,
+    TopologyStudy,
+    MotionTimeline,
 }
 
 /// Static presentation metadata for one command.
@@ -805,6 +823,55 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         "Switch between the light and dark workbench themes.",
         None,
     ),
+    // ---- Simulation tab --------------------------------------------------
+    command(
+        ModelCommand::StructuralStudy,
+        "simulation.structural",
+        RibbonTab::Simulation,
+        RibbonGroupId::SimulationStudies,
+        CommandIcon::Stress,
+        CommandSize::Large,
+        "Structural",
+        "Structural study",
+        "Hold the active body on some faces, load others, and see where it bends and how hard it is worked: stress as colour, deflection exaggerated on the part. A voxel approximation that says how coarse it is.",
+        None,
+    ),
+    command(
+        ModelCommand::ThermalStudy,
+        "simulation.thermal",
+        RibbonTab::Simulation,
+        RibbonGroupId::SimulationStudies,
+        CommandIcon::Thermal,
+        CommandSize::Large,
+        "Thermal",
+        "Thermal study",
+        "Hold faces of the active body at temperatures, let the rest lose heat to the air, and see the steady temperature as colour on the part. The same voxel grid as the structural study.",
+        None,
+    ),
+    command(
+        ModelCommand::TopologyStudy,
+        "simulation.topology",
+        RibbonTab::Simulation,
+        RibbonGroupId::SimulationStudies,
+        CommandIcon::Optimise,
+        CommandSize::Large,
+        "Optimise",
+        "Topology optimisation (experimental)",
+        "Experimental: carve the active body down to a fraction of its volume that carries the structural study's loads best, watching the material melt away iteration by iteration. Nothing is written back to the model.",
+        None,
+    ),
+    command(
+        ModelCommand::MotionTimeline,
+        "simulation.timeline",
+        RibbonTab::Simulation,
+        RibbonGroupId::SimulationMotion,
+        CommandIcon::Timeline,
+        CommandSize::Large,
+        "Timeline",
+        "Motion timeline",
+        "Scrub the mechanism through its motion, play it at a speed, and measure the clearance at every frame: the frame two parts first meet is flagged on the part and on the plot.",
+        None,
+    ),
     // ---- Theme tab -------------------------------------------------------
     command(
         ModelCommand::ThemeLight,
@@ -928,6 +995,15 @@ pub fn groups_for_tab(tab: RibbonTab) -> Vec<(RibbonGroupId, Vec<&'static Comman
         // another once several are on screen — and it is a picker rather than
         // a command, so the group carries no members and the ribbon fills it.
         groups.push((RibbonGroupId::BodyAppearance, Vec::new()));
+    }
+    // A study is set up by picking the faces it holds and loads, so the
+    // Select group rides along on the Simulation tab too.
+    if tab == RibbonTab::Simulation {
+        groups.extend(
+            groups_for_tab(RibbonTab::Model)
+                .into_iter()
+                .filter(|(group, _)| *group == RibbonGroupId::Select),
+        );
     }
     groups
 }

@@ -944,6 +944,10 @@ pub struct SurfaceField<'a> {
     /// Changes whenever the readings do. The GPU buffer cache keys on this
     /// rather than hashing a megabyte of vertices every frame.
     pub epoch: u64,
+    /// The legend to print beside the model in place of the palette's own,
+    /// for a field that is not a clearance in millimetres: a stress, a
+    /// temperature. `None` prints the palette's clearance legend.
+    pub legend: Option<&'a [HeatBand]>,
 }
 
 impl SurfaceField<'_> {
@@ -2750,8 +2754,11 @@ fn show_document_impl(
     // A body painted by a measurement is unreadable without the scale it was
     // painted to, so the legend is part of the overlay rather than something
     // the host has to remember to print beside it.
-    if let Some(palette) = bodies.iter().find_map(|body| body.field.map(|f| f.palette)) {
-        paint_heat_legend(&painter, canvas.rect, palette);
+    if let Some(field) = bodies.iter().find_map(|body| body.field) {
+        let bands = field
+            .legend
+            .map_or_else(|| field.palette.legend(), <[HeatBand]>::to_vec);
+        paint_heat_legend(&painter, canvas.rect, &bands);
     }
     // A secondary click is a menu gesture, never a camera gesture: egui only
     // reports `clicked_by` once it has ruled out a drag, so the right-drag
@@ -7808,8 +7815,7 @@ fn projected_triad_axes(view: ViewState) -> [CameraProjection; 3] {
 
 /// The key to a heat map: one swatch per band, with the reading it stands
 /// for, in the corner the axis triad leaves free.
-fn paint_heat_legend(painter: &egui::Painter, rect: Rect, palette: HeatPalette) {
-    let bands = palette.legend();
+fn paint_heat_legend(painter: &egui::Painter, rect: Rect, bands: &[HeatBand]) {
     if bands.is_empty() {
         return;
     }
@@ -9560,6 +9566,7 @@ mod tests {
             values: &readings,
             palette,
             epoch,
+            legend: None,
         };
         let ramp = HeatPalette::Gradient {
             near: 0.0,

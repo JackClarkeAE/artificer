@@ -176,6 +176,7 @@ impl KernelLabApp {
                     RibbonTab::Assembly
                     | RibbonTab::View
                     | RibbonTab::Parametric
+                    | RibbonTab::Simulation
                     | RibbonTab::Theme => {
                         self.ribbon_tab = Some((self.workbench_mode, tab));
                     }
@@ -999,6 +1000,41 @@ impl KernelLabApp {
                 }
             }
             ModelCommand::ToggleVariables => CommandAvailability::Enabled,
+            ModelCommand::StructuralStudy | ModelCommand::ThermalStudy => {
+                if self.workbench_mode == WorkbenchMode::Sketch {
+                    CommandAvailability::disabled(
+                        "Finish the sketch first; a study runs on a body.",
+                    )
+                } else if self.active_body_id().is_none() {
+                    CommandAvailability::disabled("Create or activate a body to study first.")
+                } else {
+                    CommandAvailability::Enabled
+                }
+            }
+            ModelCommand::TopologyStudy => {
+                if self.workbench_mode == WorkbenchMode::Sketch {
+                    CommandAvailability::disabled(
+                        "Finish the sketch first; a study runs on a body.",
+                    )
+                } else if self.active_body_id().is_none() {
+                    CommandAvailability::disabled("Create or activate a body to optimise first.")
+                } else if self.structural_summary().is_none() {
+                    CommandAvailability::disabled(
+                        "Solve a structural study first; the optimisation carries its supports and loads.",
+                    )
+                } else {
+                    CommandAvailability::Enabled
+                }
+            }
+            ModelCommand::MotionTimeline => {
+                if self.animation_drives_joints() {
+                    CommandAvailability::Enabled
+                } else {
+                    CommandAvailability::disabled(
+                        "A timeline needs a joint to drive; this document has none.",
+                    )
+                }
+            }
             ModelCommand::NewLengthVariable
             | ModelCommand::NewAngleVariable
             | ModelCommand::NewFactorVariable => {
@@ -1288,6 +1324,14 @@ impl KernelLabApp {
             }
             ModelCommand::NewFactorVariable => {
                 self.stage_new_variable(QuantityKind::Scalar);
+            }
+            ModelCommand::StructuralStudy => self.open_structural_study(),
+            ModelCommand::ThermalStudy
+            | ModelCommand::TopologyStudy
+            | ModelCommand::MotionTimeline => {
+                self.document_status = Some(
+                    "This study is not in the workbench yet; the structural study is".to_owned(),
+                );
             }
         }
     }

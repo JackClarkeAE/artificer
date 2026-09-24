@@ -30,6 +30,7 @@ mod revolve;
 mod ribbon;
 pub mod saved_parts;
 pub mod shell;
+pub mod simulation;
 pub mod sketch_links;
 pub mod spacemouse;
 mod sweep;
@@ -2085,6 +2086,9 @@ enum ContextualSubject {
     /// operation, so it has no gate; it stays until it is dismissed or the
     /// bodies move under it.
     Interference,
+    /// A simulation study on the active body (ADR 0058): its conditions,
+    /// its solve, and the picture it leaves. Like a study it has no gate.
+    Simulation,
     Component,
     Measurement,
     Selection,
@@ -2104,6 +2108,7 @@ impl ContextualSubject {
         match self {
             Self::PendingOperation => "OPERATION",
             Self::Interference => "INTERFERENCE",
+            Self::Simulation => "SIMULATION",
             Self::Component => "COMPONENT",
             Self::Measurement => "MEASURE",
             Self::Selection => "SELECTION",
@@ -2370,6 +2375,7 @@ impl ClearanceHeatMap {
                 values,
                 palette: self.palette,
                 epoch: self.epoch,
+                legend: None,
             })
     }
 }
@@ -2964,6 +2970,9 @@ pub struct KernelLabApp {
     /// was measured on. Kept beside the report rather than inside it: the
     /// report is a published document, and this is a picture of it.
     heat_map: Option<ClearanceHeatMap>,
+    /// The Simulation tab's studies and the picture they leave on the
+    /// studied body (ADR 0058).
+    simulation: simulation::SimulationState,
     /// The model camera as it stood before a plane sketch reframed it, so
     /// leaving the sketch hands the three-dimensional view back.
     camera_before_plane_sketch: Option<ViewState>,
@@ -3169,6 +3178,7 @@ impl Default for KernelLabApp {
             kinematics: Kinematics::default(),
             clearance_profile: None,
             heat_map: None,
+            simulation: simulation::SimulationState::default(),
             camera_before_plane_sketch: None,
             show_origin_planes: false,
             section_analysis: SectionAnalysis::default(),
@@ -18443,6 +18453,12 @@ impl KernelLabApp {
         if self.pending_operation.is_some() {
             return Some(ContextualSubject::PendingOperation);
         }
+        // A study that is open is what the user is in the middle of: its
+        // faces are picked in the viewport and named on the card, so the
+        // card has to stay up while faces are being clicked.
+        if self.simulation.is_showing() {
+            return Some(ContextualSubject::Simulation);
+        }
         if self.interference.is_some() {
             return Some(ContextualSubject::Interference);
         }
@@ -20268,6 +20284,13 @@ impl KernelLabApp {
                 if shows(ContextualSubject::Interference) && self.interference.is_some() {
                     card(ui, "interference_study", "INTERFERENCE", &mut |ui| {
                         self.interference_card(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if shows(ContextualSubject::Simulation) && self.simulation.is_showing() {
+                    card(ui, "simulation_study", "SIMULATION", &mut |ui| {
+                        self.simulation_card(ui);
                     });
                     ui.add_space(5.0);
                 }
@@ -22259,6 +22282,9 @@ impl KernelLabApp {
         // camera back. Lifting the readings out of the document for the
         // duration is what lets both be true at once.
         let heat_map = self.heat_map.take();
+        // The simulation's picture of the studied body is lifted out the
+        // same way: a deformed copy of its scene and the stress over it.
+        let simulation_display = self.simulation.take_display();
         let drives_joints = self.animation_drives_joints();
 
         let frame_output = Frame::new()
@@ -22322,6 +22348,19 @@ impl KernelLabApp {
                             },
                             |candidate| &candidate.scene,
                         );
+                        // A studied body is drawn as the study left it:
+                        // its facets displaced by the exaggerated
+                        // deformation, painted by stress. The picture
+                        // replaces the committed scene only while no
+                        // feature is being previewed over the body.
+                        let study = simulation_display
+                            .as_ref()
+                            .filter(|display| {
+                                display.body == body.id
+                                    && feature_candidate.is_none()
+                                    && edge_candidate.is_none()
+                            });
+                        let scene = study.map_or(scene, |display| &display.scene);
                         let bounds = feature_candidate.map_or_else(
                             || edge_candidate.map_or(source_bounds, |candidate| candidate.bounds),
                             |candidate| candidate.bounds,
@@ -22355,9 +22394,20 @@ impl KernelLabApp {
                                         })
                                 },
                             )
-                            .with_field(heat_map.as_ref().and_then(|heat_map| {
-                                heat_map.field_for(body.id, scene.triangles.len() * 3)
-                            }))
+                            .with_field(
+                                study
+                                    .and_then(|display| {
+                                        simulation::display_field(
+                                            display,
+                                            scene.triangles.len() * 3,
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        heat_map.as_ref().and_then(|heat_map| {
+                                            heat_map.field_for(body.id, scene.triangles.len() * 3)
+                                        })
+                                    }),
+                            )
                             .with_base_transform(self.occurrence_transform_for_body(body.id)),
                         )
                     })
@@ -22672,6 +22722,7 @@ impl KernelLabApp {
                 }
             });
         self.heat_map = heat_map;
+        self.simulation.restore_display(simulation_display);
         self.model_canvas_overlay(ui, frame_output.response.rect.shrink(7.0));
         self.sync_transform_preview();
     }
@@ -23439,6 +23490,7 @@ impl eframe::App for KernelLabApp {
         self.updates.poll(context);
         self.poll_async_sketch_extrusion_commit(context);
         self.poll_async_sweep(context);
+        self.poll_simulation(context);
         if !self.advance_face_camera_transition(context) {
             self.advance_motion(context);
         }

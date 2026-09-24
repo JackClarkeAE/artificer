@@ -69,6 +69,14 @@ pub enum CommandIcon {
     JointDisabled,
     Variable,
     VariableNew,
+    /// A beam bending under a load: the structural study.
+    Stress,
+    /// A thermometer: the thermal study.
+    Thermal,
+    /// A block with a truss cut into it: topology optimisation.
+    Optimise,
+    /// A play head on a track: the motion timeline.
+    Timeline,
 }
 
 pub fn paint_command_icon(painter: &Painter, rect: Rect, icon: CommandIcon, color: Color32) {
@@ -216,6 +224,56 @@ impl IconPainter<'_> {
             CommandIcon::Plane => {
                 self.closed_path(&[(0.10, 0.62), (0.44, 0.80), (0.90, 0.56), (0.56, 0.38)]);
                 self.dashed((0.50, 0.09), (0.50, 0.44));
+            }
+            CommandIcon::Stress => {
+                // A cantilever clamped at the left, drooping under a load
+                // arrow at its tip.
+                self.line((0.12, 0.20), (0.12, 0.80));
+                self.path(&[(0.12, 0.42), (0.36, 0.44), (0.60, 0.50), (0.86, 0.62)]);
+                self.path(&[(0.12, 0.58), (0.36, 0.60), (0.60, 0.66), (0.86, 0.76)]);
+                self.line((0.86, 0.62), (0.86, 0.76));
+                self.arrow((0.84, 0.14), (0.84, 0.48), 0.13);
+            }
+            CommandIcon::Thermal => {
+                // A thermometer: a bulb, a stem, and the level inside it.
+                self.circle((0.50, 0.76), 0.14);
+                self.line((0.42, 0.66), (0.42, 0.18));
+                self.line((0.58, 0.66), (0.58, 0.18));
+                self.arc(
+                    (0.50, 0.18),
+                    0.08,
+                    std::f32::consts::PI,
+                    std::f32::consts::PI,
+                );
+                self.filled_rectangle((0.47, 0.40), (0.53, 0.70));
+                self.dot((0.50, 0.76), 0.08);
+                self.line((0.64, 0.30), (0.72, 0.30));
+                self.line((0.64, 0.44), (0.72, 0.44));
+                self.line((0.64, 0.58), (0.72, 0.58));
+            }
+            CommandIcon::Optimise => {
+                // A block whose middle has been carved to a truss.
+                self.rectangle((0.10, 0.22), (0.90, 0.78));
+                self.path(&[
+                    (0.10, 0.78),
+                    (0.30, 0.22),
+                    (0.50, 0.78),
+                    (0.70, 0.22),
+                    (0.90, 0.78),
+                ]);
+            }
+            CommandIcon::Timeline => {
+                // A track with tick marks and a play head on it.
+                self.line((0.10, 0.62), (0.90, 0.62));
+                for tick in [0.10, 0.30, 0.50, 0.70, 0.90] {
+                    self.line((tick, 0.56), (tick, 0.68));
+                }
+                self.painter.add(egui::Shape::convex_polygon(
+                    vec![self.p(0.36, 0.18), self.p(0.36, 0.50), self.p(0.62, 0.34)],
+                    self.color,
+                    Stroke::NONE,
+                ));
+                self.line((0.50, 0.50), (0.50, 0.62));
             }
             CommandIcon::Axis => {
                 // A dashed line through space, with the way it runs marked.
