@@ -108,8 +108,12 @@ profile plus the finish allowance, each pass retracting along the profile),
 one on the axis), **bore** (roughing and finishing inside with a boring
 bar), **finish** (one pass along the exact section with nose-radius
 compensation: the section offset by the nose radius, `offset_loop`
-outward), **groove** (plunges for grooves narrower than the insert), **part
-off**.
+outward), **groove** (plunges for grooves narrower than the insert), **back
+corner** (a chamfer or round where the outside meets the back face, which
+no insert from the front can reach: the parting blade's front corner traces
+it, its body trailing in the part-off kerf, for a run of up to twice the
+blade's width; a longer taper facing the chuck is refused as needing a
+second setup), **part off**.
 
 Every pass is a 2D tool region swept along a line in `(r, z)`. The stock
 after each pass is `profile_boolean(stock, sweep, Difference)`. The
@@ -155,7 +159,8 @@ smallest inside corner radius and whose diameter fits the narrowest slot;
 a hole takes the drill of its diameter, else helical boring; turning takes
 the roughing then the finishing insert, and the boring bar inside.
 
-Order: face → rough → drill → finish → part off (lathe); face → pockets and
+Order: face → rough → drill → finish → groove → back corner → part off
+(lathe); face → pockets and
 profiles by tool, largest first → drills → finish passes (mill). Operations
 are grouped by tool; each change emits a retract to the safe plane, `M6
 Tn`, and `M3 Sn`. Feeds and speeds from a material table (aluminium, mild
