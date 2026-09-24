@@ -23,7 +23,9 @@ use artificer_protocol::PrecisionPolicy;
 
 use crate::analytic_extrusion::{AnalyticLoop, Segment, point_inside_loop};
 use crate::bspline::SplineCurve2;
-use crate::profile_boolean::{point_in_loops, split_at_mutual_crossings, split_segment_at_points, weld_aligned, wrap_loops};
+use crate::profile_boolean::{
+    point_in_loops, split_at_mutual_crossings, split_segment_at_points, weld_aligned, wrap_loops,
+};
 use crate::sew::NumericalPiece;
 use crate::surface_marching::TracedCurve;
 use crate::topology::{Point2, Surface, Topology};
@@ -63,7 +65,11 @@ pub(crate) enum CellError {
 }
 
 /// An edge of the arrangement: an exact piece or a stretch of a traced curve.
+/// An exact piece carries the whole `Segment` — an ellipse's frame makes it
+/// the wide variant — and the arrangement is small enough that the room the
+/// numerical arcs waste beside it is nothing against the sampling they do.
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Arc {
     Exact(Segment),
     Numerical {

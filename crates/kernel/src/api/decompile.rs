@@ -111,9 +111,28 @@ impl Session {
                 self.snapshot.id()
             );
             if self.tier() == Tier::Approximate {
-                script.push_str(
-                    "// A step below fell to the faceted tier; it is marked `approximate`.\n",
-                );
+                let numerical = self.step_reports.values().any(|report| {
+                    report.tier() == Tier::Approximate
+                        && report
+                            .rung
+                            .as_deref()
+                            .is_some_and(|rung| rung.contains("numerical"))
+                });
+                let faceted = self.step_reports.values().any(|report| {
+                    report.tier() == Tier::Approximate
+                        && !report
+                            .rung
+                            .as_deref()
+                            .is_some_and(|rung| rung.contains("numerical"))
+                });
+                let how = match (faceted, numerical) {
+                    (true, true) => {
+                        "fell to the faceted tier or was built by the numerical intersection rung"
+                    }
+                    (false, true) => "was built by the numerical intersection rung",
+                    _ => "fell to the faceted tier",
+                };
+                let _ = writeln!(script, "// A step below {how}; it is marked `approximate`.");
             }
             script.push('\n');
         }
@@ -169,11 +188,13 @@ impl Writer<'_> {
         if let Some(report) = self.session.step_reports.get(&label)
             && report.tier() == Tier::Approximate
         {
-            let _ = writeln!(
-                self.body,
-                "// approximate: the faceted tier built this step ({})",
-                report.rung.as_deref().unwrap_or("faceted")
-            );
+            let rung = report.rung.as_deref().unwrap_or("faceted");
+            let tier = if rung.contains("numerical") {
+                "the numerical intersection rung"
+            } else {
+                "the faceted tier"
+            };
+            let _ = writeln!(self.body, "// approximate: {tier} built this step ({rung})");
         }
         let call = match command {
             ApiCommand::MakeBox { origin, size, .. } => format!(

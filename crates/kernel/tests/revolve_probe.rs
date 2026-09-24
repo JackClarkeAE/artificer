@@ -494,9 +494,10 @@ fn a_slanted_side_meeting_the_axis_sweeps_a_pointed_cone() {
     }
 }
 
-/// A cone point sunk into a block takes out the cone: the faceted tier
-/// answers, as it does for any carrier the exact engines do not sew, and the
-/// volume it removes is the cone's to within the faceting.
+/// A cone point sunk into a block takes out the cone. The cone meets the
+/// block's top face in a circle, a pair in ADR 0025's matrix, so the general
+/// engine answers exactly since ADR 0056 B1 admitted cones; the faceted tier
+/// answered before, to within its faceting.
 #[test]
 fn a_pointed_cone_cuts_a_block() {
     // The block's top face is at z = 0; the cone stands point down, its apex
@@ -512,9 +513,14 @@ fn a_pointed_cone_cuts_a_block() {
     let submerged = radius * depth / (depth + over);
     let expected = PI * submerged * submerged * depth / 3.0;
     assert!(
-        ((removed - expected) / expected).abs() < 2.0e-2,
+        ((removed - expected) / expected).abs() < 1.0e-9,
         "removed {removed}, the submerged cone is {expected}"
     );
+    assert_eq!(
+        outcome.report.rung.as_deref(),
+        Some("revolve/boolean-analytic")
+    );
+    assert_eq!(outcome.report.tier(), Tier::Exact);
     assert!(NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid).valid);
 }
 
@@ -758,27 +764,30 @@ fn a_revolved_bore_cuts_a_block_exactly() {
 }
 
 #[test]
-fn a_revolved_sphere_cuts_a_block_on_the_faceted_tier_and_says_so() {
+fn a_revolved_sphere_cuts_a_block_exactly() {
     // A sphere of radius 5 centred on the top face takes a hemisphere away.
+    // The sphere meets the top face in a circle, a pair in ADR 0025's
+    // matrix, so the general engine answers exactly since ADR 0056 B1
+    // admitted spheres; this took the faceted tier before.
     let outcome =
         revolve_into(&block(), half_disc(5.0), SolidOperation::Cut).expect("the sphere cuts");
-    assert_eq!(outcome.report.rung.as_deref(), Some("revolve/faceted"));
-    let codes = outcome
-        .report
-        .warnings
-        .iter()
-        .map(|warning| warning.code.as_str().to_owned())
-        .collect::<Vec<_>>();
+    assert_eq!(
+        outcome.report.rung.as_deref(),
+        Some("revolve/boolean-analytic")
+    );
+    assert_eq!(outcome.report.tier(), Tier::Exact);
     assert!(
-        codes.contains(&"REVOLVE_FACETED_APPROXIMATION".to_owned()),
-        "{codes:?}"
+        outcome.report.warnings.is_empty(),
+        "{:?}",
+        outcome.report.warnings
     );
     let expected = 32_000.0 - 2.0 / 3.0 * PI * 125.0;
     let volume = outcome.snapshot.measures().volume;
     assert!(
-        ((volume - expected) / expected).abs() < 1.0e-2,
+        ((volume - expected) / expected).abs() < 1.0e-9,
         "{volume} against {expected}"
     );
+    assert!(NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid).valid);
 }
 
 #[test]

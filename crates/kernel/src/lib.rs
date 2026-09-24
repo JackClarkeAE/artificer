@@ -45,6 +45,7 @@ mod profile_boolean;
 mod push_pull;
 mod revolve;
 mod revolved;
+mod revolved_measures;
 mod rim_loop_blend;
 mod ruled;
 mod section_cells;
@@ -66,6 +67,7 @@ mod surface_marching;
 mod sweep_profile;
 mod topology;
 mod transform;
+mod trimmed_tessellation;
 mod validator;
 mod variable_radius_fillet;
 mod vertex_blend;
@@ -1487,14 +1489,44 @@ impl NativeKernel {
                                 request.precision,
                             )
                             .map_err(ExactRouteDecline::from_engine)
-                            .and_then(|topology| exact_candidate(topology, request.precision)),
+                            .and_then(|topology| exact_candidate(topology, request.precision))
+                            .map(|topology| (topology, None))
+                            // Then the numerical intersection rung (ADR
+                            // 0056 B2), which keeps the exact route's reason
+                            // beside its approximation, and when it cannot
+                            // answer either.
+                            .or_else(|decline| {
+                                numerical_rung(
+                                    &input.topology,
+                                    tool,
+                                    BooleanOperation::Difference,
+                                    request.precision,
+                                )
+                                .map(|(topology, approximation)| {
+                                    (topology, approximation.map(|found| (found, decline)))
+                                })
+                                .map_err(|_| decline)
+                            }),
                         };
                         match exact {
-                            Ok(topology) => {
+                            Ok((topology, approximation)) => {
                                 // The faces are the engine's own records,
                                 // matched back to history the way every
                                 // regularized Boolean's are.
-                                rung = "face-feature/analytic-boolean";
+                                rung = match approximation {
+                                    Some((approximation, decline)) => {
+                                        // The reason the exact route stood
+                                        // aside is the first thing said,
+                                        // then the approximation it made
+                                        // necessary.
+                                        warnings
+                                            .push(decline.diagnostic(DiagnosticSeverity::Warning));
+                                        warnings
+                                            .push(numerical_intersection_warning(approximation));
+                                        "face-feature/numerical-boolean"
+                                    }
+                                    None => "face-feature/analytic-boolean",
+                                };
                                 (topology, None, true)
                             }
                             Err(decline) => {
@@ -1634,7 +1666,13 @@ impl NativeKernel {
                         // would poke out again under any part of the profile
                         // that hangs over the face's edge, and publish that
                         // sliver as material.
-                        let analytic = || -> Result<Topology, ExactRouteDecline> {
+                        let analytic = || -> Result<
+                            (
+                                Topology,
+                                Option<(analytic_boolean::NumericalApproximation, ExactRouteDecline)>,
+                            ),
+                            ExactRouteDecline,
+                        > {
                             let overshoot = match operation {
                                 FaceExtrusionOperation::Cut => {
                                     (*distance * 0.01).max(request.precision.min_feature_size * 8.0)
@@ -1655,14 +1693,32 @@ impl NativeKernel {
                             ) {
                                 return Err(ExactRouteDecline::Vocabulary);
                             }
-                            let topology = analytic_boolean::build_analytic_boolean(
-                                &input.topology,
-                                &tool,
-                                boolean_operation,
-                                request.precision,
-                            )
-                            .map_err(ExactRouteDecline::from_engine)
-                            .and_then(|topology| exact_candidate(topology, request.precision))?;
+                            let (topology, approximation) =
+                                analytic_boolean::build_analytic_boolean(
+                                    &input.topology,
+                                    &tool,
+                                    boolean_operation,
+                                    request.precision,
+                                )
+                                .map_err(ExactRouteDecline::from_engine)
+                                .and_then(|topology| exact_candidate(topology, request.precision))
+                                .map(|topology| (topology, None))
+                                // Then the numerical intersection rung (ADR
+                                // 0056 B2), keeping the exact route's reason
+                                // beside its approximation, and when it
+                                // cannot answer either.
+                                .or_else(|decline| {
+                                    numerical_rung(
+                                        &input.topology,
+                                        &tool,
+                                        boolean_operation,
+                                        request.precision,
+                                    )
+                                    .map(|(topology, approximation)| {
+                                        (topology, approximation.map(|found| (found, decline)))
+                                    })
+                                    .map_err(|_| decline)
+                                })?;
                             // An add whose profile misses the face has no
                             // interface, and the union of two solids that
                             // never meet is two solids, not a boss.
@@ -1671,7 +1727,7 @@ impl NativeKernel {
                             {
                                 return Err(ExactRouteDecline::Empty);
                             }
-                            Ok(topology)
+                            Ok((topology, approximation))
                         };
                         let prism = prism_boolean::build_prism_boolean(
                             &input.topology,
@@ -1690,8 +1746,19 @@ impl NativeKernel {
                                 topology
                             }
                             Err(_) => match analytic() {
-                                Ok(topology) => {
-                                    rung = "face-feature/analytic-boolean";
+                                Ok((topology, approximation)) => {
+                                    rung = match approximation {
+                                        Some((approximation, decline)) => {
+                                            warnings.push(
+                                                decline.diagnostic(DiagnosticSeverity::Warning),
+                                            );
+                                            warnings.push(numerical_intersection_warning(
+                                                approximation,
+                                            ));
+                                            "face-feature/numerical-boolean"
+                                        }
+                                        None => "face-feature/analytic-boolean",
+                                    };
                                     topology
                                 }
                                 Err(decline) if *operation == FaceExtrusionOperation::Cut => {
@@ -1997,8 +2064,8 @@ impl NativeKernel {
                         // against planes and coaxial cylinders the cut is
                         // exact; a cone meets them in a hyperbola, which
                         // takes the faceted tier with its label.
-                        let (core, faceted) = match clip {
-                            None => (core, false),
+                        let (core, answered) = match clip {
+                            None => (core, SHELL_BOOLEAN.rungs[1]),
                             Some(clip) => {
                                 let prism = core_from_empty(KernelCommand::ExtrudePlanarProfile {
                                     frame: clip.frame,
@@ -2023,10 +2090,16 @@ impl NativeKernel {
                                         topology,
                                         measures: SnapshotMeasures::default(),
                                     },
-                                    answered == SHELL_BOOLEAN.rungs[2],
+                                    answered,
                                 )
                             }
                         };
+                        let faceted = answered == SHELL_BOOLEAN.rungs[2];
+                        // A core cut by the numerical intersection rung (ADR
+                        // 0056 B2) is analytic with traced edges: enclosed
+                        // or taken away as an exact one is, under that
+                        // rung's name and its label in `warnings`.
+                        let numerical = answered == SHELL_BOOLEAN.numerical;
                         if !open {
                             let topology = shell::hollow(&input.topology, &core.topology)
                                 .ok_or_else(|| {
@@ -2038,6 +2111,8 @@ impl NativeKernel {
                                 })?;
                             rung = if faceted {
                                 "shell/faceted"
+                            } else if numerical {
+                                SHELL_BOOLEAN.numerical
                             } else {
                                 "shell/closed-revolve"
                             };
@@ -2085,7 +2160,18 @@ impl NativeKernel {
                                 diagnostics,
                             )
                         })?;
-                            outcome.report.rung = Some("shell/open-revolve".to_owned());
+                            outcome.report.rung = Some(
+                                if numerical {
+                                    SHELL_BOOLEAN.numerical
+                                } else {
+                                    "shell/open-revolve"
+                                }
+                                .to_owned(),
+                            );
+                            // The core's own approximation label, if it
+                            // carries one, travels with the wall it opened.
+                            outcome.report.warnings.append(&mut warnings);
+                            outcome.report.sort_deterministically();
                             return Ok(outcome);
                         }
                     }
@@ -2503,8 +2589,10 @@ impl NativeKernel {
 
         // Beyond the prism reductions, the general analytic engine runs the
         // full imprint/classify/regularize/sew pipeline for operands whose
-        // faces it can carry. Everything is exact; nothing tessellates.
+        // faces it can carry. Everything is exact, and nothing tessellates,
+        // until the numerical rung, which says what it approximated.
         let mut rung = "boolean/prism";
+        let mut warnings = Vec::new();
         // Two coaxial bodies of revolution combine in their shared section,
         // exactly, cones, spheres and tori included (ADR 0026 F4).
         let coaxial = match &analytic {
@@ -2532,7 +2620,7 @@ impl NativeKernel {
                 if analytic_boolean::operands_in_engine_vocabulary(&target.topology, &tool.topology)
                 {
                     rung = "boolean/analytic";
-                    match perf_span!(
+                    let exact = perf_span!(
                         "kernel.boolean.analytic",
                         target.topology.faces.len() + tool.topology.faces.len(),
                         {
@@ -2543,9 +2631,57 @@ impl NativeKernel {
                                 request.precision,
                             )
                         }
-                    ) {
-                        Ok(topology) => topology,
-                        Err(analytic_boolean::AnalyticBooleanError::EmptyResult) => {
+                    );
+                    // Past the exact engine, the numerical intersection rung
+                    // (ADR 0056 B2): the same engine with the carrier pairs
+                    // the matrix refuses traced and fitted, labelled with the
+                    // departure it measured.
+                    let numerical = match &exact {
+                        Ok(_) | Err(analytic_boolean::AnalyticBooleanError::EmptyResult) => None,
+                        Err(_) => Some(numerical_rung(
+                            &target.topology,
+                            &tool.topology,
+                            request.operation,
+                            request.precision,
+                        )),
+                    };
+                    match (exact, numerical) {
+                        (_, Some(Ok((topology, approximation)))) => {
+                            if let Some(approximation) = approximation {
+                                rung = "boolean/numerical";
+                                warnings.push(numerical_intersection_warning(approximation));
+                            }
+                            topology
+                        }
+                        // The rung found the faces within reach of one
+                        // another and could not trace or fit their curve, or
+                        // built a body the validator refused: that is the
+                        // reason to give, not the exact engine's.
+                        (
+                            _,
+                            Some(Err(
+                                decline @ (ExactRouteDecline::IntersectionUnresolved
+                                | ExactRouteDecline::Invalid),
+                            )),
+                        ) => {
+                            return Err(error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                target.id,
+                                "the Boolean operands leave the regularized analytic domain",
+                                vec![simple_diagnostic(
+                                    "BOOLEAN_INTERSECTION_UNRESOLVED",
+                                    KernelStage::Construction,
+                                    &format!(
+                                        "The numerical intersection rung could not answer: {}; \
+                                         move the faces apart or change the carriers.",
+                                        decline.sentence()
+                                    ),
+                                )],
+                            ));
+                        }
+                        (Ok(topology), _) => topology,
+                        (Err(analytic_boolean::AnalyticBooleanError::EmptyResult), _) => {
                             return Err(error(
                                 KernelErrorCode::Unsupported,
                                 KernelStage::Construction,
@@ -2558,7 +2694,7 @@ impl NativeKernel {
                                 )],
                             ));
                         }
-                        Err(analytic_boolean::AnalyticBooleanError::CarrierPair(pair)) => {
+                        (Err(analytic_boolean::AnalyticBooleanError::CarrierPair(pair)), _) => {
                             let [first, second] = *pair;
                             // The engine names the pair the two faces actually
                             // bring together, which a scan of every carrier
@@ -2580,7 +2716,7 @@ impl NativeKernel {
                                 )],
                             ));
                         }
-                        Err(analytic_boolean::AnalyticBooleanError::TraceUnclosed) => {
+                        (Err(analytic_boolean::AnalyticBooleanError::TraceUnclosed), _) => {
                             return Err(error(
                                 KernelErrorCode::Unsupported,
                                 KernelStage::Construction,
@@ -2596,7 +2732,10 @@ impl NativeKernel {
                                 )],
                             ));
                         }
-                        Err(analytic_boolean::AnalyticBooleanError::IntersectionUnresolved) => {
+                        (
+                            Err(analytic_boolean::AnalyticBooleanError::IntersectionUnresolved),
+                            _,
+                        ) => {
                             return Err(error(
                                 KernelErrorCode::Unsupported,
                                 KernelStage::Construction,
@@ -2612,7 +2751,7 @@ impl NativeKernel {
                                 )],
                             ));
                         }
-                        Err(analytic_boolean::AnalyticBooleanError::DomainUnsupported) => {
+                        (Err(analytic_boolean::AnalyticBooleanError::DomainUnsupported), _) => {
                             // An out-of-matrix carrier pair is a vocabulary
                             // limit and says so; anything else the engine
                             // refuses is a contact outside the transverse
@@ -2734,7 +2873,7 @@ impl NativeKernel {
             bounds: measures.bounds,
             history,
             validation,
-            warnings: Vec::new(),
+            warnings,
             rung: Some(rung.to_owned()),
         };
         report.sort_deterministically();
@@ -4403,8 +4542,8 @@ impl ExactRouteDecline {
 
     fn sentence(self) -> String {
         match self {
-            Self::Vocabulary => "the body carries a face class — a torus, a cone, a sphere or a \
-                                 ruled wall — that the exact engine cannot sew"
+            Self::Vocabulary => "the body carries a face class — a ruled wall or a B-spline \
+                                 patch — that the exact engine cannot sew"
                 .to_owned(),
             Self::CarrierPair { first, second } => format!(
                 "the {first} and {second} carriers meet in a curve outside this kernel's line and \
@@ -4474,6 +4613,67 @@ fn exact_candidate(
     } else {
         Err(ExactRouteDecline::Invalid)
     }
+}
+
+/// The numerical intersection rung (ADR 0056 B2–B4): the general engine with
+/// the carrier pairs the matrix refuses traced and fitted, held to the solid
+/// validator as any exact candidate is. The body, and the approximation it
+/// carries — `None` when no curve had to be traced and the body is exact
+/// after all — or why the rung does not answer.
+fn numerical_rung(
+    target: &Topology,
+    tool: &Topology,
+    operation: BooleanOperation,
+    precision: PrecisionPolicy,
+) -> Result<(Topology, Option<analytic_boolean::NumericalApproximation>), ExactRouteDecline> {
+    if !analytic_boolean::operands_in_engine_vocabulary(target, tool) {
+        return Err(ExactRouteDecline::Vocabulary);
+    }
+    let (topology, approximation) =
+        analytic_boolean::build_general_boolean(target, tool, operation, precision)
+            .map_err(ExactRouteDecline::from_engine)?;
+    let validation = validator::validate(&topology, precision.linear_agreement);
+    if validation.diagnostics.is_empty() {
+        Ok((topology, approximation))
+    } else {
+        Err(ExactRouteDecline::Invalid)
+    }
+}
+
+/// The warning every numerically intersected result carries: what was
+/// approximated, how far the fitted curves depart, and the tolerance they
+/// were held to.
+fn numerical_intersection_warning(
+    approximation: analytic_boolean::NumericalApproximation,
+) -> ProtocolDiagnostic {
+    let mut warning = approximation_warning(
+        "BOOLEAN_INTERSECTION_APPROXIMATED",
+        &format!(
+            "{} intersection curve{} between carriers outside the exact matrix {} traced \
+             numerically and fitted as B-splines. Each fitted curve and its parameter traces \
+             lie within {:.3e} of both carriers and of one another, inside the intersection \
+             tolerance of {:.3e}; the body's faces are exact carriers, but these edges \
+             approximate the true curves rather than certifying them.",
+            approximation.curves,
+            if approximation.curves == 1 { "" } else { "s" },
+            if approximation.curves == 1 {
+                "was"
+            } else {
+                "were"
+            },
+            approximation.deviation,
+            approximation.tolerance
+        ),
+    );
+    warning.measurement = Some(DiagnosticMeasurement {
+        quantity: QuantityKind::Length,
+        measured: approximation.deviation,
+        allowed: NumericInterval {
+            min: None,
+            max: Some(approximation.tolerance),
+        },
+    });
+    warning
 }
 
 /// A faceted-tier refusal with the exact route's reason in front of it: a
@@ -4620,6 +4820,9 @@ struct ToolBoolean {
     /// The rung for two coaxial bodies of revolution combined in their
     /// shared section (ADR 0026 F4).
     coaxial: &'static str,
+    /// The rung for the numerical intersection route (ADR 0056 B2): the
+    /// general engine with out-of-matrix carrier pairs traced and fitted.
+    numerical: &'static str,
 }
 
 /// A loft added to or cut from a body (ADR 0049).
@@ -4635,6 +4838,7 @@ const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
         "loft/faceted",
     ],
     coaxial: "loft/boolean-coaxial",
+    numerical: "loft/boolean-numerical",
 };
 
 /// A sweep added to or cut from a body (ADR 0055). A straight sweep is a
@@ -4652,6 +4856,7 @@ const SWEEP_BOOLEAN: ToolBoolean = ToolBoolean {
         "sweep/faceted",
     ],
     coaxial: "sweep/boolean-coaxial",
+    numerical: "sweep/boolean-numerical",
 };
 
 /// A revolve added to or cut from a body (ADR 0055). A revolve whose
@@ -4671,6 +4876,7 @@ const REVOLVE_BOOLEAN: ToolBoolean = ToolBoolean {
         "revolve/faceted",
     ],
     coaxial: "revolve/boolean-coaxial",
+    numerical: "revolve/boolean-numerical",
 };
 
 /// The wedge wall taken off a partial turn's shell core (ADR 0055). The
@@ -4689,6 +4895,7 @@ const SHELL_BOOLEAN: ToolBoolean = ToolBoolean {
         "shell/faceted",
     ],
     coaxial: "shell/closed-revolve",
+    numerical: "shell/numerical",
 };
 
 /// A spline profile added to or cut from a face (ADR 0050), which answers
@@ -4705,6 +4912,7 @@ const SPLINE_FACE_BOOLEAN: ToolBoolean = ToolBoolean {
         "face-feature/faceted",
     ],
     coaxial: "face-feature/coaxial-section",
+    numerical: "face-feature/numerical-boolean",
 };
 
 /// A loft added to or cut from a body, through the Boolean ladder.
@@ -4808,6 +5016,22 @@ fn tool_boolean(
     } else {
         ExactRouteDecline::Vocabulary
     };
+    // The numerical intersection rung (ADR 0056 B2), between the exact
+    // engine and the faceted tier: exact where nothing had to be traced,
+    // labelled with its measured departure where something had.
+    if let Ok((topology, approximation)) =
+        numerical_rung(&input.topology, &tool, operation, precision)
+    {
+        return Ok(match approximation {
+            Some(approximation) => {
+                warnings
+                    .push(decline.diagnostic_coded(labels.declined, DiagnosticSeverity::Warning));
+                warnings.push(numerical_intersection_warning(approximation));
+                (topology, labels.numerical)
+            }
+            None => (topology, labels.rungs[1]),
+        });
+    }
     let declined = |mut refusal: KernelError| {
         for diagnostic in &mut refusal.diagnostics {
             if diagnostic.code.as_str() == "FACE_FEATURE_FACETED_UNRESOLVED" {
@@ -6148,6 +6372,11 @@ fn tessellate_torus_face(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 3]> {
+    // A face that is more than its parameter rectangle — holed, or bounded
+    // by a traced curve — is drawn from its loops (ADR 0056 Track B).
+    if let Some(triangles) = trimmed_tessellation::tessellate(topology, face, budget, precision) {
+        return triangles;
+    }
     let Some(loop_record) = topology.loop_record(face.outer_loop) else {
         return Vec::new();
     };
@@ -6257,6 +6486,9 @@ fn tessellate_sphere_face(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 3]> {
+    if let Some(triangles) = trimmed_tessellation::tessellate(topology, face, budget, precision) {
+        return triangles;
+    }
     let Some((u_min, u_max, v_min, v_max)) = face_parameter_bounds(topology, face) else {
         return Vec::new();
     };
@@ -6358,6 +6590,9 @@ fn tessellate_cone_face(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 3]> {
+    if let Some(triangles) = trimmed_tessellation::tessellate(topology, face, budget, precision) {
+        return triangles;
+    }
     let Some(loop_record) = topology.loop_record(face.outer_loop) else {
         return Vec::new();
     };
@@ -6830,6 +7065,11 @@ fn tessellate_cylinder_face(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 3]> {
+    // A holed face, or one bounded by a traced curve, is drawn from its
+    // loops (ADR 0056 Track B); the strips below keep every other face.
+    if let Some(triangles) = trimmed_tessellation::tessellate(topology, face, budget, precision) {
+        return triangles;
+    }
     if !face.inner_loops.is_empty() {
         return Vec::new();
     }

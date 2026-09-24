@@ -69,7 +69,7 @@ are stable, slash-separated paths:
 | `revolve/partial-turn` | A section turned through less than a full turn (ADR 0055 R3): its curved faces are split halfway round the turn, and two planar wedge faces, the section and its turned copy, close it. |
 | `revolve/boolean-prism`, `revolve/boolean-analytic` | A revolve added to or cut from the body exactly (ADR 0055): its faces came out planes and coaxial cylinders. |
 | `revolve/boolean-coaxial`, `sweep/boolean-coaxial`, `loft/boolean-coaxial`, `face-feature/coaxial-section`, `boolean/coaxial` | A body of revolution added to, cut from or combined with a body turned about the same axis: the Boolean of the two `(r, z)` sections, turned again (ADR 0026 F4). Exact for every carrier the section builder makes, cones, spheres and tori included. |
-| `revolve/faceted` | A revolve added to or cut from the body on the faceted tier, because it has a cone, torus or sphere face the exact engines do not carry and it does not turn about the body's own axis. Carries `REVOLVE_FACETED_APPROXIMATION` and the reason, `REVOLVE_EXACT_ROUTE_DECLINED`. |
+| `revolve/faceted` | A revolve added to or cut from the body on the faceted tier, because a pair of faces it brings together is outside ADR 0025's matrix and the numerical intersection rung could not trace it either, or the operands meet in a contact the exact engine does not classify. Carries `REVOLVE_FACETED_APPROXIMATION` and the reason, `REVOLVE_EXACT_ROUTE_DECLINED`. |
 | `sweep/straight` | A profile swept along a straight path (ADR 0055): lofted to its copy at the far end, with planes, cylinders and ruled walls. Exact. |
 | `sweep/revolve` | A profile swept along one circular arc about an axis in its own plane, turned with the path: a partial revolve. Exact. |
 | `sweep/skinned` | A profile swept along any other path: skinned through copies of it along the path, graded in wherever the skin strays. Carries `SWEEP_APPROXIMATION_TOLERANCE`, measuring the worst departure from the true sweep against the approximation budget. |
@@ -88,13 +88,14 @@ are stable, slash-separated paths:
 | `edge-finish/concave-fill` | A concave straight edge between flat faces on a body no prism rung owns, filled by unioning its own corner region into the body (ADR 0056, F2); the material added is certified against the closed form. Convex edges in the same selection are finished on the filled body afterwards, bounded against the fill where they meet it (F3). Exact. |
 | `edge-finish/faceted` | A fillet or chamfer on the faceted tier. |
 | `variable-radius/faceted` | A fillet whose radius changes linearly along a convex straight edge (ADR 0056, F5, first slice), reached through `NativeKernel::finish_edge_variable_radius`: the band is carried as flat facets lofted between the two end sections and cut exactly, so the approximation is the tool's alone. Carries `EDGE_FINISH_VARIABLE_RADIUS_FACETED_APPROXIMATION` with the measured deviation; the volume removed is certified against the cone's closed form. |
-| `boolean/prism`, `boolean/analytic` | A union, difference or intersection by the prism reduction or the general engine. |
+| `boolean/prism`, `boolean/analytic` | A union, difference or intersection by the prism reduction or the general engine. Since ADR 0056 B1 the general engine sews cones, spheres and tori too, exactly, wherever every pair of faces that meet is in ADR 0025's matrix. |
+| `boolean/numerical`, `face-feature/numerical-boolean`, `revolve/boolean-numerical`, `sweep/boolean-numerical`, `loft/boolean-numerical`, `shell/numerical` | The numerical intersection rung (ADR 0056 B2–B4): the same general engine, with every pair of analytic faces the matrix refuses traced by marching and fitted as a B-spline, on the body and in each face's parameter space, before the section is closed and sewn as an exact one is. The step carries `BOOLEAN_INTERSECTION_APPROXIMATED` with the largest departure it measured between the fitted curves and the true surfaces against the tolerance it holds them to, and the reason the exact route stood aside. A pair the rung cannot trace within tolerance refuses by name, `BOOLEAN_INTERSECTION_UNRESOLVED`, or falls to the faceted tier where one exists. |
 | `mirror/exact` | A mirror: every carrier reflected as itself, faces reversed to face outward. |
 | `pattern/replay` | A feature pattern; the instance steps `<label>/<n>` under it carry the rungs that built each instance. |
 | `pattern/exact-instances`, `pattern/boolean` | A whole-body pattern: copies that clear one another placed as solids of one body, or copies that overlap joined through the Boolean ladder. |
 | `shell/open-prism`, `shell/closed-prism` | A shell of a prism: the open face's inward offset cut as a pocket, or a core one wall in from every face enclosed as a void. |
 | `shell/open-revolve`, `shell/closed-revolve` | A shell of a solid of revolution, offset in its own section; a partial turn's core also loses a prism along the axis that keeps one wall along each closed wedge face. |
-| `shell/faceted` | A shell whose pocket, or whose partial turn's core, the exact rungs could not cut; a partial cone's wedge wall meets its conical core in a hyperbola. A cut core carries `SHELL_FACETED_APPROXIMATION` and the reason, `SHELL_EXACT_ROUTE_DECLINED`. |
+| `shell/faceted` | A shell whose pocket, or whose partial turn's core, neither the exact rungs nor the numerical intersection rung could cut. A cut core carries `SHELL_FACETED_APPROXIMATION` and the reason, `SHELL_EXACT_ROUTE_DECLINED`. |
 | `transform/similarity` | A rigid transform. |
 | `surface/extrude`, `surface/revolve`, `surface/patch` | A sheet body (ADR 0056, Track S): the walls a chain sweeps along a normal, the bands it sweeps about an axis, or a profile's planar face, each on the carriers the solid builders write and with no caps. |
 | `stitch/sheet`, `stitch/solid` | Sheets welded along their boundaries within the model's agreement: a sheet while any boundary edge is left, a solid once every one pairs. |
@@ -104,9 +105,16 @@ are stable, slash-separated paths:
 
 A rung ending in `/faceted` or `/approximate` is the approximate tier;
 the step also carries a `*_FACETED_APPROXIMATION` or
-`*_OFFSET_APPROXIMATION` warning. Everything else is exact: the body's
-faces are analytic carriers, its volume is a closed-form integral, and its
-digest is a function of that geometry alone.
+`*_OFFSET_APPROXIMATION` warning. A rung with `numerical` in it is the
+approximate tier too, on a different footing: the body keeps its analytic
+carriers and its volume is still integrated exactly over the faces it has,
+but the curves where two of them meet are B-splines fitted to a traced
+intersection, and the step's `BOOLEAN_INTERSECTION_APPROXIMATED` warning
+states how far they were measured to depart from the true surfaces. A
+warning code ending in `_APPROXIMATED` marks a step approximate exactly as
+`_FACETED_APPROXIMATION` does. Everything else is exact: the body's faces
+are analytic carriers, its volume is a closed-form integral, and its digest
+is a function of that geometry alone.
 
 ### Face and edge descriptions
 

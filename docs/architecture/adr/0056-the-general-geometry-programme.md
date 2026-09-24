@@ -179,6 +179,17 @@ and circles, which `curve_chords` and the chainers already carry.
   clears the blend; a sphere seated on a plate joined by union; the
   conservation fuzzer over bodies with all seven classes.
 - Effort: 3–4 weeks.
+- **Status 2026-09-24: done**, except the fuzzer. `revolved.rs` gives the
+  four surfaces of revolution one profile/ray/reparameterisation
+  vocabulary; `section_cells.rs` closes a face's section by the cells of
+  its arrangement, classified in 3D, so cone, sphere and torus faces need
+  no bounded section loop; `revolved_measures.rs` integrates area, volume
+  and moment over any loop on a surface of revolution by Green's theorem.
+  Coincident overlays for the three classes are admitted. Gates in
+  `boolean_frontier.rs`: `a_sphere_seated_on_a_plate_joins_exactly`,
+  `a_coaxial_counterbore_cuts_into_a_drafted_boss_on_a_plate`,
+  `a_bore_that_clears_a_torus_blend_stays_exact`, each exact and
+  unlabelled, with conservation asserted on every pair.
 
 ### B2. Quadric traces over a ruled host
 
@@ -199,6 +210,19 @@ it is obtained by exact inversion.
   intersection volume by Pappus-free quadrature), the crossing-bore
   fixtures rerun with one cone.
 - Effort: 5–6 weeks.
+- **Status 2026-09-24: answered by one numerical route rather than by
+  closed-form traces.** B2, B3 and the analytic part of B4 landed together
+  as `surface_marching.rs`: every pair of analytic carriers the matrix
+  refuses is marched and fitted (see B4's status), so the quadric-trace
+  machinery this stage describes was not built. Gates in
+  `boolean_frontier.rs`: `a_sphere_cut_by_an_off_centre_bore_is_traced_numerically`
+  (union, difference and intersection each within 1e-7 of a polar
+  quadrature oracle, and conserved) and
+  `a_cone_cut_by_an_oblique_plane_is_traced_numerically` (segment-area
+  oracle). The rung is `boolean/numerical`, `Tier::Approximate`, with
+  `BOOLEAN_INTERSECTION_APPROXIMATED`. A closed-form quadric trace would
+  make these pairs exact and unlabelled; that remains the way to retire the
+  label for them.
 
 ### B3. Quartic traces: the torus against a ruled host or a plane
 
@@ -214,6 +238,15 @@ parallel lines in the plane.
 - **Gates:** a filleted block (torus bands) drilled off-axis; a torus
   cut by a slanted plane; the conservation fuzzer over blended bodies.
 - Effort: 5–6 weeks.
+- **Status 2026-09-24: answered by the numerical route** (see B4's
+  status), including the pairs this stage deferred: torus × torus and
+  torus × sphere off-axis need no generator. Gates in
+  `boolean_frontier.rs`: `a_hole_through_a_torus_band_is_traced_numerically`
+  (the `blend_then_drill` example, volume within 1e-7 of a polar
+  quadrature oracle, rung `face-feature/numerical-boolean`) and
+  `two_tori_crossing_are_traced_numerically` (four closed loops; union,
+  difference and intersection within 1e-7 of a lens-annulus slice oracle
+  and conserved). The slanted-plane torus and the fuzzer are not written.
 
 ### B4. General surface–surface intersection (SSI)
 
@@ -242,6 +275,34 @@ The long pole. For ruled, B-spline and the residual analytic pairs:
 - Effort: 10–14 weeks. This is where commercial kernels spent years; the
   plan is to ship it narrow (transverse crossings, non-rational,
   non-periodic) and widen behind the fuzzer.
+- **Status 2026-09-24: the analytic half shipped; ruled and B-spline
+  carriers wait.** `surface_marching.rs` traces any two analytic carriers
+  (plane, cylinder, cone, sphere, torus) through implicit-function
+  oracles: start points from a grid of either patch projected onto the
+  curve by minimum-norm Newton, marching along `n₁ × n₂` with step control
+  on the turn and the corrector's reach, closed-loop detection, and every
+  branch inside the faces' windows. A sampled separation test
+  (`patches_apart`: half the sample spacing plus the sagitta the least
+  curvature radius allows) keeps pairs that cannot meet off the tracer, so
+  a bore that clears a torus blend stays exact. The marched points are
+  resampled evenly by arc length and interpolated by a degree-5 B-spline in
+  space and in each carrier's parameter space (a plane's pcurve is the
+  space curve projected, control point for control point), doubling the
+  sampling until the worst of position, distance to either carrier and
+  tangent mismatch — the validator's own locus proof — is within an
+  absolute 5e-10, a tenth of the validator's tolerance. The curve is
+  carried as `Curve3::Bspline` with `Curve2::Bspline` pcurves, cut where
+  it crosses face boundaries on either side (`curve_region_crossings`),
+  and each face's section is closed by the cells of its arrangement
+  (`section_cells.rs`). The measured deviation travels in
+  `BOOLEAN_INTERSECTION_APPROXIMATED` as `Tier::Approximate` — not the
+  `Tier::Certified` this stage proposed, which does not exist yet — and a
+  pair within reach that cannot be traced within tolerance refuses as
+  `BOOLEAN_INTERSECTION_UNRESOLVED`. Tangential crossings stall the
+  tracer and refuse that way rather than by a name of their own. Not done:
+  ruled and B-spline oracles (the tracer's `Oracle` has no arm for them;
+  `sweep/faceted` and `loft/faceted` fixtures still reach the faceted
+  tier), interval-Newton certification, the corpus and the fuzzer.
 
 ### B5. Classification, sewing and the ladder
 
@@ -257,6 +318,36 @@ The long pole. For ruled, B-spline and the residual analytic pairs:
   listed, and each is either moved up a tier or has its refusal code
   recorded as intended.
 - Effort: 3–4 weeks, interleaved with B2–B4.
+- **Status 2026-09-24: the ladder is prism → coaxial → analytic →
+  numerical → faceted** at every site (`execute_boolean`, `tool_boolean`
+  for revolves, sweeps, lofts and shells, and both face-feature sites), the
+  numerical rung reached only when the exact engine declines and answering
+  only when the solid validator passes its body. `point_in_solid` casts
+  rays through cone, sphere and torus faces by their quadric and quartic
+  roots (`revolved::ray_face_crossings`); `sew_shells` welds B-spline
+  edges by their endpoints and midpoint from the one curve both faces
+  carry. `HistoryMode::Approximate` and the timeline badge are not done.
+  Every Boolean fixture that reached the faceted tier before, and where
+  it stands now:
+  - `examples/blend_then_drill.art` (`exact_route_decline.rs`,
+    `report_tests.rs`, `roundtrip_tests.rs`, `boolean_frontier.rs`): the
+    torus × cylinder hole, now `face-feature/numerical-boolean`, within
+    1e-7 of the polar quadrature oracle.
+  - `revolve_probe.rs::a_revolved_sphere_cuts_a_block_exactly` and
+    `a_pointed_cone_cuts_a_block`: sphere × plane and cone × plane, in the
+    matrix, now `revolve/boolean-analytic` and exact to 1e-9.
+  - `shell_tests.rs::a_quarter_tapered_post_shells_closed_on_the_numerical_rung`:
+    the cone × plane hyperbola of a partial turn's core, now
+    `shell/numerical`.
+  - `coaxial_boolean.rs::a_revolve_about_another_axis_is_not_coaxial`:
+    cone × cylinder off-axis, now `revolve/boolean-numerical`.
+  - `second_crossing_bore.rs`: cylinder × cylinder, exact since ADR 0047;
+    unchanged.
+  - `bspline_surfaces.rs` (`face-feature/faceted`),
+    `loft_between_sections.rs` (`loft/faceted`, `face-feature/faceted`),
+    `sweep_probe.rs` (`sweep/faceted`): ruled and B-spline walls, which the
+    tracer has no oracle for; they stay on the faceted tier with their
+    labels, refused by the exact route as `Vocabulary`.
 
 ## 5. Track F — general fillets
 

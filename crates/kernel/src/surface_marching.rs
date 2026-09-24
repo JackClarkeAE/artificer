@@ -25,10 +25,10 @@ use crate::topology::{Point2, Point3, Surface, Vector2, Vector3};
 /// The agreement the fitted curve is brought to, in model units: a tenth of
 /// the validator's linear tolerance, so every sample the locus proof takes
 /// of the fitted edge lands inside it.
-pub(crate) const INTERSECTION_TOLERANCE: f64 = 1.0e-10;
+pub(crate) const INTERSECTION_TOLERANCE: f64 = 5.0e-10;
 
 /// The most marched points one curve is allowed before the fit is given up.
-const MOST_POINTS: usize = 6_000;
+const MOST_POINTS: usize = 16_384;
 
 /// Why a pair could not be traced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,13 +146,23 @@ impl Oracle {
         Revolved::of(self.surface).is_some_and(Revolved::v_periodic)
     }
 
-    /// The smallest curvature radius the carrier has, for step control and
-    /// sagitta bounds.
-    fn least_radius(&self) -> f64 {
+    /// The smallest curvature radius the carrier has inside a window, for
+    /// step control and sagitta bounds. A cone's is its narrowest ring in
+    /// the window (its curvature radius along a ring is the ring's radius
+    /// times the slant factor, so the ring radius alone is the lower bound),
+    /// and zero where the window holds the apex.
+    fn least_radius(&self, window: Window) -> f64 {
         match self.surface {
             Surface::Plane(_) => f64::INFINITY,
             Surface::Cylinder(cylinder) => cylinder.radius.abs(),
-            Surface::Cone(cone) => cone.base_radius.abs().max(1.0e-3),
+            Surface::Cone(cone) => {
+                let (low, high) = (cone.ring_radius(window.v.0), cone.ring_radius(window.v.1));
+                if low.signum() != high.signum() {
+                    0.0
+                } else {
+                    low.abs().min(high.abs())
+                }
+            }
             Surface::Sphere(sphere) => sphere.radius.abs(),
             Surface::Torus(torus) => torus.minor_radius.abs(),
             Surface::Ruled(_) | Surface::Bspline(_) => 1.0,
@@ -219,7 +229,13 @@ fn march(
     scale: f64,
 ) -> (Vec<Point3>, Stop) {
     let mut points = vec![start];
-    let least_radius = a.least_radius().min(b.least_radius());
+    // The tightest bend either carrier has bounds the step; a carrier with
+    // an apex in the window bounds nothing, and the turn control below
+    // keeps the step honest there.
+    let least_radius = a
+        .least_radius(windows[0])
+        .min(b.least_radius(windows[1]))
+        .max(scale * 1.0e-2);
     let largest = (scale / 32.0).min(least_radius / 4.0).max(scale * 1.0e-4);
     let floor = scale * 1.0e-7;
     let mut step = largest / 4.0;
@@ -230,9 +246,8 @@ fn march(
     heading = heading * direction;
     let mut travelled = 0.0;
     let mut stop = Stop::Stalled;
-    let inside = |point: Point3| {
-        windows[0].contains(a.local(point)) && windows[1].contains(b.local(point))
-    };
+    let inside =
+        |point: Point3| windows[0].contains(a.local(point)) && windows[1].contains(b.local(point));
     while points.len() < MOST_POINTS {
         let predicted = point + heading * step;
         let Some(next) = project(a, b, predicted, scale) else {
@@ -245,7 +260,11 @@ fn march(
         let Some(ahead) = tangent(a, b, next) else {
             break;
         };
-        let ahead = if ahead.dot(heading) < 0.0 { ahead * -1.0 } else { ahead };
+        let ahead = if ahead.dot(heading) < 0.0 {
+            ahead * -1.0
+        } else {
+            ahead
+        };
         let turn = heading.dot(ahead).clamp(-1.0, 1.0).acos();
         let moved = (next - point).length();
         if (turn > 0.15 || moved > 2.0 * step || (next - predicted).length() > 0.5 * step)
@@ -386,7 +405,7 @@ fn window_scale(oracle: &Oracle, window: Window) -> f64 {
             scale = scale.max((*corner - *other).length());
         }
     }
-    scale.max(oracle.least_radius().min(1.0e3))
+    scale.max(oracle.least_radius(window).min(1.0e3))
 }
 
 /// The parameters of the marched points on one carrier, continuous across
@@ -426,7 +445,12 @@ fn fit(
     closed: bool,
     scale: f64,
 ) -> Result<Option<TracedCurve>, TraceError> {
-    let mut count = points.len().max(32).next_power_of_two();
+    // The sampling starts coarse whatever the march took: the marched
+    // points only lay out the curve, and the fit's own doubling finds the
+    // count it needs. Too fine a start would not converge better — the
+    // rate of a spline with very short spans amplifies the rounding of its
+    // control points — so the first count under tolerance is the one kept.
+    let mut count = 32;
     while count <= MOST_POINTS {
         let samples = resample(a, b, &points, count, scale);
         let Some(candidate) = interpolate_all(a, b, &samples, closed) else {
@@ -484,13 +508,14 @@ fn chord_parameters(points: &[Point3]) -> Option<Vec<f64>> {
     parameters.push(0.0);
     for pair in points.windows(2) {
         let chord = (pair[1] - pair[0]).length();
-        if !(chord > 0.0) {
+        // A repeated point, or a NaN, has no chord to parameterise by.
+        if chord.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return None;
         }
         running += chord;
         parameters.push(running);
     }
-    if !(running > 0.0) {
+    if running.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return None;
     }
     for parameter in &mut parameters {
@@ -599,7 +624,7 @@ pub(crate) fn patches_apart(
             }
         }
         let diagonal = spacing * std::f64::consts::SQRT_2;
-        let sagitta = diagonal * diagonal / (8.0 * patch.least_radius());
+        let sagitta = diagonal * diagonal / (8.0 * patch.least_radius(window));
         let cover = 0.5 * diagonal + sagitta + 1.0e-6;
         samples.iter().all(|parameters| {
             let point = patch.evaluate(*parameters);

@@ -150,14 +150,20 @@ fn snapshot_bound_references_become_history_selectors() {
 
 #[test]
 fn an_approximate_step_is_annotated_and_rebuilds_on_the_same_tier() {
+    // The hole through the blended rim is the numerical intersection rung's
+    // since ADR 0056 Track B: approximate, and annotated with the rung that
+    // built it rather than the faceted tier.
     let session = run(include_str!("../examples/blend_then_drill.art"));
     assert_eq!(session.tier(), Tier::Approximate);
     let script = session.to_art(&DecompileOptions::default()).unwrap();
     assert!(
-        script.contains("// approximate: the faceted tier built this step"),
+        script.contains("// approximate: the numerical intersection rung built this step"),
         "{script}"
     );
-    assert!(script.contains("fell to the faceted tier"), "{script}");
+    assert!(
+        script.contains("was built by the numerical intersection rung"),
+        "{script}"
+    );
     let rebuilt = run(&script);
     assert_eq!(rebuilt.tier(), Tier::Approximate);
     assert_eq!(

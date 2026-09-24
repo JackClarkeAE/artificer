@@ -2206,9 +2206,10 @@ impl Tier {
 impl OperationReport {
     /// Exact unless the faceted tier reported its approximation warning,
     /// which every approximate rung attaches, or a surface was offset by
-    /// approximation (`SURFACE_OFFSET_APPROXIMATION`, ADR 0056), or a reading
-    /// was approximated (a rational spline read as non-rational within its
-    /// tolerance), which its `_APPROXIMATED` warning says.
+    /// approximation (`SURFACE_OFFSET_APPROXIMATION`, ADR 0056), or a
+    /// `*_APPROXIMATED` warning says a reading or an intersection was
+    /// approximated (a rational spline read as non-rational within its
+    /// tolerance; the numerical intersection rung, ADR 0056).
     #[must_use]
     pub fn tier(&self) -> Tier {
         let approximate = self.warnings.iter().any(|warning| {

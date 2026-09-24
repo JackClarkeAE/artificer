@@ -286,6 +286,13 @@ impl Session {
                     .is_some_and(|rung| rung.ends_with("/approximate"))
                 {
                     " Approximate: an approximated surface built this step."
+                } else if outcome
+                    .report
+                    .rung
+                    .as_deref()
+                    .is_some_and(|rung| rung.contains("numerical"))
+                {
+                    " Approximate: the numerical intersection rung built this step."
                 } else {
                     " Approximate: the faceted tier built this step."
                 }

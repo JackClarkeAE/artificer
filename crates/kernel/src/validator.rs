@@ -1298,6 +1298,19 @@ fn pcurve_locus_error(
             // invariant to check. A quartic has no frame to compare.
             sampled_error.max(tangent_error)
         }
+        (
+            Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Torus(_),
+            Curve2::Bspline { .. },
+            Curve3::Bspline { .. },
+        ) => {
+            // A numerically traced intersection curve (ADR 0056 B2): the
+            // space curve and the parameter trace are two fits of one
+            // marched curve over one parameter, held to a tolerance inside
+            // this one when they were made. The sampled and tangent errors
+            // are that agreement, measured again here; no carrier frame
+            // holds a curve that is not one of its own.
+            sampled_error.max(tangent_error)
+        }
         _ => f64::INFINITY,
     };
 
@@ -2571,6 +2584,17 @@ fn exact_face_contribution(
     face: &Face,
     anchor: Point3,
 ) -> Option<FaceContribution> {
+    // A surface of revolution bounded by more than a rectangle of rings and
+    // meridians (a general Boolean's section loops, a numerically traced
+    // B-spline) is measured by Green's theorem along its loops; the closed
+    // forms below keep the rectangles and the cylinder's contour cases.
+    if let Some(revolved) = crate::revolved::Revolved::of(face.surface)
+        && general_revolved_measures(topology, face)
+    {
+        let (area, flux, moment) =
+            crate::revolved_measures::face_contribution(topology, face, revolved, anchor)?;
+        return Some(FaceContribution { area, flux, moment });
+    }
     let mut surface_area = 0.0;
     let mut flux = 0.0;
     let mut moment = Vector3::new(0.0, 0.0, 0.0);
@@ -2905,6 +2929,25 @@ fn exact_face_contribution(
         flux,
         moment,
     })
+}
+
+/// Whether a face on a surface of revolution is measured along its loops
+/// rather than by the closed forms: a cylinder only when a numerically
+/// traced B-spline bounds it (its contour engine knows every other pcurve),
+/// the general surfaces whenever they are more than one rectangle.
+fn general_revolved_measures(topology: &Topology, face: &Face) -> bool {
+    if matches!(face.surface, Surface::Cylinder(_)) {
+        return face.loops().any(|loop_key| {
+            topology.loop_record(loop_key).is_some_and(|record| {
+                record.value.coedges.iter().any(|coedge_key| {
+                    topology
+                        .coedge(*coedge_key)
+                        .is_some_and(|coedge| matches!(coedge.value.pcurve, Curve2::Bspline { .. }))
+                })
+            })
+        });
+    }
+    crate::revolved_measures::needs_general_measures(topology, face)
 }
 
 /// One face's share of the exact shell measures; see [`exact_face_contribution`].

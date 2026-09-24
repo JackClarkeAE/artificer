@@ -516,15 +516,15 @@ pub(crate) fn split_segment_at_points(
     let length = segment_length(segment);
     let cuts: Vec<Cut> = points
         .iter()
-        .filter_map(|point| {
-            match place(parameter_of(segment, *point), length, tolerances) {
+        .filter_map(
+            |point| match place(parameter_of(segment, *point), length, tolerances) {
                 Placement::Interior(parameter) => Some(Cut {
                     parameter,
                     point: *point,
                 }),
                 _ => None,
-            }
-        })
+            },
+        )
         .collect();
     split_segment(segment, &cuts, tolerances)
 }

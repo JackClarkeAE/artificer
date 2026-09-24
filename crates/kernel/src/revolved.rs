@@ -20,8 +20,8 @@
 use crate::analytic_extrusion::Segment;
 use crate::surface_intersection::IntersectionCurve;
 use crate::topology::{
-    Cone, Curve3, Cylinder, ParameterRange, Plane, Point2, Point3, Sphere, Surface, Torus,
-    Vector3, seam_snapped_sin_cos,
+    Cone, Curve3, Cylinder, ParameterRange, Plane, Point2, Point3, Sphere, Surface, Torus, Vector3,
+    seam_snapped_sin_cos,
 };
 
 /// One of the four carriers of revolution.
@@ -33,14 +33,11 @@ pub(crate) enum Revolved {
     Torus(Torus),
 }
 
-/// The meridian profile at one `v`: the ring radius and height and their
-/// rates.
+/// The meridian profile at one `v`: the ring radius and height.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Profile {
     pub(crate) rho: f64,
     pub(crate) z: f64,
-    pub(crate) rho_prime: f64,
-    pub(crate) z_prime: f64,
 }
 
 impl Revolved {
@@ -146,22 +143,16 @@ impl Revolved {
             Self::Cylinder(cylinder) => Profile {
                 rho: cylinder.radius,
                 z: v,
-                rho_prime: 0.0,
-                z_prime: 1.0,
             },
             Self::Cone(cone) => Profile {
                 rho: cone.ring_radius(v),
                 z: v,
-                rho_prime: cone.slope,
-                z_prime: 1.0,
             },
             Self::Sphere(sphere) => {
                 let (sin, cos) = seam_snapped_sin_cos(v);
                 Profile {
                     rho: sphere.radius * cos,
                     z: sphere.radius * sin,
-                    rho_prime: -sphere.radius * sin,
-                    z_prime: sphere.radius * cos,
                 }
             }
             Self::Torus(torus) => {
@@ -169,8 +160,6 @@ impl Revolved {
                 Profile {
                     rho: torus.minor_radius.mul_add(cos, torus.major_radius),
                     z: torus.minor_radius * sin,
-                    rho_prime: -torus.minor_radius * sin,
-                    z_prime: torus.minor_radius * cos,
                 }
             }
         }
@@ -196,7 +185,10 @@ impl Revolved {
         let radial = relative - axis * height;
         let reach = radial.length();
         let azimuth = if reach > 0.0 {
-            self.angular_sign() * radial.dot(self.radial_v()).atan2(radial.dot(self.radial_u()))
+            self.angular_sign()
+                * radial
+                    .dot(self.radial_v())
+                    .atan2(radial.dot(self.radial_u()))
         } else {
             0.0
         };
@@ -340,8 +332,7 @@ pub(crate) fn curve_chords(
                 // and its centre sits where this carrier's minor circle does.
                 let azimuths = match revolved {
                     Revolved::Sphere(sphere) => {
-                        if (radius - sphere.radius).abs() > tolerance
-                            || offset.length() > tolerance
+                        if (radius - sphere.radius).abs() > tolerance || offset.length() > tolerance
                         {
                             return None;
                         }
@@ -484,8 +475,10 @@ fn lift(from: &Surface, piece: Segment) -> Option<SpacePiece> {
         }),
         (surface, Segment::Line { start, end }) => {
             let revolved = Revolved::of(*surface)?;
-            let level = (start.y - end.y).abs() <= 1.0e-12 * start.y.abs().max(end.y.abs()).max(1.0);
-            let upright = (start.x - end.x).abs() <= 1.0e-12 * start.x.abs().max(end.x.abs()).max(1.0);
+            let level =
+                (start.y - end.y).abs() <= 1.0e-12 * start.y.abs().max(end.y.abs()).max(1.0);
+            let upright =
+                (start.x - end.x).abs() <= 1.0e-12 * start.x.abs().max(end.x.abs()).max(1.0);
             if level {
                 // A ring at a fixed `v`.
                 let profile = revolved.profile(start.y);
@@ -775,11 +768,7 @@ pub(crate) fn ray_hits(
         direction.dot(direction),
     );
     // |radial|² = |w|² − h² as a polynomial in t.
-    let radial_square = [
-        q0 - h0 * h0,
-        q1 - 2.0 * h0 * h1,
-        q2 - h1 * h1,
-    ];
+    let radial_square = [q0 - h0 * h0, q1 - 2.0 * h0 * h1, q2 - h1 * h1];
     let polynomial: Vec<f64> = match revolved {
         Revolved::Cylinder(cylinder) => vec![
             radial_square[0] - cylinder.radius * cylinder.radius,
@@ -890,7 +879,9 @@ pub(crate) fn real_roots(polynomial: &[f64]) -> Vec<f64> {
     let bound = 1.0
         + trimmed[..degree]
             .iter()
-            .fold(0.0_f64, |bound, coefficient| bound.max((coefficient / leading).abs()));
+            .fold(0.0_f64, |bound, coefficient| {
+                bound.max((coefficient / leading).abs())
+            });
     let mut stations = vec![-bound];
     stations.extend(real_roots(&derivative(&trimmed)));
     stations.push(bound);
@@ -908,7 +899,8 @@ pub(crate) fn real_roots(polynomial: &[f64]) -> Vec<f64> {
         }
         if (low_value < 0.0) == (high_value < 0.0) {
             // A double root at a station: the polynomial touches zero there.
-            if high_value == 0.0 || high_value.abs() <= 1.0e-13 * scale * bound.powi(degree as i32) {
+            if high_value == 0.0 || high_value.abs() <= 1.0e-13 * scale * bound.powi(degree as i32)
+            {
                 roots.push(high);
             }
             continue;
@@ -957,10 +949,8 @@ pub(crate) fn ray_face_crossings(
         let mut counted = false;
         'branches: for u_turn in [-1.0, 0.0, 1.0] {
             for v_turn in v_turns {
-                let candidate = Point2::new(
-                    tau.mul_add(u_turn, local.x),
-                    tau.mul_add(*v_turn, local.y),
-                );
+                let candidate =
+                    Point2::new(tau.mul_add(u_turn, local.x), tau.mul_add(*v_turn, local.y));
                 match inside(candidate) {
                     Some(1) => {
                         counted = true;
@@ -980,11 +970,7 @@ pub(crate) fn ray_face_crossings(
 
 /// A box in model space a face on one of these carriers cannot leave: the
 /// whole drum, ball or ring the carrier occupies over the face's `v` range.
-pub(crate) fn extent(
-    revolved: Revolved,
-    v_low: f64,
-    v_high: f64,
-) -> Option<(Point3, Point3)> {
+pub(crate) fn extent(revolved: Revolved, v_low: f64, v_high: f64) -> Option<(Point3, Point3)> {
     let axis = revolved.axis();
     let reach = |radius: f64| {
         let (u, v) = (revolved.radial_u(), revolved.radial_v());

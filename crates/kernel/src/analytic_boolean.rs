@@ -491,6 +491,23 @@ fn collect_operand_pieces(
             rest = remaining;
         }
 
+        // A traced curve, or a carrier whose sections the count-based
+        // closure does not read, takes the cells of the arrangement (ADR
+        // 0056 B5); every other face closes its section into regions here,
+        // once, and a section that closes to nothing — every piece outside
+        // the face's window — leaves the face untouched.
+        let by_cells = !traced.is_empty() || Revolved::is_general(face.value.surface);
+        let section = if by_cells {
+            Vec::new()
+        } else {
+            close_section_pieces(&face.value, exact.clone(), region, precision)?
+        };
+        let untouched = if by_cells {
+            exact.is_empty() && traced.is_empty()
+        } else {
+            section.is_empty()
+        };
+
         let mut kept: Vec<Vec<Vec<Segment>>> = Vec::new();
         let mut cells: Vec<crate::section_cells::Cell> = Vec::new();
         for piece in rest {
@@ -499,7 +516,7 @@ fn collect_operand_pieces(
                 loops.extend(piece.holes.iter().cloned());
                 loops
             };
-            if exact.is_empty() && traced.is_empty() {
+            if untouched {
                 // Untouched face: wholesale in-or-out of the other solid. One
                 // clear of the other solid's whole box is outside it (a solid
                 // is bounded), so it skips the ray cast over every far face.
@@ -516,7 +533,7 @@ fn collect_operand_pieces(
                 if keep {
                     kept.push(piece_loops);
                 }
-            } else if !traced.is_empty() || Revolved::is_general(face.value.surface) {
+            } else if by_cells {
                 // A traced curve, or a carrier whose sections the count-based
                 // closure does not read: the cells of the arrangement,
                 // classified in space (ADR 0056 B5).
@@ -549,7 +566,6 @@ fn collect_operand_pieces(
                     })?,
                 );
             } else {
-                let section = close_section_pieces(&face.value, exact.clone(), region, precision)?;
                 match profile_boolean_multi(
                     std::slice::from_ref(&piece),
                     &section,
@@ -885,13 +901,20 @@ fn coincident_overlays(
         if faces_apart(own_extent, other.extents[index], precision) {
             continue;
         }
-        let outcome =
-            intersect(face.surface, other_face.value.surface, precision).map_err(|_| {
-                AnalyticBooleanError::CarrierPair(Box::new([
+        // A pair outside the matrix is never a coincident pair: the matrix
+        // answers `Coincident` for every same-carrier pair it knows. What
+        // such a pair means for the section is the section builder's to
+        // say, and the numerical rung's to trace.
+        let outcome = match intersect(face.surface, other_face.value.surface, precision) {
+            Ok(outcome) => outcome,
+            Err(crate::surface_intersection::IntersectionError::Unsupported) => continue,
+            Err(crate::surface_intersection::IntersectionError::Indeterminate) => {
+                return Err(AnalyticBooleanError::CarrierPair(Box::new([
                     face.surface,
                     other_face.value.surface,
-                ]))
-            })?;
+                ])));
+            }
+        };
         if !matches!(outcome, SurfaceIntersection::Coincident) {
             continue;
         }
@@ -1028,6 +1051,9 @@ fn close_section_pieces(
     own_region: &[Vec<Segment>],
     precision: PrecisionPolicy,
 ) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
+    if pieces.is_empty() {
+        return Ok(Vec::new());
+    }
     match face.surface {
         Surface::Cylinder(_) => close_periodic_sections(pieces, own_region, precision),
         _ => nest_section_loops(

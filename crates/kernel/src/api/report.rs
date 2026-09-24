@@ -234,7 +234,8 @@ pub struct BodyReport {
     /// Faces by carrier kind. A faceted-tier body is all planes.
     pub surfaces: SurfaceCounts,
     pub tier: Tier,
-    /// How many steps so far fell to the faceted tier.
+    /// How many steps so far were approximate: fell to the faceted tier or
+    /// were built by the numerical intersection rung.
     pub approximate_feature_count: u64,
     pub faces: Vec<FaceRecord>,
     pub edges: Vec<EdgeRecord>,
