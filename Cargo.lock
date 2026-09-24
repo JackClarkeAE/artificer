@@ -382,6 +382,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "artificer-step"
+version = "0.99.81"
+
+[[package]]
 name = "artificer-testkit"
 version = "0.99.81"
 dependencies = [

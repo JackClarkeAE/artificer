@@ -1,0 +1,15 @@
+[package]
+name = "artificer-step"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "A dependency-free reader and writer for ISO 10303-21 (STEP Part 21) exchange structures"
+
+# Deliberately no dependencies: this crate sits below the kernel and the scan
+# add-on, both of which read and write Part 21 text, and neither of which
+# should pull a parser stack in for it.
+[dependencies]
+
+[lints]
+workspace = true

@@ -17,6 +17,7 @@ members = [
     "crates/sketch",
     "crates/sketch-ui",
     "crates/spacemouse",
+    "crates/step",
     "crates/ui-core",
     "crates/viewport",
 ]
