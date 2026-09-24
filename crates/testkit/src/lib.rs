@@ -596,6 +596,7 @@ pub fn validate_case(case: &KernelCase) -> Result<(), TestkitError> {
             KernelCommand::PlanarPatch { .. } => "native.planar_patch.v0",
             KernelCommand::ThickenSheet { .. } => "native.thicken_sheet.v0",
             KernelCommand::TrimSheetByPlane { .. } => "native.trim_sheet_by_plane.v0",
+            KernelCommand::ImportStep { .. } => "native.import_step.v0",
         };
         if !case
             .required_capabilities

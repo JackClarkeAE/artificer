@@ -294,6 +294,7 @@ dependencies = [
  "artificer-compute",
  "artificer-geometry",
  "artificer-protocol",
+ "artificer-step",
  "criterion",
  "serde",
  "serde_json",

@@ -490,9 +490,16 @@ fn the_schema_lists_every_diagnostic_code_the_kernel_can_emit() {
             } else if path
                 .file_name()
                 .is_some_and(|name| name == "step_export.rs")
+                || (path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .is_some_and(|name| name == "step_import")
+                    && path.file_name().is_some_and(|name| name != "mod.rs"))
             {
-                // The STEP writer's upper-case literals are entity type
-                // names in the file it writes, not diagnostic codes.
+                // The STEP writer's and reader's upper-case literals are
+                // entity type names in the files they write and read, not
+                // diagnostic codes; the reader keeps its codes in `mod.rs`,
+                // which is scanned.
                 continue;
             } else if path.extension().is_some_and(|extension| extension == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();

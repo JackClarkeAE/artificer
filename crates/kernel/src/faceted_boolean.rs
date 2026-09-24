@@ -3523,6 +3523,40 @@ const fn internal_point(point: artificer_protocol::Point3) -> Point3 {
     Point3::new(point.x, point.y, point.z)
 }
 
+/// A faceted B-rep from polygons that already tile a closed surface: the
+/// reference mesh a STEP import falls back to (ADR 0056, I3). No Boolean
+/// runs; the polygons are welded, conformed, merged where coplanar, and
+/// assembled as every faceted result is, with each role kept so the faces
+/// of one source face stay one logical surface. The caller runs the solid
+/// validator before publishing.
+pub(crate) fn topology_from_reference_polygons(
+    polygons: Vec<(Vec<Point3>, FaceRole)>,
+    precision: PrecisionPolicy,
+) -> Option<Topology> {
+    // The polygons are a tessellation of smooth walls, as a Boolean's
+    // tessellated operands are, and are assembled under the same rules and
+    // at the same scale as those.
+    let epsilon = precision.linear_agreement.max(1.0e-8) * 16.0;
+    let polygons: Vec<Polygon> = polygons
+        .into_iter()
+        .filter_map(|(vertices, role)| Polygon::new(vertices, role, epsilon))
+        .collect();
+    if polygons.is_empty() {
+        return None;
+    }
+    let maximum_healed_cycle_span = precision
+        .approximation_budget
+        .max(precision.modeling_resolution)
+        .max(precision.min_feature_size)
+        * 512.0;
+    topology_from_polygons_with_heal_limit(
+        polygons,
+        epsilon,
+        Some(maximum_healed_cycle_span),
+        Rebuild::Strict,
+    )
+}
+
 const fn face_error(error: FaceFeatureInputError) -> PlanarProfileInputError {
     PlanarProfileInputError::FaceFeature(error)
 }

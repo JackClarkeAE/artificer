@@ -1814,6 +1814,23 @@ pub enum KernelCommand {
         plane_origin: Point3,
         plane_normal: Vector3,
     },
+    /// Reads a STEP (ISO 10303-21) file's first product into a new body
+    /// (ADR 0056, Track I).
+    ///
+    /// `MANIFOLD_SOLID_BREP`, `BREP_WITH_VOIDS`, `FACETED_BREP` and a
+    /// `SHELL_BASED_SURFACE_MODEL` whose shells close are read exactly
+    /// where their surfaces and curves are in the kernel's vocabulary —
+    /// planes, cylinders, cones, spheres, ring tori, non-rational B-spline
+    /// surfaces bounded by their iso-lines; lines, circles, ellipses and
+    /// B-spline curves — and conformed to the kernel's conventions. A file
+    /// with a face the kernel cannot read opens as a reference mesh on the
+    /// faceted tier, with every refusal named beside it; a rational spline
+    /// whose weights differ is refused by name. Runs from the empty
+    /// snapshot only.
+    ImportStep {
+        /// The file's text.
+        text: String,
+    },
 }
 
 /// Several sheet snapshots to stitch into one body (ADR 0056, S3): every
@@ -2189,12 +2206,16 @@ impl Tier {
 impl OperationReport {
     /// Exact unless the faceted tier reported its approximation warning,
     /// which every approximate rung attaches, or a surface was offset by
-    /// approximation (`SURFACE_OFFSET_APPROXIMATION`, ADR 0056).
+    /// approximation (`SURFACE_OFFSET_APPROXIMATION`, ADR 0056), or a reading
+    /// was approximated (a rational spline read as non-rational within its
+    /// tolerance), which its `_APPROXIMATED` warning says.
     #[must_use]
     pub fn tier(&self) -> Tier {
         let approximate = self.warnings.iter().any(|warning| {
             let code = warning.code.as_str();
-            code.ends_with("_FACETED_APPROXIMATION") || code.ends_with("_OFFSET_APPROXIMATION")
+            code.ends_with("_FACETED_APPROXIMATION")
+                || code.ends_with("_OFFSET_APPROXIMATION")
+                || code.ends_with("_APPROXIMATED")
         }) || self
             .rung
             .as_deref()

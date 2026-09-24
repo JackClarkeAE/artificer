@@ -399,7 +399,9 @@ fn validate_supported_command(command: &KernelCommand) -> Result<(), Parameteriz
         | KernelCommand::SurfaceRevolve { .. }
         | KernelCommand::PlanarPatch { .. }
         | KernelCommand::ThickenSheet { .. }
-        | KernelCommand::TrimSheetByPlane { .. } => {
+        | KernelCommand::TrimSheetByPlane { .. }
+        // An imported body's dimensions are the file's.
+        | KernelCommand::ImportStep { .. } => {
             return Err(ParameterizedKernelError::UnsupportedCommand);
         }
     };

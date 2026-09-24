@@ -15,6 +15,7 @@ perf-spans = ["artificer-compute/perf-spans"]
 artificer-compute = { path = "../compute" }
 artificer-geometry = { path = "../geometry" }
 artificer-protocol = { path = "../protocol" }
+artificer-step = { path = "../step" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

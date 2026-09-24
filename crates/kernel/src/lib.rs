@@ -58,6 +58,7 @@ mod shell;
 mod sim_queries;
 mod spline_profile;
 mod step_export;
+mod step_import;
 mod surface_intersection;
 mod sweep_profile;
 mod topology;
@@ -2282,6 +2283,21 @@ impl NativeKernel {
             | KernelCommand::TrimSheetByPlane { .. } => {
                 unreachable!("sheet commands are answered before the ladder")
             }
+            KernelCommand::ImportStep { text } => {
+                validate_extrusion_source(input)?;
+                let imported = step_import::import_step(text, request.precision)
+                    .map_err(|failure| step_import_error(input.id, failure))?;
+                ensure_candidate_within_envelope(input.id, &imported.topology, request.precision)?;
+                warnings.extend(imported.warnings);
+                rung = imported.rung;
+                (
+                    imported.topology,
+                    HistoryMode::Imported {
+                        face_sources: imported.face_sources,
+                        edge_sources: imported.edge_sources,
+                    },
+                )
+            }
         };
 
         check_cancelled(input.id, cancellation, KernelStage::Construction)?;
@@ -2346,6 +2362,10 @@ impl NativeKernel {
                     HistoryMode::FacePushPull { target_face } => {
                         face_push_pull_history(input, &snapshot, target_face)?
                     }
+                    HistoryMode::Imported {
+                        face_sources,
+                        edge_sources,
+                    } => imported_history(&snapshot, &face_sources, &edge_sources),
                 })
             },
         )?;
@@ -7455,7 +7475,7 @@ fn point_in_or_on_triangle(
         && signed_area_2d(third, first, point) >= 0.0
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum HistoryMode {
     Generated,
     OneToOne,
@@ -7470,6 +7490,13 @@ enum HistoryMode {
     RegularizedFaceFeature,
     FacePushPull {
         target_face: EntityRef,
+    },
+    /// A STEP import: every entity generated, with each face and edge also
+    /// under the role of the STEP entity it came from (`#412`), so a later
+    /// step can name it as the file does (ADR 0056, I4).
+    Imported {
+        face_sources: Vec<u64>,
+        edge_sources: Vec<Option<u64>>,
     },
 }
 
@@ -8829,6 +8856,52 @@ fn generated_history(snapshot: &Snapshot) -> Vec<HistoryRecord> {
         add(EntityKind::Solid, record.id.get(), ordinal);
     }
     history
+}
+
+/// The history of an imported body: every entity generated under its kind
+/// and ordinal, and every face and edge that came from one STEP entity also
+/// under that entity's number as its role, ordinal by ordinal where one
+/// STEP face became several kernel faces (a cylinder split at its seams).
+fn imported_history(
+    snapshot: &Snapshot,
+    face_sources: &[u64],
+    edge_sources: &[Option<u64>],
+) -> Vec<HistoryRecord> {
+    let mut history = generated_history(snapshot);
+    let mut ordinals: BTreeMap<(EntityKind, u64), u32> = BTreeMap::new();
+    let mut add = |kind: EntityKind, id: u64, source: u64| {
+        let ordinal = ordinals.entry((kind, source)).or_insert(0);
+        history.push(HistoryRecord {
+            relation: HistoryRelation::Generated,
+            inputs: Vec::new(),
+            outputs: vec![entity_ref(snapshot.id, id, kind)],
+            role: Some(OperationRole::new(format!("#{source}"), Some(*ordinal))),
+        });
+        *ordinal += 1;
+    };
+    for (record, source) in snapshot.topology.faces.iter().zip(face_sources) {
+        if *source != 0 {
+            add(EntityKind::Face, record.id.get(), *source);
+        }
+    }
+    for (record, source) in snapshot.topology.edges.iter().zip(edge_sources) {
+        if let Some(source) = source {
+            add(EntityKind::Edge, record.id.get(), *source);
+        }
+    }
+    history
+}
+
+/// A STEP import that produced nothing: the refusals as the error's
+/// diagnostics, so the caller sees every face named.
+fn step_import_error(snapshot: SnapshotId, failure: step_import::ImportFailure) -> KernelError {
+    error(
+        KernelErrorCode::Unsupported,
+        KernelStage::Construction,
+        snapshot,
+        failure.message,
+        failure.diagnostics,
+    )
 }
 
 fn regularized_face_feature_history(input: &Snapshot, output: &Snapshot) -> Vec<HistoryRecord> {
