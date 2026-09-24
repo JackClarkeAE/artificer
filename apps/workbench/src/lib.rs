@@ -11,6 +11,7 @@ pub use artificer_viewport as viewport;
 
 pub mod assembly;
 mod browser;
+pub mod cam;
 mod command_icons;
 pub mod commands;
 mod construction_axis;
@@ -555,6 +556,10 @@ enum PendingOperation {
         target_face: EntityRef,
         distance: f64,
     },
+    /// An Auto-CAM plan in its card (ADR 0057). The plan, its G-code and
+    /// its simulation are not `Copy`, so they live in `cam.staged` beside
+    /// the operation, as a loft's picks do; Confirm keeps them.
+    StageCamPlan,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -656,6 +661,7 @@ impl PendingOperation {
                 ..
             } => "Extrude finished sketch",
             Self::PushPullFace { .. } => "Push/pull selected face",
+            Self::StageCamPlan => "Auto-CAM plan",
         }
     }
 
@@ -738,6 +744,9 @@ impl PendingOperation {
             } => "Build, validate, and publish a native solid from the finished profile",
             Self::PushPullFace { .. } => {
                 "Move the complete selected face and its adjacent walls as one exact solid edit"
+            }
+            Self::StageCamPlan => {
+                "Scrub the simulation and check the operations, then confirm to keep the plan and its G-code"
             }
         }
     }
@@ -830,6 +839,7 @@ impl PendingOperation {
                 object.insert("plane".to_owned(), serde_json::json!(format!("{plane:?}")));
                 object.insert("revision".to_owned(), serde_json::json!(revision));
             }
+            Self::StageCamPlan => {}
             Self::ExtrudeSketch {
                 base_snapshot,
                 revision,
@@ -1769,9 +1779,19 @@ enum Attempt {
 /// What an open Export dialog is about to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportSubject {
-    Body { ordinal: u32, format: BodyExport },
-    Sketch { index: usize, ordinal: u32 },
-    Document { format: BodyExport },
+    Body {
+        ordinal: u32,
+        format: BodyExport,
+    },
+    Sketch {
+        index: usize,
+        ordinal: u32,
+    },
+    Document {
+        format: BodyExport,
+    },
+    /// The kept CAM plan's G-code (ADR 0057).
+    CamGcode,
 }
 
 /// The three ways a body leaves the workbench.
@@ -1808,6 +1828,7 @@ impl ExportSubject {
         match self {
             Self::Body { format, .. } | Self::Document { format } => format.extension(),
             Self::Sketch { .. } => "dxf",
+            Self::CamGcode => "ngc",
         }
     }
 
@@ -1815,11 +1836,13 @@ impl ExportSubject {
         let format = match self {
             Self::Body { format, .. } | Self::Document { format } => format.label().to_owned(),
             Self::Sketch { .. } => "DXF".to_owned(),
+            Self::CamGcode => "G-CODE".to_owned(),
         };
         match self {
             Self::Body { ordinal, .. } => format!("EXPORT BODY {ordinal} AS {format}"),
             Self::Sketch { ordinal, .. } => format!("EXPORT SKETCH {ordinal} AS {format}"),
             Self::Document { .. } => format!("EXPORT DOCUMENT AS {format}"),
+            Self::CamGcode => "EXPORT G-CODE".to_owned(),
         }
     }
 
@@ -1828,11 +1851,13 @@ impl ExportSubject {
         let format = match self {
             Self::Body { format, .. } | Self::Document { format } => format.label().to_owned(),
             Self::Sketch { .. } => "DXF".to_owned(),
+            Self::CamGcode => "G-code".to_owned(),
         };
         match self {
             Self::Body { ordinal, .. } => format!("Export body {ordinal} as {format}"),
             Self::Sketch { ordinal, .. } => format!("Export sketch {ordinal} as {format}"),
             Self::Document { .. } => format!("Export document as {format}"),
+            Self::CamGcode => "Export G-code".to_owned(),
         }
     }
 
@@ -1845,6 +1870,7 @@ impl ExportSubject {
             Self::Body { ordinal, .. } => format!("{stem}-body-{ordinal}"),
             Self::Sketch { ordinal, .. } => format!("{stem}-sketch-{ordinal}"),
             Self::Document { .. } => stem.to_owned(),
+            Self::CamGcode => format!("{stem}-cam"),
         }
     }
 }
@@ -2104,6 +2130,10 @@ enum ContextualSubject {
     /// and pulled: the operation has not been staged yet, but its controls are
     /// what the user came for.
     Feature,
+    /// A kept CAM plan, or the reason there is none, while the CAM tab is
+    /// showing (ADR 0057). Like an interference study it is a reading with
+    /// no gate of its own; the staged plan is a pending operation instead.
+    Cam,
 }
 
 impl ContextualSubject {
@@ -2121,6 +2151,7 @@ impl ContextualSubject {
             Self::SketchTool => "ACTIVE TOOL",
             Self::SketchFeature => "SELECTED FEATURE",
             Self::Feature => "FEATURE",
+            Self::Cam => "CAM",
         }
     }
 }
@@ -3023,6 +3054,9 @@ pub struct KernelLabApp {
     sketch_orbit_returning: bool,
     /// The 3D mouse, if the process has one, and how it steers the camera.
     spacemouse: spacemouse::SpaceMouseNavigation,
+    /// The CAM tab (ADR 0057): its tool library, the plan in its card or
+    /// kept, and the simulation clock.
+    cam: cam::CamState,
 }
 
 impl Default for KernelLabApp {
@@ -3196,6 +3230,7 @@ impl Default for KernelLabApp {
             sketch_orbit_return_view: None,
             sketch_orbit_returning: false,
             spacemouse: spacemouse::SpaceMouseNavigation::default(),
+            cam: cam::CamState::default(),
         };
         // Internal bootstrap is the sole non-interactive construction path.
         // Once the UI is live, every model mutation is staged first.
@@ -3251,6 +3286,7 @@ impl KernelLabApp {
         app.load_theme_preferences(egui_ctx);
         app.user_preferences_path = user_preferences_path();
         app.load_user_preferences();
+        app.cam.set_library_path(cam::tools_path());
         // The 3D mouse is opened once per process; a further document
         // shares the reader and takes its motion while it is in front.
         app.spacemouse = spacemouse::SpaceMouseNavigation::attach(egui_ctx);
@@ -5360,7 +5396,8 @@ impl KernelLabApp {
                 | PendingOperation::SketchEdit { .. }
                 | PendingOperation::FinishSketch { .. }
                 | PendingOperation::ExtrudeSketch { .. }
-                | PendingOperation::PushPullFace { .. },
+                | PendingOperation::PushPullFace { .. }
+                | PendingOperation::StageCamPlan,
             )
             | None => None,
         }
@@ -12429,6 +12466,7 @@ impl KernelLabApp {
             pending @ PendingOperation::PushPullFace { .. } => {
                 self.execute_face_push_pull(pending);
             }
+            PendingOperation::StageCamPlan => self.commit_cam_plan(),
         }
         true
     }
@@ -12516,6 +12554,7 @@ impl KernelLabApp {
                 self.sketch_extrusion_issue = None;
                 self.pending_operation = None;
             }
+            PendingOperation::StageCamPlan => self.cancel_cam_plan(),
         }
         true
     }
@@ -16539,6 +16578,7 @@ impl KernelLabApp {
                 BodyExport::StepExact | BodyExport::StepFaceted => ("STEP model", &["step", "stp"]),
             },
             ExportSubject::Sketch { .. } => ("DXF drawing", &["dxf"]),
+            ExportSubject::CamGcode => ("G-code program", &["ngc", "nc", "gcode"]),
         };
         let file_name = format!(
             "{}.{}",
@@ -16918,6 +16958,7 @@ impl KernelLabApp {
                 Some(curves) => export::write_sketch_dxf(&path, &curves),
                 None => Err("that sketch is no longer in the document".into()),
             },
+            ExportSubject::CamGcode => self.export_cam_gcode_to(&path),
         };
         self.document_status = Some(match &written {
             Ok(()) => format!("Exported to {}", path.display()),
@@ -18461,6 +18502,9 @@ impl KernelLabApp {
         // card has to stay up while faces are being clicked.
         if self.simulation.is_showing() {
             return Some(ContextualSubject::Simulation);
+        }
+        if self.cam_card_wanted() {
+            return Some(ContextualSubject::Cam);
         }
         if self.interference.is_some() {
             return Some(ContextualSubject::Interference);
@@ -20365,6 +20409,16 @@ impl KernelLabApp {
                 {
                     card(ui, "loft", "LOFT", &mut |ui| {
                         self.loft_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if shows(ContextualSubject::Cam)
+                    || (shows(ContextualSubject::PendingOperation)
+                        && matches!(self.pending_operation, Some(PendingOperation::StageCamPlan)))
+                {
+                    card(ui, "cam", "CAM", &mut |ui| {
+                        self.cam_controls(ui);
                     });
                     ui.add_space(5.0);
                 }
@@ -22292,6 +22346,9 @@ impl KernelLabApp {
         // flagged on the parts themselves.
         let flagged_bodies = self.simulation_flagged_bodies();
         let drives_joints = self.animation_drives_joints();
+        // The CAM tab's stock, tool and toolpath at the simulation clock,
+        // built before the body instances borrow the document (ADR 0057).
+        let cam_overlay = self.cam_overlay();
 
         let frame_output = Frame::new()
             .fill(theme::viewport_bottom())
@@ -22471,7 +22528,7 @@ impl KernelLabApp {
                     }
                 } else {
                     let navigation_bindings = self.navigation_bindings();
-                    let output = viewport::show_document_with_feature_drag(
+                    let output = viewport::show_document_with_overlay(
                         ui,
                         &body_instances,
                         reference_plane_bounds,
@@ -22505,6 +22562,7 @@ impl KernelLabApp {
                         &mut self.feature_preview_drag,
                         &mut self.model_edge_frame_memo,
                         navigation_bindings,
+                        cam_overlay.as_ref(),
                     );
                     if self.sketch_orbit_peek {
                         // The orbit peek is look-only: the camera responds,
@@ -23502,6 +23560,7 @@ impl eframe::App for KernelLabApp {
         if !self.advance_face_camera_transition(context) {
             self.advance_motion(context);
         }
+        self.advance_cam_playback(context);
         // The 3D mouse steers the camera after the face flight has had its
         // frame, so a flight in progress is never fought over.
         self.poll_spacemouse(context);

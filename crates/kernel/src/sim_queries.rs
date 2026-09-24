@@ -25,7 +25,6 @@ use std::collections::BTreeSet;
 
 use artificer_protocol::{EntityRef, Point3};
 
-use crate::topology::Point3 as TopologyPoint3;
 use crate::{DebugScene, NativeKernel, Snapshot};
 
 /// The most cells one grid may hold. A 200³ grid is eight million cells, a
@@ -266,21 +265,6 @@ struct Crossing {
 }
 
 impl NativeKernel {
-    /// Whether `point` lies inside the solid, by exact parity ray casting
-    /// against the analytic faces.
-    ///
-    /// `None` where the answer cannot be given exactly: a face whose
-    /// carrier the exact cast does not handle (cone, sphere, torus, ruled
-    /// or B-spline), or every ray direction grazing a boundary. Points on
-    /// the surface itself are among the latter.
-    #[must_use]
-    pub fn point_in_solid(snapshot: &Snapshot, point: Point3) -> Option<bool> {
-        crate::analytic_boolean::point_in_solid(
-            &snapshot.topology,
-            TopologyPoint3::new(point.x, point.y, point.z),
-        )
-    }
-
     /// The body as a grid of cubic cells `cell` millimetres on a side over
     /// its bounding box, with the face each surface cell lies on.
     ///

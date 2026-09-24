@@ -165,8 +165,13 @@ impl NativeKernel {
     }
 
     /// Whether a point lies inside the snapshot's material, by an exact
-    /// parity ray cast against every face. `None` when every ray direction
-    /// tried met a degenerate crossing.
+    /// parity ray cast against every face (shared by CAM, ADR 0057, and the
+    /// simulation tab, ADR 0058).
+    ///
+    /// `None` where the answer cannot be given exactly: a point that is not
+    /// finite, a face whose carrier the exact cast does not handle (cone,
+    /// sphere, torus, ruled or B-spline), or every ray direction grazing a
+    /// boundary. Points on the surface itself are among the latter.
     #[must_use]
     pub fn point_in_solid(snapshot: &Snapshot, point: ProtocolPoint3) -> Option<bool> {
         if !point.is_finite() {

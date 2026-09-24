@@ -77,6 +77,12 @@ pub enum CommandIcon {
     Optimise,
     /// A play head on a track: the motion timeline.
     Timeline,
+    /// An end mill over a workpiece: the CAM tab's Auto-CAM.
+    Cam,
+    /// Two triangles pointing back to the start.
+    Rewind,
+    /// An arrow leaving a tray: a file going out.
+    Export,
 }
 
 pub fn paint_command_icon(painter: &Painter, rect: Rect, icon: CommandIcon, color: Color32) {
@@ -496,6 +502,41 @@ impl IconPainter<'_> {
             }
             CommandIcon::Stop => {
                 self.filled_rectangle((0.22, 0.22), (0.78, 0.78));
+            }
+            CommandIcon::Cam => {
+                // The workpiece with a pocket taken out, and the end mill
+                // standing in it.
+                self.path(&[
+                    (0.08, 0.86),
+                    (0.08, 0.56),
+                    (0.30, 0.56),
+                    (0.30, 0.70),
+                    (0.70, 0.70),
+                    (0.70, 0.56),
+                    (0.92, 0.56),
+                    (0.92, 0.86),
+                ]);
+                self.line((0.08, 0.86), (0.92, 0.86));
+                self.rectangle((0.42, 0.10), (0.58, 0.36));
+                self.closed_path(&[(0.38, 0.36), (0.62, 0.36), (0.62, 0.70), (0.38, 0.70)]);
+                self.line((0.38, 0.48), (0.62, 0.58));
+            }
+            CommandIcon::Rewind => {
+                self.painter.add(egui::Shape::convex_polygon(
+                    vec![self.p(0.52, 0.18), self.p(0.52, 0.82), self.p(0.12, 0.50)],
+                    self.color,
+                    Stroke::NONE,
+                ));
+                self.painter.add(egui::Shape::convex_polygon(
+                    vec![self.p(0.92, 0.18), self.p(0.92, 0.82), self.p(0.52, 0.50)],
+                    self.color,
+                    Stroke::NONE,
+                ));
+            }
+            CommandIcon::Export => {
+                self.path(&[(0.14, 0.56), (0.14, 0.86), (0.86, 0.86), (0.86, 0.56)]);
+                self.line((0.50, 0.66), (0.50, 0.12));
+                self.arrowhead((0.50, 0.12), (0.0, -1.0), 0.16);
             }
             CommandIcon::Library => {
                 self.rectangle((0.10, 0.20), (0.32, 0.86));

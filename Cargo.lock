@@ -425,6 +425,7 @@ dependencies = [
 name = "artificer-workbench"
 version = "0.99.81"
 dependencies = [
+ "artificer-cam",
  "artificer-catalog",
  "artificer-compute",
  "artificer-geometry",

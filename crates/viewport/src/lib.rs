@@ -387,6 +387,34 @@ enum ActiveDatumDrag {
     },
 }
 
+/// One mesh the shell draws over the committed scene: the CAM tab's stock
+/// ghost, its remaining stock and its tool (ADR 0057). Triangles are in
+/// document space and carry a colour with its alpha; a shaded mesh takes the
+/// scene's light rig, an unshaded one is painted flat.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverlayMesh {
+    pub triangles: Vec<[Point3; 3]>,
+    pub color: Color32,
+    pub shaded: bool,
+}
+
+/// One polyline the shell draws over the scene: a toolpath's rapids or cuts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverlayPolyline {
+    pub points: Vec<Point3>,
+    pub color: Color32,
+    pub width: f32,
+}
+
+/// Presentation-only geometry painted over the committed bodies, after them
+/// and in depth order among itself, so a translucent stock reads as a ghost
+/// around the part and a tool as a solid sitting on it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SceneOverlay {
+    pub meshes: Vec<OverlayMesh>,
+    pub polylines: Vec<OverlayPolyline>,
+}
+
 /// Combined result for the interactive document viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DocumentViewportOutput {
@@ -1646,6 +1674,7 @@ pub fn show_document(
         None,
         None,
         artificer_ui_core::navigation::NavigationPreset::Artificer.bindings(),
+        None,
     )
     .selected_face
 }
@@ -1707,6 +1736,68 @@ pub fn show_document_with_feature_drag(
         Some(feature_drag_state),
         Some(edge_frame_memo),
         navigation,
+        None,
+    )
+}
+
+/// [`show_document_with_feature_drag`] with presentation-only geometry
+/// painted over the scene: the CAM tab's stock, tool and toolpath.
+#[allow(clippy::too_many_arguments)]
+pub fn show_document_with_overlay(
+    ui: &mut Ui,
+    bodies: &[DocumentBodyInstance<'_>],
+    reported_bounds: Option<Aabb3>,
+    edge_overlay: bool,
+    display_mode: ModelDisplayMode,
+    selected: Option<DocumentFaceSelection>,
+    selected_edge: Option<DocumentEdgeSelection>,
+    selected_vertex: Option<DocumentVertexSelection>,
+    selected_faces: &[DocumentFaceSelection],
+    selected_edges: &[DocumentEdgeSelection],
+    selected_vertices: &[DocumentVertexSelection],
+    active_body: Option<BodyInstanceKey>,
+    active_tool: ActiveTool,
+    active_display_transform: &mut DisplayTransform,
+    view: &mut ViewState,
+    animation_phase: f64,
+    feature_preview: Option<&FeaturePreview>,
+    sketch_overlays: &[ModelSketchOverlay],
+    selected_sketch_regions: &[ModelSketchRegionSelection],
+    measured_edges: &[DocumentEdgeSelection],
+    measurement: Option<&DocumentMeasurement>,
+    edge_finish_preview: Option<&EdgeFinishPreview>,
+    feature_drag_state: &mut FeaturePreviewDragState,
+    edge_frame_memo: &mut Option<EdgeFrameMemo>,
+    navigation: artificer_ui_core::navigation::Bindings,
+    overlay: Option<&SceneOverlay>,
+) -> DocumentViewportOutput {
+    show_document_impl(
+        ui,
+        bodies,
+        reported_bounds,
+        edge_overlay,
+        display_mode,
+        selected,
+        selected_edge,
+        selected_vertex,
+        selected_faces,
+        selected_edges,
+        selected_vertices,
+        active_body,
+        active_tool,
+        active_display_transform,
+        view,
+        animation_phase,
+        feature_preview,
+        sketch_overlays,
+        selected_sketch_regions,
+        measured_edges,
+        measurement,
+        edge_finish_preview,
+        Some(feature_drag_state),
+        Some(edge_frame_memo),
+        navigation,
+        overlay,
     )
 }
 
@@ -1737,6 +1828,7 @@ fn show_document_impl(
     mut feature_drag_state: Option<&mut FeaturePreviewDragState>,
     mut edge_frame_memo: Option<&mut Option<EdgeFrameMemo>>,
     navigation: artificer_ui_core::navigation::Bindings,
+    overlay: Option<&SceneOverlay>,
 ) -> DocumentViewportOutput {
     let size = ui.available_size().max(Vec2::new(260.0, 260.0));
     let (canvas, painter) = ui.allocate_painter(size, Sense::click_and_drag());
@@ -2628,6 +2720,10 @@ fn show_document_impl(
 
     if let Some(geometry) = datum_geometry {
         paint_datum_handles(&painter, geometry, datum_interaction.hovered);
+    }
+
+    if let Some(overlay) = overlay {
+        paint_scene_overlay(&painter, overlay, projection, *view);
     }
 
     let mut selected_from_ui = clicked;
@@ -7583,6 +7679,89 @@ fn paint_feature_preview(
     );
     let text_origin = chip.center() - galley.size() / 2.0;
     painter.galley(text_origin, galley, accent);
+}
+
+/// Paints the shell's overlay: meshes in depth order, far first, each
+/// triangle lit by the scene's rig when the mesh asks for it, then the
+/// polylines over them.
+fn paint_scene_overlay(
+    painter: &egui::Painter,
+    overlay: &SceneOverlay,
+    projection: Projection,
+    view: ViewState,
+) {
+    let presentation = InstancePresentation::identity(Point3::new(0.0, 0.0, 0.0));
+    let mut projected: Vec<(ProjectedFeatureTriangle, Color32)> = Vec::new();
+    for mesh in &overlay.meshes {
+        for triangle in &mesh.triangles {
+            let camera = triangle.map(|point| presentation.project_point(point, view));
+            let points = camera.map(|point| projection.camera_point(point));
+            if triangle_signed_area(points).abs() <= 1.0e-4 {
+                continue;
+            }
+            let color = if mesh.shaded {
+                let a = triangle[0];
+                let b = triangle[1];
+                let c = triangle[2];
+                let u = [b.x - a.x, b.y - a.y, b.z - a.z];
+                let v = [c.x - a.x, c.y - a.y, c.z - a.z];
+                let normal = [
+                    u[1].mul_add(v[2], -(u[2] * v[1])),
+                    u[2].mul_add(v[0], -(u[0] * v[2])),
+                    u[0].mul_add(v[1], -(u[1] * v[0])),
+                ];
+                // Either side of a translucent facet may face the camera.
+                let level = vertex_lighting(normal, view)
+                    .level
+                    .max(vertex_lighting([-normal[0], -normal[1], -normal[2]], view).level);
+                let scale = 0.45 + 0.55 * level.clamp(0.0, 1.0);
+                let channel =
+                    |value: u8| (f32::from(value) * scale).round().clamp(0.0, 255.0) as u8;
+                Color32::from_rgba_unmultiplied(
+                    channel(mesh.color.r()),
+                    channel(mesh.color.g()),
+                    channel(mesh.color.b()),
+                    mesh.color.a(),
+                )
+            } else {
+                mesh.color
+            };
+            projected.push((
+                ProjectedFeatureTriangle {
+                    points,
+                    depth: camera.iter().map(|point| point.depth).sum::<f64>() / 3.0,
+                },
+                color,
+            ));
+        }
+    }
+    projected.sort_by(|left, right| left.0.depth.total_cmp(&right.0.depth));
+    let mut mesh = Mesh::default();
+    mesh.reserve_vertices(projected.len() * 3);
+    mesh.reserve_triangles(projected.len());
+    for (triangle, color) in projected {
+        let first = mesh.vertices.len() as u32;
+        for point in triangle.points {
+            mesh.colored_vertex(point, color);
+        }
+        mesh.add_triangle(first, first + 1, first + 2);
+    }
+    if !mesh.is_empty() {
+        painter.add(Shape::mesh(mesh));
+    }
+    for polyline in &overlay.polylines {
+        let points = polyline
+            .points
+            .iter()
+            .map(|point| projection.instance_point(*point, view, presentation))
+            .collect::<Vec<_>>();
+        for pair in points.windows(2) {
+            painter.line_segment(
+                [pair[0], pair[1]],
+                Stroke::new(polyline.width, polyline.color),
+            );
+        }
+    }
 }
 
 fn paint_preview_arrow(

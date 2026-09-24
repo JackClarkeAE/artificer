@@ -177,7 +177,8 @@ impl KernelLabApp {
                     | RibbonTab::View
                     | RibbonTab::Parametric
                     | RibbonTab::Simulation
-                    | RibbonTab::Theme => {
+                    | RibbonTab::Theme
+                    | RibbonTab::Cam => {
                         self.ribbon_tab = Some((self.workbench_mode, tab));
                     }
                 }
@@ -189,7 +190,7 @@ impl KernelLabApp {
     /// is what makes the Sketch tab appear the moment a sketch opens, the way a
     /// contextual tab does elsewhere; an explicit pick overrides it until the
     /// workspace changes again.
-    fn active_ribbon_tab(&self) -> RibbonTab {
+    pub(crate) fn active_ribbon_tab(&self) -> RibbonTab {
         let workspace_tab = self.workspace_tab();
         self.ribbon_tab
             .filter(|(mode, _)| *mode == self.workbench_mode)
@@ -635,6 +636,7 @@ impl KernelLabApp {
     fn command_icon(&self, descriptor: &CommandDescriptor) -> CommandIcon {
         match descriptor.command {
             ModelCommand::PlayMotion if self.motion.playing => CommandIcon::Stop,
+            ModelCommand::CamSimulate if self.cam.playing => CommandIcon::Stop,
             _ => descriptor.icon,
         }
     }
@@ -651,6 +653,7 @@ impl KernelLabApp {
                 SketchEntryAction::Edit => "Edit sketch",
             },
             ModelCommand::PlayMotion if self.motion.playing => "Stop",
+            ModelCommand::CamSimulate if self.cam.playing => "Pause",
             ModelCommand::ToggleTheme => theme::active_theme().other().label(),
             _ => descriptor.label,
         }
@@ -697,6 +700,11 @@ impl KernelLabApp {
             ModelCommand::ThemeColours => self.theme_editor_open,
             ModelCommand::ToggleVariables => self.variables_window_open,
             ModelCommand::PlayMotion => self.motion.playing,
+            ModelCommand::CamSimulate => self.cam.playing,
+            ModelCommand::CamSetup => self.cam.section == crate::cam::CamCardSection::Setup,
+            ModelCommand::CamOperations => {
+                self.cam.section == crate::cam::CamCardSection::Operations
+            }
             _ => false,
         }
     }
@@ -1044,6 +1052,45 @@ impl KernelLabApp {
                     CommandAvailability::Enabled
                 }
             }
+            ModelCommand::AutoCam => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                if self.workbench_mode == WorkbenchMode::Sketch {
+                    return CommandAvailability::disabled(
+                        "Finish the sketch first; CAM plans a body.",
+                    );
+                }
+                if self.active_body_id().is_none() {
+                    return CommandAvailability::disabled("Create a body to machine first.");
+                }
+                CommandAvailability::Enabled
+            }
+            ModelCommand::CamSetup | ModelCommand::CamOperations => {
+                if self.cam.study().is_some() {
+                    CommandAvailability::Enabled
+                } else {
+                    CommandAvailability::disabled("Press Auto-CAM to plan the active body first.")
+                }
+            }
+            ModelCommand::CamSimulate | ModelCommand::CamRewind => {
+                if self.cam.study().is_some() {
+                    CommandAvailability::Enabled
+                } else {
+                    CommandAvailability::disabled("Press Auto-CAM to plan the active body first.")
+                }
+            }
+            ModelCommand::CamExport => {
+                if self.cam.committed.is_some() {
+                    CommandAvailability::Enabled
+                } else if self.cam.staged.is_some() {
+                    CommandAvailability::disabled(
+                        "Confirm the plan first; the export writes what was kept.",
+                    )
+                } else {
+                    CommandAvailability::disabled("Press Auto-CAM and confirm a plan first.")
+                }
+            }
         }
     }
 
@@ -1329,6 +1376,14 @@ impl KernelLabApp {
             ModelCommand::ThermalStudy => self.open_thermal_study(),
             ModelCommand::TopologyStudy => self.open_topology_study(),
             ModelCommand::MotionTimeline => self.open_motion_timeline(),
+            ModelCommand::AutoCam => self.stage_auto_cam(),
+            ModelCommand::CamSetup => self.cam.section = crate::cam::CamCardSection::Setup,
+            ModelCommand::CamOperations => {
+                self.cam.section = crate::cam::CamCardSection::Operations;
+            }
+            ModelCommand::CamSimulate => self.toggle_cam_playback(context),
+            ModelCommand::CamRewind => self.cam.rewind(),
+            ModelCommand::CamExport => self.export_cam_gcode(),
         }
     }
 }
