@@ -6720,6 +6720,25 @@ impl KernelLabApp {
         };
     }
 
+    /// The bodies a Boolean has spent: the tool of every active, committed,
+    /// unsuppressed Boolean that did not keep it. Spent material is not a
+    /// body — nothing lists it, counts it or can show it — though its record
+    /// stays in the document for the history's sake and it comes back if
+    /// the Boolean is undone, suppressed or scrubbed away. An extrusion cut
+    /// from an origin-plane sketch is a sweep folded in by such a Boolean,
+    /// and used to leave its tool behind as a hidden "Body 2".
+    fn consumed_body_ids(&self) -> Vec<BodyId> {
+        self.document
+            .active_features()
+            .iter()
+            .filter(|feature| !feature.state.suppressed && feature.committed.is_some())
+            .filter_map(|feature| match &feature.action {
+                ReplayAction::Boolean(recipe) if !recipe.keep_tool => Some(recipe.tool),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn restore_runtime_from_document(&mut self) {
         self.sync_feature_reports_from_document();
         let previous_active = self.active_body_id();
@@ -6736,9 +6755,13 @@ impl KernelLabApp {
                         )
                     })
             });
+        let consumed = self.consumed_body_ids();
         let mut bodies = Vec::new();
         for record in self.document.bodies() {
             if bootstrap_replaced && Some(record.id) == self.bootstrap_body {
+                continue;
+            }
+            if consumed.contains(&record.id) {
                 continue;
             }
             let Some(snapshot) = record.committed_snapshot else {
@@ -6776,12 +6799,28 @@ impl KernelLabApp {
             });
         }
         self.bodies = bodies;
+        // A spent body keeps its number: the next body is numbered past
+        // every record in the document, listed or not.
+        let recorded = self
+            .document
+            .bodies()
+            .iter()
+            .filter_map(|record| {
+                record
+                    .label
+                    .split_whitespace()
+                    .last()
+                    .and_then(|value| value.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0);
         self.next_body_ordinal = self
             .bodies
             .iter()
             .map(|body| body.ordinal)
             .max()
             .unwrap_or(0)
+            .max(recorded)
             .saturating_add(1);
         let active_index = previous_active
             .and_then(|id| self.bodies.iter().position(|body| body.id == id))
@@ -11036,6 +11075,11 @@ impl KernelLabApp {
             return;
         }
         let before = self.document.history_position();
+        let volume_before = self
+            .bodies
+            .iter()
+            .find(|body| body.id == target)
+            .map(|body| body.body.snapshot.measures().volume);
         self.active_body_ordinal = self
             .bodies
             .iter()
@@ -11048,10 +11092,28 @@ impl KernelLabApp {
             // the status line.
             return;
         }
-        self.document_status = Some(match operation {
-            BooleanOperation::Union => "Extrusion added to the body".to_owned(),
-            BooleanOperation::Difference => "Extrusion cut from the body".to_owned(),
-            BooleanOperation::Intersection => "Extrusion intersected with the body".to_owned(),
+        let volume_after = self
+            .bodies
+            .iter()
+            .find(|body| body.id == target)
+            .map(|body| body.body.snapshot.measures().volume);
+        let unchanged = matches!(
+            (volume_before, volume_after),
+            (Some(before), Some(after)) if (after - before).abs() <= 1.0e-9 * before.abs().max(1.0)
+        );
+        self.document_status = Some(match (operation, unchanged) {
+            (BooleanOperation::Union, false) => "Extrusion added to the body".to_owned(),
+            (BooleanOperation::Difference, false) => "Extrusion cut from the body".to_owned(),
+            (BooleanOperation::Intersection, false) => {
+                "Extrusion intersected with the body".to_owned()
+            }
+            (BooleanOperation::Difference, true) => {
+                "The extrusion missed the body: nothing was cut · check its direction and distance"
+                    .to_owned()
+            }
+            (BooleanOperation::Union | BooleanOperation::Intersection, true) => {
+                "The extrusion did not change the body".to_owned()
+            }
         });
     }
 
@@ -14586,11 +14648,28 @@ impl KernelLabApp {
             body.last_feature = last_feature;
             body.kind = ModelBodyKind::Boolean;
         }
+        // The result is archived like every other commit's, so the history
+        // cursor can leave the Boolean and come back to it.
+        if !self
+            .body_archive
+            .iter()
+            .any(|entry| entry.body.snapshot.id() == current.snapshot.id())
+        {
+            self.body_archive.push(ArchivedBody {
+                body: current.clone(),
+                kind: ModelBodyKind::Boolean,
+            });
+        }
         if !keep_tools {
-            for tool in tools {
-                if let Some(body) = self.bodies.iter_mut().find(|body| body.id == *tool) {
-                    body.visible = false;
-                }
+            // The tool is spent: it leaves the body list rather than
+            // lingering as a hidden body, and its number stays taken.
+            self.bodies.retain(|body| !tools.contains(&body.id));
+            if self.active_body_id().is_none() {
+                self.active_body_ordinal = self
+                    .bodies
+                    .iter()
+                    .find(|body| body.id == target)
+                    .map_or(self.active_body_ordinal, |body| body.ordinal);
             }
         }
         if self.active_body_id() == Some(target) {
@@ -31647,15 +31726,14 @@ mod extrusion_workbench_tests {
             "each tool is its own two-body recipe so replay can reproduce it"
         );
         assert!(app.displayed_measures().expect("result measures").volume > before);
-        // Consumed by default: neither tool survives as a visible body.
+        // Consumed by default: neither tool survives as a body at all; the
+        // document keeps their records for the history.
         for tool in [first, second] {
             assert!(
-                !app.bodies
-                    .iter()
-                    .find(|body| body.id == tool)
-                    .expect("tool body")
-                    .visible
+                !app.bodies.iter().any(|body| body.id == tool),
+                "a spent tool leaves the body list"
             );
+            assert!(app.document.bodies().iter().any(|record| record.id == tool));
         }
         assert_eq!(app.active_body_id(), Some(target));
     }
@@ -31846,11 +31924,8 @@ mod extrusion_workbench_tests {
             ReplayAction::Boolean(_)
         ));
         assert!(
-            !app.bodies
-                .iter()
-                .find(|body| body.id == tool_id)
-                .unwrap()
-                .visible
+            !app.bodies.iter().any(|body| body.id == tool_id),
+            "the spent tool is no body"
         );
         assert!(app.displayed_measures().unwrap().volume > 24.0);
 
@@ -36092,6 +36167,97 @@ mod construction_plane_tests {
         app.set_body_visibility(0, false);
         app.begin_new_origin_sketch();
         assert!(app.face_sketch_context.is_none());
+    }
+
+    /// A cut from an origin-plane sketch is a sweep folded into the body by
+    /// a Boolean. The swept tool is spent by it: it used to linger as a
+    /// hidden "Body 2" the Browser listed and a click could show, standing
+    /// where the cut was. Now it leaves the body list, its number stays
+    /// taken, and it comes back only where the history stands before the
+    /// Boolean.
+    #[test]
+    fn a_cut_from_an_origin_sketch_leaves_no_tool_body_behind() {
+        let mut app = KernelLabApp::default();
+        app.begin_new_origin_sketch();
+        app.sketch
+            .stage_geometry(SketchGeometry::circle(point(0.0, 0.0), point(10.0, 0.0)))
+            .expect("circle stages");
+        app.sketch.commit_pending().expect("circle commits");
+        app.sketch_revision = app.sketch_revision.saturating_add(1);
+        app.feature_preview
+            .commit_sketch_revision(app.sketch_revision);
+        app.set_extrusion_distance_intent(20.0);
+        assert!(app.stage_sketch_extrusion(), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.enter_model_mode();
+        assert_eq!(app.bodies.len(), 1);
+        let cylinder = std::f64::consts::PI * 100.0 * 20.0;
+        let records = app.document.bodies().len();
+
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (-3.0, -3.0), (3.0, 3.0));
+        app.select_extrusion_mode(ExtrusionMode::Cut);
+        app.set_extrusion_distance_intent(20.0);
+        assert!(app.stage_sketch_extrusion(), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(
+            app.document_status.as_deref(),
+            Some("Extrusion cut from the body")
+        );
+        assert_eq!(app.bodies.len(), 1, "the tool is spent, not hidden");
+        assert_eq!(app.body_count(), 1);
+        assert!(app.bodies[0].visible);
+        let volume = app.displayed_measures().expect("the cylinder").volume;
+        assert!((volume - (cylinder - 720.0)).abs() < 1.0e-6, "{volume}");
+        assert_eq!(
+            app.document.bodies().len(),
+            records + 1,
+            "the document keeps the tool's record for its history"
+        );
+        let cut_position = app.document.history_position();
+
+        // Before the Boolean, the sweep is a body of its own again (hidden,
+        // as the document records a spent tool; the eye brings it back).
+        assert!(app.move_history_cursor(cut_position - 1));
+        assert_eq!(app.bodies.len(), 2);
+        assert!(app.move_history_cursor(cut_position));
+        assert_eq!(app.bodies.len(), 1);
+
+        // The next body is numbered past the spent one.
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (20.0, 20.0), (24.0, 24.0));
+        app.select_extrusion_mode(ExtrusionMode::NewBody);
+        app.set_extrusion_distance_intent(2.0);
+        assert!(app.stage_sketch_extrusion(), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.bodies.len(), 2);
+        assert_eq!(app.bodies[1].ordinal, 3);
+        assert_eq!(
+            app.document
+                .bodies()
+                .last()
+                .map(|record| record.label.as_str()),
+            Some("Body 3")
+        );
+
+        // A cut that runs away from the body says so instead of reporting a
+        // cut, and still spends its tool.
+        app.enter_model_mode();
+        app.activate_body(0);
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (-1.0, -1.0), (1.0, 1.0));
+        app.select_extrusion_mode(ExtrusionMode::Cut);
+        app.set_extrusion_distance_intent(-5.0);
+        assert!(app.stage_sketch_extrusion(), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("The extrusion missed the body")),
+            "{:?}",
+            app.document_status
+        );
+        assert_eq!(app.bodies.len(), 2);
     }
 
     #[test]
