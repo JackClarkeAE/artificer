@@ -47,6 +47,7 @@ mod revolve;
 mod revolved;
 mod rim_loop_blend;
 mod ruled;
+mod section_cells;
 mod section_revolve;
 mod sew;
 mod sheet;
@@ -61,6 +62,7 @@ mod spline_profile;
 mod step_export;
 mod step_import;
 mod surface_intersection;
+mod surface_marching;
 mod sweep_profile;
 mod topology;
 mod transform;
@@ -2594,6 +2596,22 @@ impl NativeKernel {
                                 )],
                             ));
                         }
+                        Err(analytic_boolean::AnalyticBooleanError::IntersectionUnresolved) => {
+                            return Err(error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                target.id,
+                                "the Boolean operands leave the regularized analytic domain",
+                                vec![simple_diagnostic(
+                                    "BOOLEAN_INTERSECTION_UNRESOLVED",
+                                    KernelStage::Construction,
+                                    "Two faces come within reach of one another on carriers \
+                                     outside the intersection matrix, and the numerical rung \
+                                     could not trace or fit the curve they share within its \
+                                     tolerance; move the faces apart or change the carriers.",
+                                )],
+                            ));
+                        }
                         Err(analytic_boolean::AnalyticBooleanError::DomainUnsupported) => {
                             // An out-of-matrix carrier pair is a vocabulary
                             // limit and says so; anything else the engine
@@ -4357,6 +4375,9 @@ enum ExactRouteDecline {
     TraceUnclosed,
     /// The exact result was empty.
     Empty,
+    /// The numerical intersection rung (ADR 0056 B2) found two faces within
+    /// reach of one another but could not trace or fit the curve they share.
+    IntersectionUnresolved,
     /// The prism tool itself could not be built from the profile.
     Tool,
     /// The exact engine built a candidate that the solid validator did not
@@ -4374,6 +4395,9 @@ impl ExactRouteDecline {
             analytic_boolean::AnalyticBooleanError::TraceUnclosed => Self::TraceUnclosed,
             analytic_boolean::AnalyticBooleanError::DomainUnsupported => Self::Contact,
             analytic_boolean::AnalyticBooleanError::EmptyResult => Self::Empty,
+            analytic_boolean::AnalyticBooleanError::IntersectionUnresolved => {
+                Self::IntersectionUnresolved
+            }
         }
     }
 
@@ -4395,6 +4419,11 @@ impl ExactRouteDecline {
                                     closure refuses rather than guess how it continues"
                 .to_owned(),
             Self::Empty => "the exact operation produced no material".to_owned(),
+            Self::IntersectionUnresolved => "two faces come within reach of one another on \
+                                             carriers outside the intersection matrix, and the \
+                                             numerical rung could not trace or fit the curve they \
+                                             share within its tolerance"
+                .to_owned(),
             Self::Tool => "the profile could not be swept into an exact tool".to_owned(),
             Self::Invalid => "the exact engine built a body that did not pass the solid \
                               validator, which is a defect in the exact route rather than a \

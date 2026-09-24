@@ -1184,6 +1184,26 @@ pub(crate) fn interpolate<const D: usize>(
         .then_some(points)
 }
 
+/// The curve of `degree` on `knots` through `data` at the rising
+/// `parameters`, for callers that have already chosen the knots — the
+/// numerical intersection rung interpolates a space curve and its two
+/// parameter traces on one knot vector so the three agree span for span.
+pub(crate) fn interpolating_curve<const D: usize>(
+    degree: usize,
+    knots: &[f64],
+    parameters: &[f64],
+    data: &[[f64; D]],
+) -> Option<SplineCurve<D>>
+where
+    CurveData<D>: Interned,
+{
+    if data.len() < 2 || data.len() != parameters.len() {
+        return None;
+    }
+    let control = interpolate(degree, knots, parameters, data)?;
+    SplineCurve::new(degree, knots.to_vec(), control).ok()
+}
+
 /// A clamped, uniform knot vector for `count` control points of `degree`:
 /// the one the sketch's control-vertex tool gives a spline.
 pub(crate) fn clamped_uniform_knots(count: usize, degree: usize) -> Vec<f64> {

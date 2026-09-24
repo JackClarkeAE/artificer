@@ -31,6 +31,7 @@ use crate::profile_boolean::{
 use crate::revolved::Revolved;
 use crate::sew::{SewError, SewFace, ray_directions, ray_face_crossings, sew_shells};
 use crate::surface_intersection::{IntersectionCurve, SurfaceIntersection, intersect};
+use crate::surface_marching::TracedCurve;
 use crate::topology::{Cylinder, Face, Plane, Point2, Point3, Surface, Topology, Vector3};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,23 +53,69 @@ pub(crate) enum AnalyticBooleanError {
     /// mean a face of the other solid did not report the piece that
     /// continues a curve, and the closure refuses rather than guess it.
     TraceUnclosed,
+    /// The numerical rung (ADR 0056 B2) could not trace a pair outside the
+    /// matrix: the two faces come within reach of one another but no
+    /// crossing curve was found, or the curve found could not be fitted
+    /// within the intersection tolerance.
+    IntersectionUnresolved,
 }
 
-/// Runs the general analytic Boolean over two validated solids.
+/// What the numerical rung added to a result: the worst measured departure
+/// of any fitted intersection curve from the two carriers it lies on and
+/// from its own parameter traces, the tolerance every curve was held to,
+/// and how many curves were traced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NumericalApproximation {
+    pub(crate) deviation: f64,
+    pub(crate) tolerance: f64,
+    pub(crate) curves: usize,
+}
+
+/// Runs the general analytic Boolean over two validated solids, exactly:
+/// every carrier pair that meets must be in the published matrix.
 pub(crate) fn build_analytic_boolean(
     target: &Topology,
     tool: &Topology,
     operation: BooleanOperation,
     precision: PrecisionPolicy,
 ) -> Result<Topology, AnalyticBooleanError> {
+    build(target, tool, operation, precision, false).map(|(topology, _)| topology)
+}
+
+/// Runs the general Boolean with the numerical intersection rung (ADR 0056
+/// B2–B4) admitted: a carrier pair the matrix refuses is traced and fitted,
+/// and the result says how far the fit departs. `None` for the
+/// approximation means no curve had to be traced and the body is exact.
+pub(crate) fn build_general_boolean(
+    target: &Topology,
+    tool: &Topology,
+    operation: BooleanOperation,
+    precision: PrecisionPolicy,
+) -> Result<(Topology, Option<NumericalApproximation>), AnalyticBooleanError> {
+    build(target, tool, operation, precision, true)
+}
+
+fn build(
+    target: &Topology,
+    tool: &Topology,
+    operation: BooleanOperation,
+    precision: PrecisionPolicy,
+    numerical: bool,
+) -> Result<(Topology, Option<NumericalApproximation>), AnalyticBooleanError> {
     let mut pieces = Vec::new();
     let (target, tool) = (OperandFaces::new(target), OperandFaces::new(tool));
+    let store = if numerical {
+        trace_unsupported_pairs(&target, &tool, precision)?
+    } else {
+        NumericalStore::exact()
+    };
     collect_operand_pieces(
         &target,
         &tool,
         operation,
         OperandSide::Target,
         precision,
+        &store,
         &mut pieces,
     )?;
     collect_operand_pieces(
@@ -77,14 +124,252 @@ pub(crate) fn build_analytic_boolean(
         operation,
         OperandSide::Tool,
         precision,
+        &store,
         &mut pieces,
     )?;
     if pieces.is_empty() {
         return Err(AnalyticBooleanError::EmptyResult);
     }
-    sew_shells(&pieces, precision).map_err(|error| match error {
+    let topology = sew_shells(&pieces, precision).map_err(|error| match error {
         SewError::Inconsistent | SewError::Degenerate => AnalyticBooleanError::DomainUnsupported,
+    })?;
+    let approximation = (!store.curves.is_empty()).then(|| NumericalApproximation {
+        deviation: store
+            .curves
+            .iter()
+            .map(|curve| curve.deviation)
+            .fold(0.0_f64, f64::max),
+        tolerance: crate::surface_marching::INTERSECTION_TOLERANCE,
+        curves: store.curves.len(),
+    });
+    Ok((topology, approximation))
+}
+
+/// The curves the numerical rung traced for one operand pair: each with
+/// its parameter on the target's carrier first and the tool's second, and
+/// the parameters it is cut at so that both faces it separates cut it
+/// alike. The exact route carries an empty store that admits nothing.
+struct NumericalStore {
+    admitted: bool,
+    curves: Vec<TracedCurve>,
+    cuts: Vec<Vec<f64>>,
+}
+
+impl NumericalStore {
+    fn exact() -> Self {
+        Self {
+            admitted: false,
+            curves: Vec::new(),
+            cuts: Vec::new(),
+        }
+    }
+}
+
+/// Traces every carrier pair the matrix refuses whose faces could meet.
+///
+/// A pair is skipped when its faces' extents are apart, or when a sampled
+/// separation proves the bounded patches apart; otherwise it is traced, and
+/// a pair the tracer finds within reach of itself yet finds no curve for is
+/// refused rather than read as apart.
+fn trace_unsupported_pairs(
+    target: &OperandFaces<'_>,
+    tool: &OperandFaces<'_>,
+    precision: PrecisionPolicy,
+) -> Result<NumericalStore, AnalyticBooleanError> {
+    let mut store = NumericalStore {
+        admitted: true,
+        curves: Vec::new(),
+        cuts: Vec::new(),
+    };
+    let mut visited: Vec<(Surface, Surface)> = Vec::new();
+    for (i, first) in target.topology.faces.iter().enumerate() {
+        for (j, second) in tool.topology.faces.iter().enumerate() {
+            let pair = (first.value.surface, second.value.surface);
+            if !matches!(
+                intersect(pair.0, pair.1, precision),
+                Err(crate::surface_intersection::IntersectionError::Unsupported)
+            ) {
+                continue;
+            }
+            if faces_apart(target.extents[i], tool.extents[j], precision) {
+                continue;
+            }
+            if visited.contains(&pair) {
+                continue;
+            }
+            visited.push(pair);
+            let (Some(first_window), Some(second_window)) =
+                (carrier_window(target, pair.0), carrier_window(tool, pair.1))
+            else {
+                return Err(AnalyticBooleanError::DomainUnsupported);
+            };
+            if crate::surface_marching::patches_apart(pair.0, first_window, pair.1, second_window) {
+                continue;
+            }
+            let curves = crate::surface_marching::trace_carriers(
+                pair.0,
+                first_window,
+                pair.1,
+                second_window,
+            )
+            .map_err(|error| match error {
+                crate::surface_marching::TraceError::Unsupported => {
+                    AnalyticBooleanError::CarrierPair(Box::new([pair.0, pair.1]))
+                }
+                crate::surface_marching::TraceError::ToleranceUnmet => {
+                    AnalyticBooleanError::IntersectionUnresolved
+                }
+            })?;
+            if curves.is_empty() {
+                return Err(AnalyticBooleanError::IntersectionUnresolved);
+            }
+            for curve in curves {
+                let mut cuts = vec![0.0, 1.0];
+                for (side, operand) in [(0, target), (1, tool)] {
+                    let carrier = curve.sides[side].carrier;
+                    for (index, face) in operand.topology.faces.iter().enumerate() {
+                        if face.value.surface != carrier {
+                            continue;
+                        }
+                        let region = operand.region(index)?;
+                        cuts.extend(crate::section_cells::curve_region_crossings(
+                            curve.sides[side].pcurve,
+                            carrier,
+                            region,
+                        ));
+                    }
+                }
+                cuts.sort_by(f64::total_cmp);
+                cuts.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-9);
+                // A closed loop is at least two edges, as a circle is two
+                // semicircles.
+                if curve.closed && cuts.len() < 3 {
+                    cuts.push(0.5);
+                    cuts.sort_by(f64::total_cmp);
+                }
+                store.curves.push(curve);
+                store.cuts.push(cuts);
+            }
+        }
+    }
+    Ok(store)
+}
+
+/// The parameter window every face of an operand on one carrier lies in,
+/// widened a little so a traced curve reaches past the faces' boundaries.
+fn carrier_window(
+    operand: &OperandFaces<'_>,
+    carrier: Surface,
+) -> Option<crate::surface_marching::Window> {
+    let mut u = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut v = (f64::INFINITY, f64::NEG_INFINITY);
+    for (index, face) in operand.topology.faces.iter().enumerate() {
+        if face.value.surface != carrier {
+            continue;
+        }
+        let region = operand.regions[index].as_deref()?;
+        let (Some((u_low, u_high)), Some((v_low, v_high))) =
+            (azimuth_window(region), ordinate_window(region))
+        else {
+            return None;
+        };
+        u = (u.0.min(u_low), u.1.max(u_high));
+        v = (v.0.min(v_low), v.1.max(v_high));
+    }
+    if !(u.0 < u.1 && v.0 < v.1) {
+        return None;
+    }
+    let revolved = Revolved::of(carrier);
+    let widen = |(low, high): (f64, f64)| {
+        let reach = (0.1 * (high - low)).max(0.05);
+        (low - reach, high + reach)
+    };
+    Some(crate::surface_marching::Window {
+        u: widen(u),
+        v: widen(v),
+        u_periodic: revolved.is_some(),
+        v_periodic: revolved.is_some_and(Revolved::v_periodic),
     })
+}
+
+/// The `v` span a region occupies.
+fn ordinate_window(region: &[Vec<Segment>]) -> Option<(f64, f64)> {
+    let (low, high) = region
+        .iter()
+        .flatten()
+        .flat_map(|segment| [segment.start().y, segment.end().y])
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), y| {
+            (low.min(y), high.max(y))
+        });
+    (low.is_finite() && high.is_finite()).then_some((low, high))
+}
+
+/// The stretches of traced curves that lie on this face's carrier and
+/// inside some face of the other operand on the curve's other carrier: the
+/// numerical section pieces of this face.
+fn numerical_arcs_for_face(
+    store: &NumericalStore,
+    side: OperandSide,
+    face: &Face,
+    other: &OperandFaces<'_>,
+) -> Result<Vec<crate::section_cells::NumericalArc>, AnalyticBooleanError> {
+    let own = match side {
+        OperandSide::Target => 0,
+        OperandSide::Tool => 1,
+    };
+    let mut arcs = Vec::new();
+    for (index, curve) in store.curves.iter().enumerate() {
+        if curve.sides[own].carrier != face.surface {
+            continue;
+        }
+        let across = &curve.sides[1 - own];
+        let mut regions = Vec::new();
+        for (other_index, other_face) in other.topology.faces.iter().enumerate() {
+            if other_face.value.surface == across.carrier {
+                regions.push(other.region(other_index)?);
+            }
+        }
+        for pair in store.cuts[index].windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            if to - from <= 1.0e-9 {
+                continue;
+            }
+            let middle = across.pcurve.point(0.5 * (from + to));
+            if regions
+                .iter()
+                .any(|region| point_in_region_on_any_turn(middle, region, across.carrier))
+            {
+                arcs.push(crate::section_cells::NumericalArc {
+                    curve: index,
+                    pcurve: curve.sides[own].pcurve,
+                    from,
+                    to,
+                });
+            }
+        }
+    }
+    Ok(arcs)
+}
+
+/// Whether a parameter point lies in a region, brought by whole turns onto
+/// the region's own window where the carrier is periodic.
+fn point_in_region_on_any_turn(point: Point2, region: &[Vec<Segment>], carrier: Surface) -> bool {
+    let tau = std::f64::consts::TAU;
+    let revolved = Revolved::of(carrier);
+    let mut point = point;
+    if revolved.is_some()
+        && let Some((low, high)) = azimuth_window(region)
+    {
+        let middle = 0.5 * (low + high);
+        point.x += ((middle - point.x) / tau).round() * tau;
+    }
+    if revolved.is_some_and(Revolved::v_periodic)
+        && let Some((low, high)) = ordinate_window(region)
+    {
+        let middle = 0.5 * (low + high);
+        point.y += ((middle - point.y) / tau).round() * tau;
+    }
+    crate::profile_boolean::point_in_loops(point, &crate::profile_boolean::wrap_loops(region))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,6 +449,7 @@ fn collect_operand_pieces(
     operation: BooleanOperation,
     side: OperandSide,
     precision: PrecisionPolicy,
+    store: &NumericalStore,
     pieces: &mut Vec<SewFace>,
 ) -> Result<(), AnalyticBooleanError> {
     let (operation_2d, reverse) = keep_rule(side, operation);
@@ -171,7 +457,9 @@ fn collect_operand_pieces(
     for (index, face) in own.faces.iter().enumerate() {
         let region = own_faces.region(index)?;
         let own_extent = own_faces.extents[index];
-        let section = section_on_face(&face.value, region, own_extent, other, precision)?;
+        let exact =
+            section_pieces_on_face(&face.value, own_extent, other, precision, store.admitted)?;
+        let traced = numerical_arcs_for_face(store, side, &face.value, other)?;
         let overlays = coincident_overlays(&face.value, region, own_extent, other, precision)?;
         let own_region = ProfileRegion {
             outer: region[0].clone(),
@@ -204,13 +492,14 @@ fn collect_operand_pieces(
         }
 
         let mut kept: Vec<Vec<Vec<Segment>>> = Vec::new();
+        let mut cells: Vec<crate::section_cells::Cell> = Vec::new();
         for piece in rest {
             let piece_loops = {
                 let mut loops = vec![piece.outer.clone()];
                 loops.extend(piece.holes.iter().cloned());
                 loops
             };
-            if section.is_empty() {
+            if exact.is_empty() && traced.is_empty() {
                 // Untouched face: wholesale in-or-out of the other solid. One
                 // clear of the other solid's whole box is outside it (a solid
                 // is bounded), so it skips the ray cast over every far face.
@@ -227,7 +516,40 @@ fn collect_operand_pieces(
                 if keep {
                     kept.push(piece_loops);
                 }
+            } else if !traced.is_empty() || Revolved::is_general(face.value.surface) {
+                // A traced curve, or a carrier whose sections the count-based
+                // closure does not read: the cells of the arrangement,
+                // classified in space (ADR 0056 B5).
+                let unclosed = || {
+                    if exact
+                        .iter()
+                        .any(|piece| matches!(piece, Segment::Trace { .. }))
+                    {
+                        AnalyticBooleanError::TraceUnclosed
+                    } else {
+                        AnalyticBooleanError::DomainUnsupported
+                    }
+                };
+                cells.extend(
+                    crate::section_cells::close_by_cells(
+                        face.value.surface,
+                        &piece_loops,
+                        &exact,
+                        &traced,
+                        &store.curves,
+                        other.topology,
+                        operation_2d == BooleanOperation::Intersection,
+                        precision,
+                    )
+                    .map_err(|error| match error {
+                        crate::section_cells::CellError::Unclosed => unclosed(),
+                        crate::section_cells::CellError::Unsupported => {
+                            AnalyticBooleanError::DomainUnsupported
+                        }
+                    })?,
+                );
             } else {
+                let section = close_section_pieces(&face.value, exact.clone(), region, precision)?;
                 match profile_boolean_multi(
                     std::slice::from_ref(&piece),
                     &section,
@@ -281,12 +603,27 @@ fn collect_operand_pieces(
                 }
             }
         }
-        for loops in kept {
-            let piece = SewFace {
+        let faces = kept
+            .into_iter()
+            .map(|loops| SewFace {
                 surface: face.value.surface,
                 loops,
                 role: face.value.role,
-            };
+                numerical: Vec::new(),
+            })
+            .chain(cells.into_iter().map(|cell| {
+                SewFace {
+                    surface: face.value.surface,
+                    loops: cell
+                        .loops
+                        .iter()
+                        .map(|cell| cell.segments.clone())
+                        .collect(),
+                    role: face.value.role,
+                    numerical: cell.loops.into_iter().map(|cell| cell.numerical).collect(),
+                }
+            }));
+        for piece in faces {
             pieces.push(if reverse {
                 mirror_sew_face(piece)?
             } else {
@@ -604,15 +941,21 @@ fn coincident_overlays(
     Ok(overlays)
 }
 
-/// The other solid's section on this face's carrier, in the face's own
-/// parameter space, as zero or more closed regions.
-fn section_on_face(
+/// The other solid's section pieces on this face's carrier, in the face's
+/// own parameter space, unclosed: every exact curve the matrix names,
+/// clipped to the face across the way that contributes it.
+///
+/// A pair the matrix refuses is skipped when the faces' extents are apart,
+/// and — when the numerical rung is running — always, since that rung has
+/// already traced it or proved its patches apart; otherwise it is the
+/// refusal the exact route names.
+fn section_pieces_on_face(
     face: &Face,
-    own_region: &[Vec<Segment>],
     own_extent: Option<FaceExtent>,
     other: &OperandFaces<'_>,
     precision: PrecisionPolicy,
-) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
+    numerical: bool,
+) -> Result<Vec<Segment>, AnalyticBooleanError> {
     let mut pieces: Vec<Segment> = Vec::new();
     // Only faces whose extents come near this one can put a piece on it: a
     // curve clipped to a far face's region lands outside this face (see
@@ -624,6 +967,9 @@ fn section_on_face(
         let outcome = match intersect(face.surface, other_face.value.surface, precision) {
             Ok(outcome) => outcome,
             Err(_) if faces_apart(own_extent, other.extents[index], precision) => continue,
+            Err(crate::surface_intersection::IntersectionError::Unsupported) if numerical => {
+                continue;
+            }
             Err(_) => {
                 return Err(AnalyticBooleanError::CarrierPair(Box::new([
                     face.surface,
@@ -671,7 +1017,17 @@ fn section_on_face(
     // runs along it once, so the second copy is dropped rather than left to
     // make the chain ambiguous — a vertex with four ends where a loop needs
     // two.
-    let pieces = without_repeated_pieces(pieces, precision);
+    Ok(without_repeated_pieces(pieces, precision))
+}
+
+/// Closes loose section pieces on a face into regions: the count-based
+/// closure on a cylinder, the planar chaining on a plane.
+fn close_section_pieces(
+    face: &Face,
+    pieces: Vec<Segment>,
+    own_region: &[Vec<Segment>],
+    precision: PrecisionPolicy,
+) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
     match face.surface {
         Surface::Cylinder(_) => close_periodic_sections(pieces, own_region, precision),
         _ => nest_section_loops(
@@ -865,51 +1221,25 @@ fn clip_to_azimuths(piece: Segment, low: f64, high: f64) -> Option<Segment> {
     Some(piece)
 }
 
-/// Closes the other solid's section on a periodic face into regions.
-///
-/// A section is the part of this face's carrier that lies inside the other
-/// solid, and its boundary is every curve the other solid's faces cut the
-/// carrier in. On a cylinder those curves live on a surface that wraps round,
-/// and the face is one window of it: a plane's trace crosses the window from
-/// seam to seam, a bore of the same size crosses it in a lens, and a narrower
-/// bore that reaches a seam without passing it takes a bite out of the edge
-/// and leaves by the seam it came in by. Asking which of those shapes a
-/// section is, and closing each its own way, is the approach that kept
-/// needing another case; this does not ask.
-///
-/// The curves are lifted onto the unrolled carrier and cut to a window a
-/// little wider than the face's own, so the face lies strictly inside it and
-/// nothing added below ever touches the face's edges. Inside that window the
-/// section is bounded by the curves and by stretches of the window's two edge
-/// generators — and which stretches is not a question about shapes but a
-/// count. A generator is a line on the carrier. Far enough along it, it is
-/// outside the other solid, which is bounded; every curve it crosses takes it
-/// in or out. So along each edge generator the crossings, taken in order,
-/// pair off: first and second bound a stretch inside, third and fourth the
-/// next. Those stretches close every chain that the window cut open, and the
-/// section comes back as closed loops for [`nest_section_loops`] — whatever
-/// mixture of bands, bites, lenses and islands it happens to be.
-///
-/// A curve that meets an edge generator and turns back, or two curves that
-/// cross on it, put an even number of ends at one point: the side does not
-/// change there, so those ends pair with each other rather than with the
-/// stretch, and a stretch that runs past such a point is cut at it.
-fn close_periodic_sections(
+/// The section pieces on a periodic face brought onto its window: each
+/// curve once, on every turn that reaches the window, cut to it, welded,
+/// cut at their mutual crossings, and stripped of the generators the carrier
+/// is only tangent along. Shared by the count-based closure below and the
+/// cell closure of [`crate::section_cells`].
+pub(crate) fn lift_section_pieces(
     pieces: Vec<Segment>,
     region: &[Vec<Segment>],
     precision: PrecisionPolicy,
-) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
+) -> Result<Vec<Segment>, AnalyticBooleanError> {
+    lift_pieces_to_window(pieces, region, precision).map(|(pieces, _)| pieces)
+}
+
+fn lift_pieces_to_window(
+    pieces: Vec<Segment>,
+    region: &[Vec<Segment>],
+    precision: PrecisionPolicy,
+) -> Result<(Vec<Segment>, f64), AnalyticBooleanError> {
     let tau = std::f64::consts::TAU;
-    let unclosed = |pieces: &[Segment]| {
-        if pieces
-            .iter()
-            .any(|piece| matches!(piece, Segment::Trace { .. }))
-        {
-            AnalyticBooleanError::TraceUnclosed
-        } else {
-            AnalyticBooleanError::DomainUnsupported
-        }
-    };
     let Some((u_min, u_max)) = azimuth_window(region) else {
         return Err(AnalyticBooleanError::DomainUnsupported);
     };
@@ -959,7 +1289,7 @@ fn close_periodic_sections(
         }
     }
     if lifted.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), weld));
     }
 
     // Weld ends that meet, then cut the curves wherever they cross or touch
@@ -987,6 +1317,62 @@ fn close_periodic_sections(
         } else if piece.start().x > u_min + margin && piece.start().x < u_max - margin {
             return Err(AnalyticBooleanError::DomainUnsupported);
         }
+    }
+    Ok((welded, weld))
+}
+
+/// Closes the other solid's section on a periodic face into regions.
+///
+/// A section is the part of this face's carrier that lies inside the other
+/// solid, and its boundary is every curve the other solid's faces cut the
+/// carrier in. On a cylinder those curves live on a surface that wraps round,
+/// and the face is one window of it: a plane's trace crosses the window from
+/// seam to seam, a bore of the same size crosses it in a lens, and a narrower
+/// bore that reaches a seam without passing it takes a bite out of the edge
+/// and leaves by the seam it came in by. Asking which of those shapes a
+/// section is, and closing each its own way, is the approach that kept
+/// needing another case; this does not ask.
+///
+/// The curves are lifted onto the unrolled carrier and cut to a window a
+/// little wider than the face's own, so the face lies strictly inside it and
+/// nothing added below ever touches the face's edges. Inside that window the
+/// section is bounded by the curves and by stretches of the window's two edge
+/// generators — and which stretches is not a question about shapes but a
+/// count. A generator is a line on the carrier. Far enough along it, it is
+/// outside the other solid, which is bounded; every curve it crosses takes it
+/// in or out. So along each edge generator the crossings, taken in order,
+/// pair off: first and second bound a stretch inside, third and fourth the
+/// next. Those stretches close every chain that the window cut open, and the
+/// section comes back as closed loops for [`nest_section_loops`] — whatever
+/// mixture of bands, bites, lenses and islands it happens to be.
+///
+/// A curve that meets an edge generator and turns back, or two curves that
+/// cross on it, put an even number of ends at one point: the side does not
+/// change there, so those ends pair with each other rather than with the
+/// stretch, and a stretch that runs past such a point is cut at it.
+fn close_periodic_sections(
+    pieces: Vec<Segment>,
+    region: &[Vec<Segment>],
+    precision: PrecisionPolicy,
+) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
+    let unclosed = |pieces: &[Segment]| {
+        if pieces
+            .iter()
+            .any(|piece| matches!(piece, Segment::Trace { .. }))
+        {
+            AnalyticBooleanError::TraceUnclosed
+        } else {
+            AnalyticBooleanError::DomainUnsupported
+        }
+    };
+    let Some((u_min, u_max)) = azimuth_window(region) else {
+        return Err(AnalyticBooleanError::DomainUnsupported);
+    };
+    let reach = 0.05;
+    let (low, high) = (u_min - reach, u_max + reach);
+    let (mut welded, weld) = lift_pieces_to_window(pieces, region, precision)?;
+    if welded.is_empty() {
+        return Ok(Vec::new());
     }
 
     // The stretches of each edge generator that lie inside the other solid.
@@ -2261,10 +2647,36 @@ fn mirror_sew_face(piece: SewFace) -> Result<SewFace, AnalyticBooleanError> {
                 .collect()
         })
         .collect();
+    // A traced arc's parameter trace is carried by its control points, as
+    // an affine map carries a B-spline, and walked the other way.
+    let numerical = piece
+        .numerical
+        .iter()
+        .map(|arcs| {
+            arcs.iter()
+                .rev()
+                .map(|arc| {
+                    arc.map(|arc| crate::sew::NumericalPiece {
+                        curve: arc.curve,
+                        pcurve: arc
+                            .pcurve
+                            .mapped(|point| {
+                                let mirrored = mirror(Point2::new(point[0], point[1]));
+                                [mirrored.x, mirrored.y]
+                            })
+                            .unwrap_or(arc.pcurve),
+                        from: arc.to,
+                        to: arc.from,
+                    })
+                })
+                .collect()
+        })
+        .collect();
     Ok(SewFace {
         surface,
         loops,
         role: piece.role,
+        numerical,
     })
 }
 

@@ -494,6 +494,41 @@ pub(crate) fn chain_welded_segments(
     Ok(loops)
 }
 
+/// The two ends of the stretch two segments share along one carrier, or
+/// `None` where they do not run along each other.
+pub(crate) fn overlap_ends(
+    first: Segment,
+    second: Segment,
+    precision: PrecisionPolicy,
+) -> Option<[Point2; 2]> {
+    carrier_overlap(first, second, Tolerances::from(precision)).map(|overlap| overlap.ends)
+}
+
+/// One segment split at points on it that another curve's ends supplied —
+/// the ends of a numerically traced arc landing on a face's boundary — each
+/// placed by projection, with the pieces reusing the given points exactly.
+pub(crate) fn split_segment_at_points(
+    segment: Segment,
+    points: &[Point2],
+    precision: PrecisionPolicy,
+) -> Result<Vec<Segment>, ProfileBooleanError> {
+    let tolerances = Tolerances::from(precision);
+    let length = segment_length(segment);
+    let cuts: Vec<Cut> = points
+        .iter()
+        .filter_map(|point| {
+            match place(parameter_of(segment, *point), length, tolerances) {
+                Placement::Interior(parameter) => Some(Cut {
+                    parameter,
+                    point: *point,
+                }),
+                _ => None,
+            }
+        })
+        .collect();
+    split_segment(segment, &cuts, tolerances)
+}
+
 /// Rewrites a loop so consecutive endpoints are bit-identical, for callers
 /// that feed extracted loops to consumers demanding exact junctions.
 pub(crate) fn welded(

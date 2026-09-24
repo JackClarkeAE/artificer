@@ -33,11 +33,43 @@ pub(crate) enum SewError {
 
 /// One face piece awaiting sewing: a surface carrier and its boundary loops
 /// in that surface's own parameter space, outer loop first.
+///
+/// A loop may carry numerically traced arcs (ADR 0056, Track B2): each is a
+/// placeholder line in `loops` whose ends are the arc's, beside the arc
+/// itself in `numerical`, indexed loop by loop and segment by segment. An
+/// empty `numerical` means every piece is exact.
 #[derive(Clone, Debug)]
 pub(crate) struct SewFace {
     pub(crate) surface: Surface,
     pub(crate) loops: Vec<Vec<Segment>>,
     pub(crate) role: FaceRole,
+    pub(crate) numerical: Vec<Vec<Option<NumericalPiece>>>,
+}
+
+/// A stretch of a numerically traced intersection curve as an edge: the
+/// fitted space curve both faces share, and this face's own parameter trace
+/// of it, over one parameter range.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NumericalPiece {
+    pub(crate) curve: crate::bspline::SplineCurve3,
+    pub(crate) pcurve: crate::bspline::SplineCurve2,
+    pub(crate) from: f64,
+    pub(crate) to: f64,
+}
+
+impl SewFace {
+    /// The numerical arc standing behind a loop's segment, if any.
+    fn numerical(&self, loop_index: usize, segment_index: usize) -> Option<NumericalPiece> {
+        self.numerical
+            .get(loop_index)
+            .and_then(|pieces| pieces.get(segment_index))
+            .copied()
+            .flatten()
+    }
+
+    fn has_numerical(&self) -> bool {
+        self.numerical.iter().flatten().any(|piece| piece.is_some())
+    }
 }
 
 /// A hash grid over sewn vertices, keyed by position quantised to the weld
@@ -156,16 +188,28 @@ pub(crate) fn sew_shells(
     let mut face_keys: Vec<FaceKey> = Vec::with_capacity(pieces.len());
     for piece in pieces {
         let mut loop_keys = Vec::with_capacity(piece.loops.len());
-        for segments in &piece.loops {
+        for (loop_index, segments) in piece.loops.iter().enumerate() {
             if segments.is_empty() {
                 return Err(SewError::Inconsistent);
             }
             let mut coedges = Vec::with_capacity(segments.len());
-            for segment in segments {
-                let start_world =
-                    surface_point(piece.surface, segment.start()).ok_or(SewError::Inconsistent)?;
-                let end_world =
-                    surface_point(piece.surface, segment.end()).ok_or(SewError::Inconsistent)?;
+            for (segment_index, segment) in segments.iter().enumerate() {
+                // A numerically traced arc is the one fitted space curve both
+                // faces hold, over one parameter: its ends and its middle are
+                // that curve's, so the weld below finds the same edge from
+                // either face.
+                let numerical = piece.numerical(loop_index, segment_index);
+                let start_world = match numerical {
+                    Some(arc) => arc.curve.point(arc.from),
+                    None => surface_point(piece.surface, segment.start())
+                        .ok_or(SewError::Inconsistent)?,
+                };
+                let end_world = match numerical {
+                    Some(arc) => arc.curve.point(arc.to),
+                    None => {
+                        surface_point(piece.surface, segment.end()).ok_or(SewError::Inconsistent)?
+                    }
+                };
                 // A trace is read over the pair's one parameter from here on,
                 // and its midpoint is that parameter's midpoint, so the weld
                 // below compares the same point from either face.
@@ -180,15 +224,25 @@ pub(crate) fn sew_shells(
                         trace.pcurve.evaluate((range.start + range.end) / 2.0)
                     },
                 );
-                let middle_world =
-                    surface_point(piece.surface, middle_2d).ok_or(SewError::Inconsistent)?;
+                let middle_world = match numerical {
+                    Some(arc) => arc.curve.point(0.5 * (arc.from + arc.to)),
+                    None => {
+                        surface_point(piece.surface, middle_2d).ok_or(SewError::Inconsistent)?
+                    }
+                };
                 let start_vertex =
                     vertex_grid.find_or_insert(&mut topology, &mut next_id, start_world);
                 let end_vertex = vertex_grid.find_or_insert(&mut topology, &mut next_id, end_world);
 
-                let (curve, parameter_range) = match canonical {
-                    Some(trace) => (trace.curve, trace.range),
-                    None => segment_curve(piece.surface, *segment).ok_or(SewError::Inconsistent)?,
+                let (curve, parameter_range) = match (numerical, canonical) {
+                    (Some(arc), _) => (
+                        Curve3::Bspline { curve: arc.curve },
+                        ParameterRange::new(arc.from, arc.to),
+                    ),
+                    (None, Some(trace)) => (trace.curve, trace.range),
+                    (None, None) => {
+                        segment_curve(piece.surface, *segment).ok_or(SewError::Inconsistent)?
+                    }
                 };
                 let pair = if start_vertex.0 <= end_vertex.0 {
                     [start_vertex.0, end_vertex.0]
@@ -213,11 +267,21 @@ pub(crate) fn sew_shells(
                 });
                 let (edge_key, orientation) = match found {
                     Some(index) => {
-                        let aligned =
-                            topology.edges[index].value.vertices == [start_vertex, end_vertex];
+                        let vertices = topology.edges[index].value.vertices;
+                        let aligned = vertices == [start_vertex, end_vertex];
+                        // A pole edge has both ends at one vertex, so its
+                        // direction cannot say which way a face walks it;
+                        // the two faces that share it take opposite senses,
+                        // as the edge-use family requires of every edge.
+                        let degenerate = vertices[0] == vertices[1];
+                        let already_forward = degenerate
+                            && topology.coedges.iter().any(|coedge| {
+                                coedge.value.edge == EdgeKey(index)
+                                    && coedge.value.orientation == Orientation::Forward
+                            });
                         (
                             EdgeKey(index),
-                            if aligned {
+                            if aligned && !already_forward {
                                 Orientation::Forward
                             } else {
                                 Orientation::Reverse
@@ -238,9 +302,13 @@ pub(crate) fn sew_shells(
                         (key, Orientation::Forward)
                     }
                 };
-                let (pcurve, pcurve_range) = match canonical {
-                    Some(trace) => (trace.pcurve, trace.pcurve_range),
-                    None => segment_pcurve(*segment),
+                let (pcurve, pcurve_range) = match (numerical, canonical) {
+                    (Some(arc), _) => (
+                        Curve2::Bspline { curve: arc.pcurve },
+                        ParameterRange::new(arc.from, arc.to),
+                    ),
+                    (None, Some(trace)) => (trace.pcurve, trace.pcurve_range),
+                    (None, None) => segment_pcurve(*segment),
                 };
                 let coedge_key = CoedgeKey(topology.coedges.len());
                 topology.coedges.push(Record {
@@ -470,11 +538,17 @@ fn without_needless_vertices(pieces: &[SewFace], weld: f64) -> Vec<SewFace> {
         .map(|(face, piece)| SewFace {
             surface: piece.surface,
             role: piece.role,
+            numerical: piece.numerical.clone(),
             loops: piece
                 .loops
                 .iter()
                 .map(|segments| {
                     let mut segments = segments.clone();
+                    // A loop with a traced arc in it keeps every vertex: the
+                    // placeholder lines are not pieces of any carrier.
+                    if piece.has_numerical() {
+                        return segments;
+                    }
                     let mut index = 0;
                     while segments.len() > 2 && index < segments.len() {
                         let next = (index + 1) % segments.len();
