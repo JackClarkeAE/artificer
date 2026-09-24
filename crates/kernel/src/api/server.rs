@@ -745,6 +745,45 @@ impl SharedSession {
                 id,
                 serde_json::Value::String(export_step_faceted(&session.snapshot, "model")),
             ),
+            // A body read from a STEP file, by path or by its text (ADR
+            // 0056, Track I); the same step `execute` runs as `import_step`.
+            "import.step" => {
+                #[derive(Deserialize)]
+                struct ImportParams {
+                    #[serde(default)]
+                    label: Option<String>,
+                    #[serde(default)]
+                    path: Option<String>,
+                    #[serde(default)]
+                    text: Option<String>,
+                }
+                let import: ImportParams = match serde_json::from_value(params) {
+                    Ok(import) => import,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid import params: {error}"),
+                        );
+                    }
+                };
+                let label = import.label.unwrap_or_else(|| "import".to_owned());
+                let result = match (import.path, import.text) {
+                    (_, Some(text)) => session.import_step_text(label, text, &token),
+                    (Some(path), None) => session.import_step(label, path, &token),
+                    (None, None) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            "import.step takes a `path` to a STEP file or its `text`",
+                        );
+                    }
+                };
+                match result {
+                    Ok(result) => respond(id, &result),
+                    Err(error) => JsonRpcResponse::api_error(id, &error),
+                }
+            }
             unknown => JsonRpcResponse::err(
                 id,
                 METHOD_NOT_FOUND,

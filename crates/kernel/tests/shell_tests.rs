@@ -657,7 +657,7 @@ fn a_half_hub_opens_through_its_wedge_faces_as_a_cutaway() {
 }
 
 #[test]
-fn a_quarter_tapered_post_shells_closed_on_the_faceted_tier() {
+fn a_quarter_tapered_post_shells_closed_on_the_numerical_rung() {
     let script = "let s = sketch(on: \"XZ\", label: \"s\", entities: [
     line(start: [0, 0], end: [20, 0]),
     line(start: [20, 0], end: [12, 30]),
@@ -669,9 +669,25 @@ shell(wall: 2, label: \"hollow\");
 ";
     let session = run(script);
     // A wedge face's wall meets the conical core in a hyperbola, outside
-    // the exact engines' vocabulary: the cut is faceted and says so.
-    assert_eq!(rung_of(&session, "hollow"), "shell/faceted");
+    // the exact engines' vocabulary: the numerical intersection rung (ADR
+    // 0056 Track B) traces it, and the cut says it is an approximation.
+    // This took the faceted tier before.
+    assert_eq!(rung_of(&session, "hollow"), "shell/numerical");
     assert_eq!(session.report().tier, Tier::Approximate);
+    let step = session
+        .report()
+        .steps
+        .iter()
+        .find(|step| step.label == "hollow")
+        .expect("the shell is a step")
+        .clone();
+    assert!(
+        step.warnings
+            .iter()
+            .any(|warning| warning.code == "BOOLEAN_INTERSECTION_APPROXIMATED"),
+        "{:?}",
+        step.warnings
+    );
     let (wall, slope): (f64, f64) = (2.0, 8.0 / 30.0);
     let inset = wall * (1.0 + slope * slope).sqrt();
     let steps = 2000;

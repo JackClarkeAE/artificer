@@ -229,7 +229,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "artificer-api-server"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-kernel",
  "artificer-protocol",
@@ -238,8 +238,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "artificer-cam"
+version = "0.99.82"
+dependencies = [
+ "artificer-kernel",
+ "artificer-model",
+ "artificer-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "artificer-catalog"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "serde",
  "serde_json",
@@ -249,14 +260,14 @@ dependencies = [
 
 [[package]]
 name = "artificer-cli"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-testkit",
 ]
 
 [[package]]
 name = "artificer-compute"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "rayon",
  "thiserror 2.0.19",
@@ -264,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "artificer-compute-bench"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-compute",
  "artificer-kernel",
@@ -274,15 +285,16 @@ dependencies = [
 
 [[package]]
 name = "artificer-geometry"
-version = "0.99.81"
+version = "0.99.82"
 
 [[package]]
 name = "artificer-kernel"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-compute",
  "artificer-geometry",
  "artificer-protocol",
+ "artificer-step",
  "criterion",
  "serde",
  "serde_json",
@@ -292,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "artificer-model"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-protocol",
  "artificer-sketch",
@@ -304,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "artificer-protocol"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "serde",
  "serde_json",
@@ -312,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "artificer-script-studio"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-kernel",
  "artificer-protocol",
@@ -326,8 +338,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "artificer-sim"
+version = "0.99.82"
+dependencies = [
+ "artificer-kernel",
+ "artificer-protocol",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "artificer-sketch"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-compute",
  "artificer-geometry",
@@ -341,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "artificer-sketch-ui"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-geometry",
  "artificer-protocol",
@@ -355,14 +377,18 @@ dependencies = [
 
 [[package]]
 name = "artificer-spacemouse"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "hidapi",
 ]
 
 [[package]]
+name = "artificer-step"
+version = "0.99.82"
+
+[[package]]
 name = "artificer-testkit"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-kernel",
  "artificer-protocol",
@@ -373,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "artificer-ui-core"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-protocol",
  "egui",
@@ -383,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "artificer-viewport"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
  "artificer-compute",
  "artificer-geometry",
@@ -402,14 +428,16 @@ dependencies = [
 
 [[package]]
 name = "artificer-workbench"
-version = "0.99.81"
+version = "0.99.82"
 dependencies = [
+ "artificer-cam",
  "artificer-catalog",
  "artificer-compute",
  "artificer-geometry",
  "artificer-kernel",
  "artificer-model",
  "artificer-protocol",
+ "artificer-sim",
  "artificer-sketch",
  "artificer-sketch-ui",
  "artificer-spacemouse",

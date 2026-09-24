@@ -23,8 +23,15 @@ pub const MAX_EXTRUSION_PROFILE_VERTICES: usize = 256;
 /// request may ask the native kernel to perform. They are intentionally
 /// independent of display tessellation: every entry is an exact profile curve.
 pub const MAX_PLANAR_PROFILE_REGIONS: usize = 32;
-pub const MAX_PLANAR_PROFILE_LOOPS: usize = 128;
-pub const MAX_PLANAR_PROFILE_CURVES: usize = 1_024;
+// Raised for Track R (ADR 0056): the profile Boolean's crossing pass is now
+// sub-quadratic (a segment grid, `profile_boolean`), so a profile of many
+// thousands of curves imprints in near-linear time rather than O(curves²),
+// and the wire ceilings that once guarded that cost can be an order of
+// magnitude higher. The custom deserialisation visitors below read these
+// constants, so the new ceilings bound an untrusted payload exactly as the
+// old ones did.
+pub const MAX_PLANAR_PROFILE_LOOPS: usize = 1_024;
+pub const MAX_PLANAR_PROFILE_CURVES: usize = 16_384;
 
 /// Wire-format ceiling for the sections of one loft.
 ///
@@ -1757,6 +1764,87 @@ pub enum KernelCommand {
         #[serde(default)]
         standing_apart: bool,
     },
+    /// A sheet body (ADR 0056, Track S): the walls an open or closed chain
+    /// of lines and arcs sweeps along the frame's normal, with no caps. A
+    /// straight piece sweeps a plane and an arc a cylinder, exactly as an
+    /// extrusion's walls are. The sheet faces to the right of the chain as
+    /// drawn, seen from the side the frame faces, so a counter-clockwise
+    /// closed chain faces outward. Built from the empty snapshot.
+    SurfaceExtrude {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_curves::deserialize")]
+        chain: Vec<PlanarCurve2>,
+        #[serde(with = "finite_f64")]
+        distance: f64,
+    },
+    /// A sheet body: the bands an open or closed chain of lines and arcs
+    /// sweeps about an axis in its own frame (ADR 0056, Track S), with no
+    /// wedge faces closing a partial turn. A straight piece sweeps a
+    /// cylinder, a cone or a planar annulus and an arc a torus or a sphere,
+    /// exactly as a revolve's bands are. Built from the empty snapshot.
+    SurfaceRevolve {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_curves::deserialize")]
+        chain: Vec<PlanarCurve2>,
+        axis: PlanarAxis2,
+        angle: RevolveAngle,
+    },
+    /// A sheet body of one planar face per region of a certified profile,
+    /// holes included, facing the way the frame does (ADR 0056, Track S).
+    /// Built from the empty snapshot.
+    PlanarPatch {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_profile::deserialize")]
+        profile: PlanarProfile2,
+    },
+    /// Thickens the sheet body of the input snapshot into a solid: every
+    /// face offset by `thickness` along the sheet's normal (against it when
+    /// negative), with side walls between the two boundaries (ADR 0056,
+    /// S4). Faces that are planes, cylinders, cones, spheres or tori offset
+    /// exactly; a ruled or B-spline face offsets by its sampled normals and
+    /// the result is labelled approximate.
+    ThickenSheet {
+        #[serde(with = "finite_f64")]
+        thickness: f64,
+    },
+    /// Trims the sheet body of the input snapshot by a plane, keeping the
+    /// side the normal faces (ADR 0056, S2). The plane's section curves are
+    /// imprinted on every face and the faces split along them.
+    TrimSheetByPlane {
+        plane_origin: Point3,
+        plane_normal: Vector3,
+    },
+    /// Reads a STEP (ISO 10303-21) file's first product into a new body
+    /// (ADR 0056, Track I).
+    ///
+    /// `MANIFOLD_SOLID_BREP`, `BREP_WITH_VOIDS`, `FACETED_BREP` and a
+    /// `SHELL_BASED_SURFACE_MODEL` whose shells close are read exactly
+    /// where their surfaces and curves are in the kernel's vocabulary —
+    /// planes, cylinders, cones, spheres, ring tori, non-rational B-spline
+    /// surfaces bounded by their iso-lines; lines, circles, ellipses and
+    /// B-spline curves — and conformed to the kernel's conventions. A file
+    /// with a face the kernel cannot read opens as a reference mesh on the
+    /// faceted tier, with every refusal named beside it; a rational spline
+    /// whose weights differ is refused by name. Runs from the empty
+    /// snapshot only.
+    ImportStep {
+        /// The file's text.
+        text: String,
+    },
+}
+
+/// Several sheet snapshots to stitch into one body (ADR 0056, S3): every
+/// boundary edge that pairs with another within the precision policy's
+/// linear agreement, scaled to the bodies, is welded, and a set that
+/// closes becomes a solid. A boundary edge that lines up with another but
+/// falls outside that agreement is a gap, refused by name with the gap
+/// measured: nothing is moved to close it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StitchRequest {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: RequestId,
+    pub expected_snapshots: Vec<SnapshotId>,
+    pub precision: PrecisionPolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2050,6 +2138,10 @@ pub enum ValidationProfile {
     Topology,
     ClosedShell,
     Solid,
+    /// A sheet body (ADR 0056, Track S): shells and no solid. Every edge
+    /// is used once or twice, an edge used once being a boundary edge; the
+    /// closed-shell and solid families are not applied.
+    Sheet,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2113,17 +2205,22 @@ impl Tier {
 
 impl OperationReport {
     /// Exact unless the faceted tier reported its approximation warning,
-    /// which every approximate rung attaches.
+    /// which every approximate rung attaches, or a surface was offset by
+    /// approximation (`SURFACE_OFFSET_APPROXIMATION`, ADR 0056), or a
+    /// `*_APPROXIMATED` warning says a reading or an intersection was
+    /// approximated (a rational spline read as non-rational within its
+    /// tolerance; the numerical intersection rung, ADR 0056).
     #[must_use]
     pub fn tier(&self) -> Tier {
-        let approximate = self
-            .warnings
-            .iter()
-            .any(|warning| warning.code.as_str().ends_with("_FACETED_APPROXIMATION"))
-            || self
-                .rung
-                .as_deref()
-                .is_some_and(|rung| rung.ends_with("/faceted"));
+        let approximate = self.warnings.iter().any(|warning| {
+            let code = warning.code.as_str();
+            code.ends_with("_FACETED_APPROXIMATION")
+                || code.ends_with("_OFFSET_APPROXIMATION")
+                || code.ends_with("_APPROXIMATED")
+        }) || self
+            .rung
+            .as_deref()
+            .is_some_and(|rung| rung.ends_with("/faceted") || rung.ends_with("/approximate"));
         if approximate {
             Tier::Approximate
         } else {

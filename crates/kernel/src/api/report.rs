@@ -234,7 +234,8 @@ pub struct BodyReport {
     /// Faces by carrier kind. A faceted-tier body is all planes.
     pub surfaces: SurfaceCounts,
     pub tier: Tier,
-    /// How many steps so far fell to the faceted tier.
+    /// How many steps so far were approximate: fell to the faceted tier or
+    /// were built by the numerical intersection rung.
     pub approximate_feature_count: u64,
     pub faces: Vec<FaceRecord>,
     pub edges: Vec<EdgeRecord>,
@@ -310,7 +311,9 @@ impl Session {
             .count() as u64;
         let elapsed_ms = steps.iter().map(|step| step.elapsed_ms).sum();
         let names = self.named_entities();
-        let body = (self.snapshot.counts().solids > 0)
+        // A solid, or a sheet body (ADR 0056, Track S), which has faces
+        // and an area to report and no volume.
+        let body = (self.snapshot.counts().shells > 0)
             .then(|| self.body_report(tier, approximate_feature_count, &names));
         SessionReport {
             schema_version: REPORT_SCHEMA_VERSION,

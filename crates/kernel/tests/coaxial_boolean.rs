@@ -157,8 +157,10 @@ fn a_bore_through_a_tapered_post_leaves_a_conical_tube() {
 
 #[test]
 fn a_revolve_about_another_axis_is_not_coaxial() {
-    // A cone turned about an axis beside the shaft's still combines, on the
-    // faceted tier, which labels it.
+    // A cone turned about an axis beside the shaft's still combines: its
+    // cone meets the shaft's cylinder off both axes, which the numerical
+    // intersection rung traces and labels (ADR 0056 Track B; the faceted
+    // tier answered before).
     let off_axis = "let cone_section = sketch(on: \"XZ\", label: \"cone_section\", entities: [
     line(start: [20, 10], end: [26, 10]),
     line(start: [26, 10], end: [20, 18]),
@@ -168,6 +170,8 @@ revolve(sketch: cone_section, axis: [0, 0, 1], axis_origin: [20, 0, 0], operatio
 ";
     let session = run(&format!("{}{off_axis}", shaft(22.0, 20.0)));
     assert_ne!(rung_of(&session, "cone"), "revolve/boolean-coaxial");
+    assert_eq!(rung_of(&session, "cone"), "revolve/boolean-numerical");
+    assert_eq!(session.report().tier, Tier::Approximate);
 }
 
 #[test]

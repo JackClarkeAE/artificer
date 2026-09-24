@@ -69,7 +69,7 @@ are stable, slash-separated paths:
 | `revolve/partial-turn` | A section turned through less than a full turn (ADR 0055 R3): its curved faces are split halfway round the turn, and two planar wedge faces, the section and its turned copy, close it. |
 | `revolve/boolean-prism`, `revolve/boolean-analytic` | A revolve added to or cut from the body exactly (ADR 0055): its faces came out planes and coaxial cylinders. |
 | `revolve/boolean-coaxial`, `sweep/boolean-coaxial`, `loft/boolean-coaxial`, `face-feature/coaxial-section`, `boolean/coaxial` | A body of revolution added to, cut from or combined with a body turned about the same axis: the Boolean of the two `(r, z)` sections, turned again (ADR 0026 F4). Exact for every carrier the section builder makes, cones, spheres and tori included. |
-| `revolve/faceted` | A revolve added to or cut from the body on the faceted tier, because it has a cone, torus or sphere face the exact engines do not carry and it does not turn about the body's own axis. Carries `REVOLVE_FACETED_APPROXIMATION` and the reason, `REVOLVE_EXACT_ROUTE_DECLINED`. |
+| `revolve/faceted` | A revolve added to or cut from the body on the faceted tier, because a pair of faces it brings together is outside ADR 0025's matrix and the numerical intersection rung could not trace it either, or the operands meet in a contact the exact engine does not classify. Carries `REVOLVE_FACETED_APPROXIMATION` and the reason, `REVOLVE_EXACT_ROUTE_DECLINED`. |
 | `sweep/straight` | A profile swept along a straight path (ADR 0055): lofted to its copy at the far end, with planes, cylinders and ruled walls. Exact. |
 | `sweep/revolve` | A profile swept along one circular arc about an axis in its own plane, turned with the path: a partial revolve. Exact. |
 | `sweep/skinned` | A profile swept along any other path: skinned through copies of it along the path, graded in wherever the skin strays. Carries `SWEEP_APPROXIMATION_TOLERANCE`, measuring the worst departure from the true sweep against the approximation budget. |
@@ -84,20 +84,37 @@ are stable, slash-separated paths:
 | `face-feature/faceted` | A cut the exact rungs could not own, built on the faceted tier; also every add or cut whose profile has a spline, whose B-spline walls the exact engines do not carry (ADR 0050). |
 | `drill/exact-prism`, `rib/exact-prism`, `push-pull/planar` | The kernel's own drill, rib and push/pull. |
 | `edge-finish/analytic`, `edge-finish/prism`, `edge-finish/rim-blend`, `edge-finish/rim-loop-blend`, `edge-finish/logical-successor` | Exact fillets and chamfers, by the rung that carried them. |
+| `edge-finish/concave-rim-blend` | A fillet or chamfer along a concave rim — a boss on its plate, a counterbore's or pocket's floor rim (ADR 0056, F2): a torus or cone band built in place on the air side of the corner, with its material added. Exact, by Pappus. |
+| `edge-finish/concave-fill` | A concave straight edge between flat faces on a body no prism rung owns, filled by unioning its own corner region into the body (ADR 0056, F2); the material added is certified against the closed form. Convex edges in the same selection are finished on the filled body afterwards, bounded against the fill where they meet it (F3). Exact. |
 | `edge-finish/faceted` | A fillet or chamfer on the faceted tier. |
-| `boolean/prism`, `boolean/analytic` | A union, difference or intersection by the prism reduction or the general engine. |
+| `variable-radius/faceted` | A fillet whose radius changes linearly along a convex straight edge (ADR 0056, F5, first slice), reached through `NativeKernel::finish_edge_variable_radius`: the band is carried as flat facets lofted between the two end sections and cut exactly, so the approximation is the tool's alone. Carries `EDGE_FINISH_VARIABLE_RADIUS_FACETED_APPROXIMATION` with the measured deviation; the volume removed is certified against the cone's closed form. |
+| `boolean/prism`, `boolean/analytic` | A union, difference or intersection by the prism reduction or the general engine. Since ADR 0056 B1 the general engine sews cones, spheres and tori too, exactly, wherever every pair of faces that meet is in ADR 0025's matrix. |
+| `boolean/numerical`, `face-feature/numerical-boolean`, `revolve/boolean-numerical`, `sweep/boolean-numerical`, `loft/boolean-numerical`, `shell/numerical` | The numerical intersection rung (ADR 0056 B2–B4): the same general engine, with every pair of analytic faces the matrix refuses traced by marching and fitted as a B-spline, on the body and in each face's parameter space, before the section is closed and sewn as an exact one is. The step carries `BOOLEAN_INTERSECTION_APPROXIMATED` with the largest departure it measured between the fitted curves and the true surfaces against the tolerance it holds them to, and the reason the exact route stood aside. A pair the rung cannot trace within tolerance refuses by name, `BOOLEAN_INTERSECTION_UNRESOLVED`, or falls to the faceted tier where one exists. |
 | `mirror/exact` | A mirror: every carrier reflected as itself, faces reversed to face outward. |
 | `pattern/replay` | A feature pattern; the instance steps `<label>/<n>` under it carry the rungs that built each instance. |
 | `pattern/exact-instances`, `pattern/boolean` | A whole-body pattern: copies that clear one another placed as solids of one body, or copies that overlap joined through the Boolean ladder. |
 | `shell/open-prism`, `shell/closed-prism` | A shell of a prism: the open face's inward offset cut as a pocket, or a core one wall in from every face enclosed as a void. |
 | `shell/open-revolve`, `shell/closed-revolve` | A shell of a solid of revolution, offset in its own section; a partial turn's core also loses a prism along the axis that keeps one wall along each closed wedge face. |
-| `shell/faceted` | A shell whose pocket, or whose partial turn's core, the exact rungs could not cut; a partial cone's wedge wall meets its conical core in a hyperbola. A cut core carries `SHELL_FACETED_APPROXIMATION` and the reason, `SHELL_EXACT_ROUTE_DECLINED`. |
+| `shell/faceted` | A shell whose pocket, or whose partial turn's core, neither the exact rungs nor the numerical intersection rung could cut. A cut core carries `SHELL_FACETED_APPROXIMATION` and the reason, `SHELL_EXACT_ROUTE_DECLINED`. |
 | `transform/similarity` | A rigid transform. |
+| `surface/extrude`, `surface/revolve`, `surface/patch` | A sheet body (ADR 0056, Track S): the walls a chain sweeps along a normal, the bands it sweeps about an axis, or a profile's planar face, each on the carriers the solid builders write and with no caps. |
+| `stitch/sheet`, `stitch/solid` | Sheets welded along their boundaries within the model's agreement: a sheet while any boundary edge is left, a solid once every one pairs. |
+| `thicken/exact` | A sheet made into a solid between it and its offset: planes, cylinders, cones, spheres and tori offset as carriers of the same class, with planar, cylindrical and conical walls along the boundary. |
+| `thicken/approximate` | A sheet with a B-spline face thickened: the face's offset is the B-spline surface through the true offset sampled at the Greville abscissae of the face's refined net, not the exact offset. Carries `SURFACE_OFFSET_APPROXIMATION` with the measured deviation against the approximation budget. |
+| `trim/plane` | A sheet cut by a plane: the section imprinted on every face in its own parameter space and the faces split by the exact profile Boolean. |
 
-A rung ending in `/faceted` is the approximate tier; the step also carries
-a `*_FACETED_APPROXIMATION` warning. Everything else is exact: the body's
-faces are analytic carriers, its volume is a closed-form integral, and its
-digest is a function of that geometry alone.
+A rung ending in `/faceted` or `/approximate` is the approximate tier;
+the step also carries a `*_FACETED_APPROXIMATION` or
+`*_OFFSET_APPROXIMATION` warning. A rung with `numerical` in it is the
+approximate tier too, on a different footing: the body keeps its analytic
+carriers and its volume is still integrated exactly over the faces it has,
+but the curves where two of them meet are B-splines fitted to a traced
+intersection, and the step's `BOOLEAN_INTERSECTION_APPROXIMATED` warning
+states how far they were measured to depart from the true surfaces. A
+warning code ending in `_APPROXIMATED` marks a step approximate exactly as
+`_FACETED_APPROXIMATION` does. Everything else is exact: the body's faces
+are analytic carriers, its volume is a closed-form integral, and its digest
+is a function of that geometry alone.
 
 ### Face and edge descriptions
 
@@ -351,6 +368,96 @@ surface vocabulary rather than of the offset. `SHELL_OPEN_REVOLVE_UNSUPPORTED`
 says the wall at an open cap could not be taken away, because that case
 alone rests on the Boolean engine's analytic domain; it carries the
 engine's own diagnostic underneath, and the same body shells closed.
+
+### Sheet bodies
+
+A sheet body (ADR 0056, Track S) is a topology with shells and no solid:
+faces on exact carriers, edges shared where faces meet, and a boundary of
+edges used once. `surface_extrude` (of lines, arcs and splines),
+`surface_revolve` (of lines and arcs) and `patch` build
+one; `stitch` welds several; `thicken` makes one a solid; `trim` cuts one
+by a plane (`surface_extrude`, `surface_revolve`, `planar_patch`,
+`thicken_sheet` and `trim_sheet_by_plane` on the kernel wire, and
+`NativeKernel::stitch_sheets`, which takes several snapshots as a Boolean
+takes two).
+
+A sheet validates under the `sheet` profile: every family the solid
+validator runs, with an edge used once admitted as a boundary edge and
+the closed-shell and solid families — the Euler characteristic and the
+positive volume — set aside, since an open shell satisfies neither. Held
+to the `solid` profile the same body fails, on its boundary edges. Its
+measures are its area, summed from the faces' closed forms, and no
+volume; its digest is the topology's as for a solid. Every boundary edge
+is reported under the role `boundary_edge[n]`, in edge order, and the
+viewport draws an edge with one face as a hard edge. STEP export writes a
+sheet as `OPEN_SHELL`s under a `SHELL_BASED_SURFACE_MODEL` in a
+`MANIFOLD_SURFACE_SHAPE_REPRESENTATION`, every face, edge and vertex
+exactly as a solid's; a file with solids and sheets takes the general
+`SHAPE_REPRESENTATION`.
+
+The tests in `crates/kernel/tests/surface_frontier.rs` hold each
+operation to a closed form: a cylinder sheet of radius `r` and height `h`
+has area `2πrh`; a line from `(r₀, z₀)` to `(r₁, z₁)` revolved is a cone
+sheet of area `π(r₀ + r₁)·slant`; six planar patches stitch into a cube
+of volume `1000` that validates as a solid with eight vertices, twelve
+edges and six faces; a cylinder sheet thickened by `t` outward is a tube
+of volume `π((r + t)² − r²)h`, inward `π(r² − (r − t)²)h`; a sphere sheet
+thickened is a hollow ball of volume `4/3·π((R + t)³ − R³)` with two
+shells; a cone sheet thickened is the section between the line and its
+offset turned, by Pappus; a cylinder sheet trimmed by a plane square to
+its axis at `z = c` keeps `2πr(h − c)`, and by the plane `x + z = 10`
+through its middle keeps half its area, since the kept height
+`10 + 10·cos θ` averages the half height; a sphere sheet trimmed at
+`z = c` keeps Archimedes' zone `2πR(R − c)`; a square patch trimmed by
+`x + y ≥ 10` keeps the triangle of area `50`; the quadratic Bézier arch
+from `(0, 0)` over `(5, 10)` to `(10, 0)` extruded `20` is a B-spline sheet
+of area `20·(5√5 + 5/2·asinh 2)`, its length in closed form.
+
+A B-spline face has no exact offset, and `thicken` says so rather than
+pretend. It offsets the face by the B-spline surface on the face's own
+basis that interpolates the true offset — the surface moved along its
+unit normal — at the Greville abscissae of its net, rows along `u` then
+columns along `v`, each a banded solve; on a net refined by halving its
+knot spans in the direction the normal turns more across a span, until
+the offset lies within the approximation budget of the true offset or
+the net has grown to the most this release allows. The deviation is
+measured on a grid over every span cell and reported: the step takes the
+rung `thicken/approximate`, the tier is approximate, and the
+`SURFACE_OFFSET_APPROXIMATION` warning carries the deviation as its
+measurement against the budget. The face is carried on the refined net
+from then on and its spline edges become the net's own rows, the same
+curves on the same knots, so every edge is the curve its faces hold along
+it to the bit, as the validator asks of a spline (ADR 0050); the edges
+offset to the offset's own rows, and the walls along them are the
+B-spline surfaces ruled between each edge and its offset. The test holds the arch thickened by `d = 1` to the band area
+`d·L ± d²·θ/2` (`θ = 2·atan 2` the arch's turning, minus toward the
+centre of curvature) times the height, within twice the reported
+deviation times the sheet's area, which is what a deviation of that size
+can move the volume by; and holds the two thickenings, toward and away,
+to `2·d·L·h` together.
+
+Refusals are by name and measured where there is a measure. A stitch
+whose boundary edges line up — the same length within a twentieth, ends
+within a tenth of that length — but do not meet within the model's
+agreement is `STITCH_GAP_EXCEEDS_TOLERANCE`, with the gap as the
+diagnostic's measurement against the agreement it had to meet; the cube
+with its top lifted by `0.01` refuses with a gap of `0.01`. Nothing is
+moved to close a gap: the agreement is what the validator holds every
+edge and pcurve to, and a wider weld would only publish a body it
+refuses. Sheets that cannot be turned to agree on a side are
+`STITCH_ORIENTATION_CONFLICT`. `thicken` refuses a ruled face
+(`THICKEN_FACE_UNSUPPORTED`), faces meeting at a crease, whose offsets
+part (`THICKEN_CREASE_UNSUPPORTED`), a thickness that collapses a curved
+face (`THICKEN_OFFSET_DEGENERATE`) and a boundary edge whose wall would
+be a surface it does not build (`THICKEN_EDGE_UNSUPPORTED`). `trim`
+imprints a plane on a plane or a cylinder at any attitude and on a cone,
+a sphere or a torus square to the axis or through it; an oblique section
+of those three is a curve the kernel has no exact name for and is
+`TRIM_SECTION_UNSUPPORTED`; a section that grazes a face's boundary
+within the minimum feature size is `TRIM_SECTION_INDETERMINATE`; a cut
+that leaves nothing is `TRIM_RESULT_EMPTY`. A solid operation given a
+sheet is `SHEET_UNSUPPORTED_HERE`, never a panic; a sheet operation given
+a solid is `SHEET_INPUT_REQUIRED`.
 
 ## 8. Interference studies
 

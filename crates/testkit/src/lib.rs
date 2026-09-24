@@ -591,6 +591,12 @@ pub fn validate_case(case: &KernelCase) -> Result<(), TestkitError> {
             KernelCommand::ShellSnapshot { .. } => "native.shell_snapshot.v0",
             KernelCommand::FinishEdge { .. } => "native.finish_edge.v0",
             KernelCommand::FinishEdges { .. } => "native.finish_edges.v0",
+            KernelCommand::SurfaceExtrude { .. } => "native.surface_extrude.v0",
+            KernelCommand::SurfaceRevolve { .. } => "native.surface_revolve.v0",
+            KernelCommand::PlanarPatch { .. } => "native.planar_patch.v0",
+            KernelCommand::ThickenSheet { .. } => "native.thicken_sheet.v0",
+            KernelCommand::TrimSheetByPlane { .. } => "native.trim_sheet_by_plane.v0",
+            KernelCommand::ImportStep { .. } => "native.import_step.v0",
         };
         if !case
             .required_capabilities

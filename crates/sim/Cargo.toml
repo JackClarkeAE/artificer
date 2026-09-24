@@ -1,0 +1,15 @@
+[package]
+name = "artificer-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artificer-kernel = { path = "../kernel" }
+artificer-protocol = { path = "../protocol" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

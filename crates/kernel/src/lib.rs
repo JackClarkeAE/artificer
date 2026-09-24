@@ -4,11 +4,15 @@
 //! diagnostic display geometry. It intentionally has no foreign geometry,
 //! UI, renderer, or backend-abstraction dependency.
 
+mod agreement;
 mod analytic_extrusion;
 pub mod api;
 pub mod brep;
 mod bspline;
+mod cam_queries;
 mod coaxial_boolean;
+mod concave_edge_fill;
+mod concave_rim_blend;
 mod corner_blend;
 mod cuboid;
 mod cylinder_trace;
@@ -18,6 +22,7 @@ mod edge_finish_apart;
 mod exact_face_feature;
 mod extrusion;
 mod face_feature;
+mod face_index;
 mod faceted_boolean;
 // The certified loop offset is the geometric core of rim-loop blends
 // (ADR 0023 frontier, milestone B). It is complete and unit-tested; the band,
@@ -31,24 +36,40 @@ mod loft_skin;
 mod loop_offset;
 mod mirror;
 mod pattern;
+#[doc(hidden)]
+pub mod perf;
 mod planar_profile;
 mod prism_boolean;
 mod prism_edge_finish;
 mod profile_boolean;
 mod push_pull;
 mod revolve;
+mod revolved;
+mod revolved_measures;
 mod rim_loop_blend;
 mod ruled;
+mod section_cells;
 mod section_revolve;
 mod sew;
+mod sheet;
+mod sheet_build;
+mod sheet_sew;
+mod sheet_stitch;
+mod sheet_thicken;
+mod sheet_trim;
 mod shell;
+mod sim_queries;
 mod spline_profile;
 mod step_export;
+mod step_import;
 mod surface_intersection;
+mod surface_marching;
 mod sweep_profile;
 mod topology;
 mod transform;
+mod trimmed_tessellation;
 mod validator;
+mod variable_radius_fillet;
 mod vertex_blend;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -90,10 +111,12 @@ use crate::topology::{
 };
 use crate::transform::{Similarity, TransformInputError, transform_topology};
 
+pub use crate::cam_queries::{CamQueryError, PrismProfile, TurnedSection};
 pub use crate::describe::{
     EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, RailGeometry, RailKind,
     SurfaceCounts,
 };
+pub use crate::sim_queries::{MAX_VOXELS, SurfaceCell, VoxelGrid};
 pub use crate::step_export::{StepBody, StepPlacement};
 pub use crate::topology::FaceRole;
 
@@ -794,6 +817,26 @@ impl NativeKernel {
         Self
     }
 
+    /// A fillet whose radius runs linearly from `radii[0]` at the edge's
+    /// first vertex to `radii[1]` at its second, on a convex straight edge
+    /// between two flat faces (ADR 0056, F5, first slice).
+    ///
+    /// The result is an approximation and is labelled as one: the band is
+    /// carried as flat facets, the report's rung is `variable-radius/faceted`
+    /// and its warnings carry `EDGE_FINISH_VARIABLE_RADIUS_FACETED_APPROXIMATION`
+    /// with the measured deviation from the true cone. The volume removed is
+    /// certified against the cone's closed form, and an edge this route
+    /// cannot carry — concave, curved, or running on into material at an
+    /// end — is refused by name.
+    pub fn finish_edge_variable_radius(
+        input: &Snapshot,
+        target: EntityRef,
+        radii: [f64; 2],
+        precision: PrecisionPolicy,
+    ) -> Result<ExecutionOutcome, KernelError> {
+        variable_radius_fillet::finish(input, target, radii, precision)
+    }
+
     /// Returns the stable initial snapshot. Its precision policy is bound by
     /// the first successful operation.
     #[must_use]
@@ -867,6 +910,70 @@ impl NativeKernel {
                     "The request precision policy differs from the input snapshot policy.",
                 )],
             ));
+        }
+
+        // A sheet body (ADR 0056, Track S) is edited by the sheet commands
+        // and carried by the whole-snapshot ones; everything else reads a
+        // solid and refuses a sheet by name rather than its first solid.
+        if sheet::is_sheet(&input.topology) && !sheet::command_accepts_sheet(&request.command) {
+            return Err(sheet::unsupported_here(input.id, "This operation"));
+        }
+        match &request.command {
+            KernelCommand::SurfaceExtrude {
+                frame,
+                chain,
+                distance,
+            } => {
+                return sheet_build::execute_surface_extrude(
+                    input,
+                    request,
+                    cancellation,
+                    *frame,
+                    chain,
+                    *distance,
+                );
+            }
+            KernelCommand::SurfaceRevolve {
+                frame,
+                chain,
+                axis,
+                angle,
+            } => {
+                return sheet_build::execute_surface_revolve(
+                    input,
+                    request,
+                    cancellation,
+                    *frame,
+                    chain,
+                    *axis,
+                    *angle,
+                );
+            }
+            KernelCommand::PlanarPatch { frame, profile } => {
+                return sheet_build::execute_planar_patch(
+                    input,
+                    request,
+                    cancellation,
+                    *frame,
+                    profile,
+                );
+            }
+            KernelCommand::ThickenSheet { thickness } => {
+                return sheet_thicken::execute_thicken(input, request, cancellation, *thickness);
+            }
+            KernelCommand::TrimSheetByPlane {
+                plane_origin,
+                plane_normal,
+            } => {
+                return sheet_trim::execute_trim(
+                    input,
+                    request,
+                    cancellation,
+                    *plane_origin,
+                    *plane_normal,
+                );
+            }
+            _ => {}
         }
 
         // Warnings a construction rung wants the caller to see. Most rungs
@@ -978,6 +1085,7 @@ impl NativeKernel {
                             request.precision,
                             &mut warnings,
                             &REVOLVE_BOOLEAN,
+                            cancellation,
                         )?;
                         rung = answered;
                         (topology, HistoryMode::RegularizedFaceFeature)
@@ -1026,6 +1134,7 @@ impl NativeKernel {
                             request.precision,
                             &mut warnings,
                             &SWEEP_BOOLEAN,
+                            cancellation,
                         )?;
                         rung = answered;
                         (topology, HistoryMode::RegularizedFaceFeature)
@@ -1195,6 +1304,7 @@ impl NativeKernel {
                             *operation == LoftOperation::Add,
                             request.precision,
                             &mut warnings,
+                            cancellation,
                         )?;
                         rung = answered;
                         (topology, HistoryMode::RegularizedFaceFeature)
@@ -1256,6 +1366,7 @@ impl NativeKernel {
                     *operation,
                     request.precision,
                     &mut warnings,
+                    cancellation,
                 )?;
                 rung = answered;
                 (topology, HistoryMode::RegularizedFaceFeature)
@@ -1378,14 +1489,44 @@ impl NativeKernel {
                                 request.precision,
                             )
                             .map_err(ExactRouteDecline::from_engine)
-                            .and_then(|topology| exact_candidate(topology, request.precision)),
+                            .and_then(|topology| exact_candidate(topology, request.precision))
+                            .map(|topology| (topology, None))
+                            // Then the numerical intersection rung (ADR
+                            // 0056 B2), which keeps the exact route's reason
+                            // beside its approximation, and when it cannot
+                            // answer either.
+                            .or_else(|decline| {
+                                numerical_rung(
+                                    &input.topology,
+                                    tool,
+                                    BooleanOperation::Difference,
+                                    request.precision,
+                                )
+                                .map(|(topology, approximation)| {
+                                    (topology, approximation.map(|found| (found, decline)))
+                                })
+                                .map_err(|_| decline)
+                            }),
                         };
                         match exact {
-                            Ok(topology) => {
+                            Ok((topology, approximation)) => {
                                 // The faces are the engine's own records,
                                 // matched back to history the way every
                                 // regularized Boolean's are.
-                                rung = "face-feature/analytic-boolean";
+                                rung = match approximation {
+                                    Some((approximation, decline)) => {
+                                        // The reason the exact route stood
+                                        // aside is the first thing said,
+                                        // then the approximation it made
+                                        // necessary.
+                                        warnings
+                                            .push(decline.diagnostic(DiagnosticSeverity::Warning));
+                                        warnings
+                                            .push(numerical_intersection_warning(approximation));
+                                        "face-feature/numerical-boolean"
+                                    }
+                                    None => "face-feature/analytic-boolean",
+                                };
                                 (topology, None, true)
                             }
                             Err(decline) => {
@@ -1525,7 +1666,13 @@ impl NativeKernel {
                         // would poke out again under any part of the profile
                         // that hangs over the face's edge, and publish that
                         // sliver as material.
-                        let analytic = || -> Result<Topology, ExactRouteDecline> {
+                        let analytic = || -> Result<
+                            (
+                                Topology,
+                                Option<(analytic_boolean::NumericalApproximation, ExactRouteDecline)>,
+                            ),
+                            ExactRouteDecline,
+                        > {
                             let overshoot = match operation {
                                 FaceExtrusionOperation::Cut => {
                                     (*distance * 0.01).max(request.precision.min_feature_size * 8.0)
@@ -1546,14 +1693,32 @@ impl NativeKernel {
                             ) {
                                 return Err(ExactRouteDecline::Vocabulary);
                             }
-                            let topology = analytic_boolean::build_analytic_boolean(
-                                &input.topology,
-                                &tool,
-                                boolean_operation,
-                                request.precision,
-                            )
-                            .map_err(ExactRouteDecline::from_engine)
-                            .and_then(|topology| exact_candidate(topology, request.precision))?;
+                            let (topology, approximation) =
+                                analytic_boolean::build_analytic_boolean(
+                                    &input.topology,
+                                    &tool,
+                                    boolean_operation,
+                                    request.precision,
+                                )
+                                .map_err(ExactRouteDecline::from_engine)
+                                .and_then(|topology| exact_candidate(topology, request.precision))
+                                .map(|topology| (topology, None))
+                                // Then the numerical intersection rung (ADR
+                                // 0056 B2), keeping the exact route's reason
+                                // beside its approximation, and when it
+                                // cannot answer either.
+                                .or_else(|decline| {
+                                    numerical_rung(
+                                        &input.topology,
+                                        &tool,
+                                        boolean_operation,
+                                        request.precision,
+                                    )
+                                    .map(|(topology, approximation)| {
+                                        (topology, approximation.map(|found| (found, decline)))
+                                    })
+                                    .map_err(|_| decline)
+                                })?;
                             // An add whose profile misses the face has no
                             // interface, and the union of two solids that
                             // never meet is two solids, not a boss.
@@ -1562,7 +1727,7 @@ impl NativeKernel {
                             {
                                 return Err(ExactRouteDecline::Empty);
                             }
-                            Ok(topology)
+                            Ok((topology, approximation))
                         };
                         let prism = prism_boolean::build_prism_boolean(
                             &input.topology,
@@ -1581,8 +1746,19 @@ impl NativeKernel {
                                 topology
                             }
                             Err(_) => match analytic() {
-                                Ok(topology) => {
-                                    rung = "face-feature/analytic-boolean";
+                                Ok((topology, approximation)) => {
+                                    rung = match approximation {
+                                        Some((approximation, decline)) => {
+                                            warnings.push(
+                                                decline.diagnostic(DiagnosticSeverity::Warning),
+                                            );
+                                            warnings.push(numerical_intersection_warning(
+                                                approximation,
+                                            ));
+                                            "face-feature/numerical-boolean"
+                                        }
+                                        None => "face-feature/analytic-boolean",
+                                    };
                                     topology
                                 }
                                 Err(decline) if *operation == FaceExtrusionOperation::Cut => {
@@ -1691,16 +1867,18 @@ impl NativeKernel {
                     ));
                 }
                 let profile = circle_profile(*center, *diameter * 0.5);
-                let feature = validate_exact_face_feature(
-                    input.id,
-                    &input.topology,
-                    *target_face,
-                    *frame,
-                    &profile,
-                    *depth,
-                    FaceExtrusionOperation::Cut,
-                    request.precision,
-                )
+                let feature = perf::stage("kernel.drill.exact", input.topology.faces.len(), || {
+                    validate_exact_face_feature(
+                        input.id,
+                        &input.topology,
+                        *target_face,
+                        *frame,
+                        &profile,
+                        *depth,
+                        FaceExtrusionOperation::Cut,
+                        request.precision,
+                    )
+                })
                 .map_err(|reason| planar_profile_input_error(input.id, reason))?;
                 rung = "drill/exact-prism";
                 (feature.topology, HistoryMode::RegularizedFaceFeature)
@@ -1886,8 +2064,8 @@ impl NativeKernel {
                         // against planes and coaxial cylinders the cut is
                         // exact; a cone meets them in a hyperbola, which
                         // takes the faceted tier with its label.
-                        let (core, faceted) = match clip {
-                            None => (core, false),
+                        let (core, answered) = match clip {
+                            None => (core, SHELL_BOOLEAN.rungs[1]),
                             Some(clip) => {
                                 let prism = core_from_empty(KernelCommand::ExtrudePlanarProfile {
                                     frame: clip.frame,
@@ -1901,6 +2079,7 @@ impl NativeKernel {
                                     request.precision,
                                     &mut warnings,
                                     &SHELL_BOOLEAN,
+                                    cancellation,
                                 )?;
                                 let digest = semantic_digest(&topology, request.precision);
                                 (
@@ -1911,10 +2090,16 @@ impl NativeKernel {
                                         topology,
                                         measures: SnapshotMeasures::default(),
                                     },
-                                    answered == SHELL_BOOLEAN.rungs[2],
+                                    answered,
                                 )
                             }
                         };
+                        let faceted = answered == SHELL_BOOLEAN.rungs[2];
+                        // A core cut by the numerical intersection rung (ADR
+                        // 0056 B2) is analytic with traced edges: enclosed
+                        // or taken away as an exact one is, under that
+                        // rung's name and its label in `warnings`.
+                        let numerical = answered == SHELL_BOOLEAN.numerical;
                         if !open {
                             let topology = shell::hollow(&input.topology, &core.topology)
                                 .ok_or_else(|| {
@@ -1926,6 +2111,8 @@ impl NativeKernel {
                                 })?;
                             rung = if faceted {
                                 "shell/faceted"
+                            } else if numerical {
+                                SHELL_BOOLEAN.numerical
                             } else {
                                 "shell/closed-revolve"
                             };
@@ -1973,7 +2160,18 @@ impl NativeKernel {
                                 diagnostics,
                             )
                         })?;
-                            outcome.report.rung = Some("shell/open-revolve".to_owned());
+                            outcome.report.rung = Some(
+                                if numerical {
+                                    SHELL_BOOLEAN.numerical
+                                } else {
+                                    "shell/open-revolve"
+                                }
+                                .to_owned(),
+                            );
+                            // The core's own approximation label, if it
+                            // carries one, travels with the wall it opened.
+                            outcome.report.warnings.append(&mut warnings);
+                            outcome.report.sort_deterministically();
                             return Ok(outcome);
                         }
                     }
@@ -2167,13 +2365,48 @@ impl NativeKernel {
                     (topology, HistoryMode::RegularizedFaceFeature)
                 }
             }
+            KernelCommand::SurfaceExtrude { .. }
+            | KernelCommand::SurfaceRevolve { .. }
+            | KernelCommand::PlanarPatch { .. }
+            | KernelCommand::ThickenSheet { .. }
+            | KernelCommand::TrimSheetByPlane { .. } => {
+                unreachable!("sheet commands are answered before the ladder")
+            }
+            KernelCommand::ImportStep { text } => {
+                validate_extrusion_source(input)?;
+                let imported = step_import::import_step(text, request.precision)
+                    .map_err(|failure| step_import_error(input.id, failure))?;
+                ensure_candidate_within_envelope(input.id, &imported.topology, request.precision)?;
+                warnings.extend(imported.warnings);
+                rung = imported.rung;
+                (
+                    imported.topology,
+                    HistoryMode::Imported {
+                        face_sources: imported.face_sources,
+                        edge_sources: imported.edge_sources,
+                    },
+                )
+            }
         };
 
         check_cancelled(input.id, cancellation, KernelStage::Construction)?;
+        // A sheet carried whole — moved, mirrored, patterned — is still a
+        // sheet, and is held to the sheet profile (ADR 0056, Track S).
+        let carried_sheet = sheet::is_sheet(&input.topology) && sheet::is_sheet(&topology);
         let internal_validation =
-            validator::validate(&topology, request.precision.linear_agreement);
-        let validation =
-            protocol_validation(input.id, ValidationProfile::Solid, &internal_validation);
+            perf::stage("kernel.execute.validate", topology.faces.len(), || {
+                if carried_sheet {
+                    sheet::validate_sheet(&topology, request.precision.linear_agreement)
+                } else {
+                    validator::validate(&topology, request.precision.linear_agreement)
+                }
+            });
+        let profile = if carried_sheet {
+            ValidationProfile::Sheet
+        } else {
+            ValidationProfile::Solid
+        };
+        let validation = protocol_validation(input.id, profile, &internal_validation);
         if !validation.valid {
             return Err(error(
                 KernelErrorCode::ValidationFailed,
@@ -2185,7 +2418,9 @@ impl NativeKernel {
         }
         check_cancelled(input.id, cancellation, KernelStage::Commit)?;
 
-        let semantic_digest = semantic_digest(&topology, request.precision);
+        let semantic_digest = perf::stage("kernel.execute.digest", topology.faces.len(), || {
+            semantic_digest(&topology, request.precision)
+        });
         let output_snapshot = snapshot_id(semantic_digest);
         let measures = public_measures(internal_validation.measures);
         let snapshot = Snapshot {
@@ -2195,35 +2430,48 @@ impl NativeKernel {
             topology,
             measures,
         };
+        let history = perf::stage(
+            "kernel.execute.history",
+            snapshot.topology.faces.len(),
+            || {
+                Ok::<_, KernelError>(match history_mode {
+                    HistoryMode::Generated => generated_history(&snapshot),
+                    HistoryMode::OneToOne => transformed_history(input, &snapshot),
+                    HistoryMode::Extrusion { profile_vertices } => {
+                        extrusion_history(&snapshot, profile_vertices)
+                    }
+                    HistoryMode::FaceFeature {
+                        operation,
+                        target_face,
+                        exit_face,
+                    } => face_feature_history(input, &snapshot, target_face, exit_face, operation)?,
+                    HistoryMode::RegularizedFaceFeature => {
+                        regularized_face_feature_history(input, &snapshot)
+                    }
+                    HistoryMode::FacePushPull { target_face } => {
+                        face_push_pull_history(input, &snapshot, target_face)?
+                    }
+                    HistoryMode::Imported {
+                        face_sources,
+                        edge_sources,
+                    } => imported_history(&snapshot, &face_sources, &edge_sources),
+                })
+            },
+        )?;
         let mut report = OperationReport {
             input_snapshot: input.id,
             output_snapshot,
             semantic_digest,
             topology: snapshot.counts(),
             bounds: measures.bounds,
-            history: match history_mode {
-                HistoryMode::Generated => generated_history(&snapshot),
-                HistoryMode::OneToOne => transformed_history(input, &snapshot),
-                HistoryMode::Extrusion { profile_vertices } => {
-                    extrusion_history(&snapshot, profile_vertices)
-                }
-                HistoryMode::FaceFeature {
-                    operation,
-                    target_face,
-                    exit_face,
-                } => face_feature_history(input, &snapshot, target_face, exit_face, operation)?,
-                HistoryMode::RegularizedFaceFeature => {
-                    regularized_face_feature_history(input, &snapshot)
-                }
-                HistoryMode::FacePushPull { target_face } => {
-                    face_push_pull_history(input, &snapshot, target_face)?
-                }
-            },
+            history,
             validation,
             warnings,
             rung: Some(rung.to_owned()),
         };
-        report.sort_deterministically();
+        perf::stage("kernel.execute.sort_report", report.history.len(), || {
+            report.sort_deterministically();
+        });
         Ok(ExecutionOutcome { snapshot, report })
     }
 
@@ -2279,6 +2527,9 @@ impl NativeKernel {
                     "Target, tool, and request must use the same persisted precision policy.",
                 )],
             ));
+        }
+        if sheet::is_sheet(&target.topology) || sheet::is_sheet(&tool.topology) {
+            return Err(sheet::unsupported_here(target.id, "A Boolean"));
         }
         if target.topology.solids.is_empty() || tool.topology.solids.is_empty() {
             return Err(error(
@@ -2338,8 +2589,10 @@ impl NativeKernel {
 
         // Beyond the prism reductions, the general analytic engine runs the
         // full imprint/classify/regularize/sew pipeline for operands whose
-        // faces it can carry. Everything is exact; nothing tessellates.
+        // faces it can carry. Everything is exact, and nothing tessellates,
+        // until the numerical rung, which says what it approximated.
         let mut rung = "boolean/prism";
+        let mut warnings = Vec::new();
         // Two coaxial bodies of revolution combine in their shared section,
         // exactly, cones, spheres and tori included (ADR 0026 F4).
         let coaxial = match &analytic {
@@ -2367,7 +2620,7 @@ impl NativeKernel {
                 if analytic_boolean::operands_in_engine_vocabulary(&target.topology, &tool.topology)
                 {
                     rung = "boolean/analytic";
-                    match perf_span!(
+                    let exact = perf_span!(
                         "kernel.boolean.analytic",
                         target.topology.faces.len() + tool.topology.faces.len(),
                         {
@@ -2378,9 +2631,57 @@ impl NativeKernel {
                                 request.precision,
                             )
                         }
-                    ) {
-                        Ok(topology) => topology,
-                        Err(analytic_boolean::AnalyticBooleanError::EmptyResult) => {
+                    );
+                    // Past the exact engine, the numerical intersection rung
+                    // (ADR 0056 B2): the same engine with the carrier pairs
+                    // the matrix refuses traced and fitted, labelled with the
+                    // departure it measured.
+                    let numerical = match &exact {
+                        Ok(_) | Err(analytic_boolean::AnalyticBooleanError::EmptyResult) => None,
+                        Err(_) => Some(numerical_rung(
+                            &target.topology,
+                            &tool.topology,
+                            request.operation,
+                            request.precision,
+                        )),
+                    };
+                    match (exact, numerical) {
+                        (_, Some(Ok((topology, approximation)))) => {
+                            if let Some(approximation) = approximation {
+                                rung = "boolean/numerical";
+                                warnings.push(numerical_intersection_warning(approximation));
+                            }
+                            topology
+                        }
+                        // The rung found the faces within reach of one
+                        // another and could not trace or fit their curve, or
+                        // built a body the validator refused: that is the
+                        // reason to give, not the exact engine's.
+                        (
+                            _,
+                            Some(Err(
+                                decline @ (ExactRouteDecline::IntersectionUnresolved
+                                | ExactRouteDecline::Invalid),
+                            )),
+                        ) => {
+                            return Err(error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                target.id,
+                                "the Boolean operands leave the regularized analytic domain",
+                                vec![simple_diagnostic(
+                                    "BOOLEAN_INTERSECTION_UNRESOLVED",
+                                    KernelStage::Construction,
+                                    &format!(
+                                        "The numerical intersection rung could not answer: {}; \
+                                         move the faces apart or change the carriers.",
+                                        decline.sentence()
+                                    ),
+                                )],
+                            ));
+                        }
+                        (Ok(topology), _) => topology,
+                        (Err(analytic_boolean::AnalyticBooleanError::EmptyResult), _) => {
                             return Err(error(
                                 KernelErrorCode::Unsupported,
                                 KernelStage::Construction,
@@ -2393,7 +2694,7 @@ impl NativeKernel {
                                 )],
                             ));
                         }
-                        Err(analytic_boolean::AnalyticBooleanError::CarrierPair(pair)) => {
+                        (Err(analytic_boolean::AnalyticBooleanError::CarrierPair(pair)), _) => {
                             let [first, second] = *pair;
                             // The engine names the pair the two faces actually
                             // bring together, which a scan of every carrier
@@ -2415,7 +2716,7 @@ impl NativeKernel {
                                 )],
                             ));
                         }
-                        Err(analytic_boolean::AnalyticBooleanError::TraceUnclosed) => {
+                        (Err(analytic_boolean::AnalyticBooleanError::TraceUnclosed), _) => {
                             return Err(error(
                                 KernelErrorCode::Unsupported,
                                 KernelStage::Construction,
@@ -2431,7 +2732,26 @@ impl NativeKernel {
                                 )],
                             ));
                         }
-                        Err(analytic_boolean::AnalyticBooleanError::DomainUnsupported) => {
+                        (
+                            Err(analytic_boolean::AnalyticBooleanError::IntersectionUnresolved),
+                            _,
+                        ) => {
+                            return Err(error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                target.id,
+                                "the Boolean operands leave the regularized analytic domain",
+                                vec![simple_diagnostic(
+                                    "BOOLEAN_INTERSECTION_UNRESOLVED",
+                                    KernelStage::Construction,
+                                    "Two faces come within reach of one another on carriers \
+                                     outside the intersection matrix, and the numerical rung \
+                                     could not trace or fit the curve they share within its \
+                                     tolerance; move the faces apart or change the carriers.",
+                                )],
+                            ));
+                        }
+                        (Err(analytic_boolean::AnalyticBooleanError::DomainUnsupported), _) => {
                             // An out-of-matrix carrier pair is a vocabulary
                             // limit and says so; anything else the engine
                             // refuses is a contact outside the transverse
@@ -2516,7 +2836,9 @@ impl NativeKernel {
         };
         check_cancelled(target.id, cancellation, KernelStage::Construction)?;
         let internal_validation =
-            validator::validate(&topology, request.precision.linear_agreement);
+            perf::stage("kernel.boolean.validate", topology.faces.len(), || {
+                validator::validate(&topology, request.precision.linear_agreement)
+            });
         let validation =
             protocol_validation(target.id, ValidationProfile::Solid, &internal_validation);
         if !validation.valid {
@@ -2529,7 +2851,9 @@ impl NativeKernel {
             ));
         }
         check_cancelled(target.id, cancellation, KernelStage::Commit)?;
-        let semantic_digest = semantic_digest(&topology, request.precision);
+        let semantic_digest = perf::stage("kernel.boolean.digest", topology.faces.len(), || {
+            semantic_digest(&topology, request.precision)
+        });
         let output_snapshot = snapshot_id(semantic_digest);
         let measures = public_measures(internal_validation.measures);
         let snapshot = Snapshot {
@@ -2549,7 +2873,7 @@ impl NativeKernel {
             bounds: measures.bounds,
             history,
             validation,
-            warnings: Vec::new(),
+            warnings,
             rung: Some(rung.to_owned()),
         };
         report.sort_deterministically();
@@ -2585,7 +2909,11 @@ impl NativeKernel {
         profile: ValidationProfile,
     ) -> ProtocolValidationReport {
         let tolerance = snapshot.precision.unwrap_or_default().linear_agreement;
-        let report = validator::validate_with_pool(compute, &snapshot.topology, tolerance);
+        let report = if profile == ValidationProfile::Sheet {
+            sheet::validate_sheet(&snapshot.topology, tolerance)
+        } else {
+            validator::validate_with_pool(compute, &snapshot.topology, tolerance)
+        };
         protocol_validation(snapshot.id, profile, &report)
     }
 
@@ -3155,166 +3483,188 @@ impl NativeKernel {
         } else {
             TessellationFallback::Display
         };
-        let triangles = compute.flat_map(
-            "kernel.tessellation.faces",
-            &snapshot.topology.faces,
-            |index, face| {
-                let mut triangles = Vec::new();
-                let source_face = entity_ref(snapshot.id, face.id.get(), EntityKind::Face);
-                match face.value.surface {
-                    Surface::Plane(plane) => {
-                        let Some(boundaries) = face
-                            .value
-                            .loops()
-                            .map(|loop_key| {
-                                sampled_loop_polygon(
+        let triangles = perf::stage(
+            "kernel.tessellate.faces",
+            snapshot.topology.faces.len(),
+            || {
+                compute.flat_map(
+                    "kernel.tessellation.faces",
+                    &snapshot.topology.faces,
+                    |index, face| {
+                        let mut triangles = Vec::new();
+                        let source_face = entity_ref(snapshot.id, face.id.get(), EntityKind::Face);
+                        match face.value.surface {
+                            Surface::Plane(plane) => {
+                                let Some(boundaries) = face
+                                    .value
+                                    .loops()
+                                    .map(|loop_key| {
+                                        sampled_loop_polygon(
+                                            &snapshot.topology,
+                                            loop_key,
+                                            budget,
+                                            precision,
+                                        )
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                                else {
+                                    return triangles;
+                                };
+                                if boundaries.first().is_none_or(|polygon| polygon.len() < 3) {
+                                    return triangles;
+                                }
+                                for vertices in
+                                    triangulate_face_boundaries(&boundaries, plane, fallback)
+                                {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            Surface::Cylinder(cylinder) => {
+                                for vertices in tessellate_cylinder_face(
                                     &snapshot.topology,
-                                    loop_key,
+                                    &face.value,
+                                    cylinder,
                                     budget,
                                     precision,
-                                )
-                            })
-                            .collect::<Option<Vec<_>>>()
-                        else {
-                            return triangles;
-                        };
-                        if boundaries.first().is_none_or(|polygon| polygon.len() < 3) {
-                            return triangles;
+                                ) {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            Surface::Torus(torus) => {
+                                for vertices in tessellate_torus_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    torus,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            Surface::Sphere(sphere) => {
+                                for vertices in tessellate_sphere_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    sphere,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            Surface::Cone(cone) => {
+                                for vertices in tessellate_cone_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    cone,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            // The ruled tessellator knows each vertex's parameters,
+                            // so its normals come from them rather than from
+                            // inverting the vertex back onto the surface.
+                            Surface::Ruled(ruled) => {
+                                for (vertices, normals) in tessellate_ruled_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    ruled,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(DebugTriangle {
+                                        vertices: vertices.map(protocol_point),
+                                        normals: normals.map(protocol_vector),
+                                        source_face,
+                                        role: snapshot.topology.faces[index].value.role,
+                                    });
+                                }
+                            }
+                            // So does the B-spline tessellator's.
+                            Surface::Bspline(surface) => {
+                                for (vertices, normals) in tessellate_spline_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    surface,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(DebugTriangle {
+                                        vertices: vertices.map(protocol_point),
+                                        normals: normals.map(protocol_vector),
+                                        source_face,
+                                        role: snapshot.topology.faces[index].value.role,
+                                    });
+                                }
+                            }
                         }
-                        for vertices in triangulate_face_boundaries(&boundaries, plane, fallback) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    Surface::Cylinder(cylinder) => {
-                        for vertices in tessellate_cylinder_face(
-                            &snapshot.topology,
-                            &face.value,
-                            cylinder,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    Surface::Torus(torus) => {
-                        for vertices in tessellate_torus_face(
-                            &snapshot.topology,
-                            &face.value,
-                            torus,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    Surface::Sphere(sphere) => {
-                        for vertices in tessellate_sphere_face(
-                            &snapshot.topology,
-                            &face.value,
-                            sphere,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    Surface::Cone(cone) => {
-                        for vertices in tessellate_cone_face(
-                            &snapshot.topology,
-                            &face.value,
-                            cone,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    // The ruled tessellator knows each vertex's parameters,
-                    // so its normals come from them rather than from
-                    // inverting the vertex back onto the surface.
-                    Surface::Ruled(ruled) => {
-                        for (vertices, normals) in tessellate_ruled_face(
-                            &snapshot.topology,
-                            &face.value,
-                            ruled,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
-                                normals: normals.map(protocol_vector),
-                                source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
-                        }
-                    }
-                    // So does the B-spline tessellator's.
-                    Surface::Bspline(surface) => {
-                        for (vertices, normals) in tessellate_spline_face(
-                            &snapshot.topology,
-                            &face.value,
-                            surface,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
-                                normals: normals.map(protocol_vector),
-                                source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
-                        }
-                    }
-                }
-                triangles
+                        triangles
+                    },
+                )
             },
         );
 
-        let presentation_flags = presentation_edge_flags(&snapshot.topology);
+        let presentation_flags = perf::stage(
+            "kernel.tessellate.edge_flags",
+            snapshot.topology.edges.len(),
+            || presentation_edge_flags(&snapshot.topology),
+        );
         let presentation_smooth_edges = &presentation_flags.smooth;
         let edge_incident_faces = edge_incident_faces(snapshot);
-        let edges = compute.flat_map(
-            "kernel.tessellation.edges",
-            &snapshot.topology.edges,
-            |index, edge| {
-                let is_smooth = presentation_smooth_edges[index];
-                let is_tangent = presentation_flags.tangent[index];
-                let incident_faces = edge_incident_faces[index];
-                sampled_edge_segments(edge.value, budget, precision)
-                    .into_iter()
-                    .map(|endpoints| DebugEdge {
-                        endpoints: endpoints.map(protocol_point),
-                        source_edge: entity_ref(snapshot.id, edge.id.get(), EntityKind::Edge),
-                        is_smooth,
-                        is_tangent,
-                        incident_faces,
-                    })
-                    .collect()
+        let edges = perf::stage(
+            "kernel.tessellate.edges",
+            snapshot.topology.edges.len(),
+            || {
+                compute.flat_map(
+                    "kernel.tessellation.edges",
+                    &snapshot.topology.edges,
+                    |index, edge| {
+                        let is_smooth = presentation_smooth_edges[index];
+                        let is_tangent = presentation_flags.tangent[index];
+                        let incident_faces = edge_incident_faces[index];
+                        sampled_edge_segments(edge.value, budget, precision)
+                            .into_iter()
+                            .map(|endpoints| DebugEdge {
+                                endpoints: endpoints.map(protocol_point),
+                                source_edge: entity_ref(
+                                    snapshot.id,
+                                    edge.id.get(),
+                                    EntityKind::Edge,
+                                ),
+                                is_smooth,
+                                is_tangent,
+                                incident_faces,
+                            })
+                            .collect()
+                    },
+                )
             },
         );
         // A vertex where only tangent rails and one crease meet is not a
@@ -3325,21 +3675,27 @@ impl NativeKernel {
             .map(|(smooth, tangent)| *smooth || *tangent)
             .collect::<Vec<_>>();
 
-        let vertices = snapshot
-            .topology
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(vertex_index, vertex)| DebugVertex {
-                point: protocol_point(vertex.value.point),
-                source_vertex: entity_ref(snapshot.id, vertex.id.get(), EntityKind::Vertex),
-                is_smooth: presentation_vertex_is_smooth(
-                    &snapshot.topology,
-                    vertex_index,
-                    &crease_hidden,
-                ),
-            })
-            .collect();
+        let vertices = perf::stage(
+            "kernel.tessellate.vertices",
+            snapshot.topology.vertices.len(),
+            || {
+                snapshot
+                    .topology
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .map(|(vertex_index, vertex)| DebugVertex {
+                        point: protocol_point(vertex.value.point),
+                        source_vertex: entity_ref(snapshot.id, vertex.id.get(), EntityKind::Vertex),
+                        is_smooth: presentation_vertex_is_smooth(
+                            &snapshot.topology,
+                            vertex_index,
+                            &crease_hidden,
+                        ),
+                    })
+                    .collect()
+            },
+        );
 
         DebugScene {
             snapshot: snapshot.id,
@@ -3347,7 +3703,11 @@ impl NativeKernel {
             triangles,
             edges,
             vertices,
-            carriers: display_carriers(snapshot),
+            carriers: perf::stage(
+                "kernel.tessellate.carriers",
+                snapshot.topology.faces.len(),
+                || display_carriers(snapshot),
+            ),
         }
     }
 }
@@ -4154,6 +4514,9 @@ enum ExactRouteDecline {
     TraceUnclosed,
     /// The exact result was empty.
     Empty,
+    /// The numerical intersection rung (ADR 0056 B2) found two faces within
+    /// reach of one another but could not trace or fit the curve they share.
+    IntersectionUnresolved,
     /// The prism tool itself could not be built from the profile.
     Tool,
     /// The exact engine built a candidate that the solid validator did not
@@ -4171,13 +4534,16 @@ impl ExactRouteDecline {
             analytic_boolean::AnalyticBooleanError::TraceUnclosed => Self::TraceUnclosed,
             analytic_boolean::AnalyticBooleanError::DomainUnsupported => Self::Contact,
             analytic_boolean::AnalyticBooleanError::EmptyResult => Self::Empty,
+            analytic_boolean::AnalyticBooleanError::IntersectionUnresolved => {
+                Self::IntersectionUnresolved
+            }
         }
     }
 
     fn sentence(self) -> String {
         match self {
-            Self::Vocabulary => "the body carries a face class — a torus, a cone, a sphere or a \
-                                 ruled wall — that the exact engine cannot sew"
+            Self::Vocabulary => "the body carries a face class — a ruled wall or a B-spline \
+                                 patch — that the exact engine cannot sew"
                 .to_owned(),
             Self::CarrierPair { first, second } => format!(
                 "the {first} and {second} carriers meet in a curve outside this kernel's line and \
@@ -4192,6 +4558,11 @@ impl ExactRouteDecline {
                                     closure refuses rather than guess how it continues"
                 .to_owned(),
             Self::Empty => "the exact operation produced no material".to_owned(),
+            Self::IntersectionUnresolved => "two faces come within reach of one another on \
+                                             carriers outside the intersection matrix, and the \
+                                             numerical rung could not trace or fit the curve they \
+                                             share within its tolerance"
+                .to_owned(),
             Self::Tool => "the profile could not be swept into an exact tool".to_owned(),
             Self::Invalid => "the exact engine built a body that did not pass the solid \
                               validator, which is a defect in the exact route rather than a \
@@ -4242,6 +4613,67 @@ fn exact_candidate(
     } else {
         Err(ExactRouteDecline::Invalid)
     }
+}
+
+/// The numerical intersection rung (ADR 0056 B2–B4): the general engine with
+/// the carrier pairs the matrix refuses traced and fitted, held to the solid
+/// validator as any exact candidate is. The body, and the approximation it
+/// carries — `None` when no curve had to be traced and the body is exact
+/// after all — or why the rung does not answer.
+fn numerical_rung(
+    target: &Topology,
+    tool: &Topology,
+    operation: BooleanOperation,
+    precision: PrecisionPolicy,
+) -> Result<(Topology, Option<analytic_boolean::NumericalApproximation>), ExactRouteDecline> {
+    if !analytic_boolean::operands_in_engine_vocabulary(target, tool) {
+        return Err(ExactRouteDecline::Vocabulary);
+    }
+    let (topology, approximation) =
+        analytic_boolean::build_general_boolean(target, tool, operation, precision)
+            .map_err(ExactRouteDecline::from_engine)?;
+    let validation = validator::validate(&topology, precision.linear_agreement);
+    if validation.diagnostics.is_empty() {
+        Ok((topology, approximation))
+    } else {
+        Err(ExactRouteDecline::Invalid)
+    }
+}
+
+/// The warning every numerically intersected result carries: what was
+/// approximated, how far the fitted curves depart, and the tolerance they
+/// were held to.
+fn numerical_intersection_warning(
+    approximation: analytic_boolean::NumericalApproximation,
+) -> ProtocolDiagnostic {
+    let mut warning = approximation_warning(
+        "BOOLEAN_INTERSECTION_APPROXIMATED",
+        &format!(
+            "{} intersection curve{} between carriers outside the exact matrix {} traced \
+             numerically and fitted as B-splines. Each fitted curve and its parameter traces \
+             lie within {:.3e} of both carriers and of one another, inside the intersection \
+             tolerance of {:.3e}; the body's faces are exact carriers, but these edges \
+             approximate the true curves rather than certifying them.",
+            approximation.curves,
+            if approximation.curves == 1 { "" } else { "s" },
+            if approximation.curves == 1 {
+                "was"
+            } else {
+                "were"
+            },
+            approximation.deviation,
+            approximation.tolerance
+        ),
+    );
+    warning.measurement = Some(DiagnosticMeasurement {
+        quantity: QuantityKind::Length,
+        measured: approximation.deviation,
+        allowed: NumericInterval {
+            min: None,
+            max: Some(approximation.tolerance),
+        },
+    });
+    warning
 }
 
 /// A faceted-tier refusal with the exact route's reason in front of it: a
@@ -4388,6 +4820,9 @@ struct ToolBoolean {
     /// The rung for two coaxial bodies of revolution combined in their
     /// shared section (ADR 0026 F4).
     coaxial: &'static str,
+    /// The rung for the numerical intersection route (ADR 0056 B2): the
+    /// general engine with out-of-matrix carrier pairs traced and fitted.
+    numerical: &'static str,
 }
 
 /// A loft added to or cut from a body (ADR 0049).
@@ -4403,6 +4838,7 @@ const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
         "loft/faceted",
     ],
     coaxial: "loft/boolean-coaxial",
+    numerical: "loft/boolean-numerical",
 };
 
 /// A sweep added to or cut from a body (ADR 0055). A straight sweep is a
@@ -4420,6 +4856,7 @@ const SWEEP_BOOLEAN: ToolBoolean = ToolBoolean {
         "sweep/faceted",
     ],
     coaxial: "sweep/boolean-coaxial",
+    numerical: "sweep/boolean-numerical",
 };
 
 /// A revolve added to or cut from a body (ADR 0055). A revolve whose
@@ -4439,6 +4876,7 @@ const REVOLVE_BOOLEAN: ToolBoolean = ToolBoolean {
         "revolve/faceted",
     ],
     coaxial: "revolve/boolean-coaxial",
+    numerical: "revolve/boolean-numerical",
 };
 
 /// The wedge wall taken off a partial turn's shell core (ADR 0055). The
@@ -4457,6 +4895,7 @@ const SHELL_BOOLEAN: ToolBoolean = ToolBoolean {
         "shell/faceted",
     ],
     coaxial: "shell/closed-revolve",
+    numerical: "shell/numerical",
 };
 
 /// A spline profile added to or cut from a face (ADR 0050), which answers
@@ -4473,6 +4912,7 @@ const SPLINE_FACE_BOOLEAN: ToolBoolean = ToolBoolean {
         "face-feature/faceted",
     ],
     coaxial: "face-feature/coaxial-section",
+    numerical: "face-feature/numerical-boolean",
 };
 
 /// A loft added to or cut from a body, through the Boolean ladder.
@@ -4482,8 +4922,17 @@ fn loft_boolean(
     add: bool,
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
+    cancellation: &CancellationToken,
 ) -> Result<(Topology, &'static str), KernelError> {
-    tool_boolean(input, tool, add, precision, warnings, &LOFT_BOOLEAN)
+    tool_boolean(
+        input,
+        tool,
+        add,
+        precision,
+        warnings,
+        &LOFT_BOOLEAN,
+        cancellation,
+    )
 }
 
 /// A tool body added to or cut from a body, through the Boolean ladder: the
@@ -4503,6 +4952,7 @@ fn tool_boolean(
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
     labels: &ToolBoolean,
+    cancellation: &CancellationToken,
 ) -> Result<(Topology, &'static str), KernelError> {
     let noun = labels.noun;
     if input.topology.solids.is_empty() {
@@ -4566,6 +5016,22 @@ fn tool_boolean(
     } else {
         ExactRouteDecline::Vocabulary
     };
+    // The numerical intersection rung (ADR 0056 B2), between the exact
+    // engine and the faceted tier: exact where nothing had to be traced,
+    // labelled with its measured departure where something had.
+    if let Ok((topology, approximation)) =
+        numerical_rung(&input.topology, &tool, operation, precision)
+    {
+        return Ok(match approximation {
+            Some(approximation) => {
+                warnings
+                    .push(decline.diagnostic_coded(labels.declined, DiagnosticSeverity::Warning));
+                warnings.push(numerical_intersection_warning(approximation));
+                (topology, labels.numerical)
+            }
+            None => (topology, labels.rungs[1]),
+        });
+    }
     let declined = |mut refusal: KernelError| {
         for diagnostic in &mut refusal.diagnostics {
             if diagnostic.code.as_str() == "FACE_FEATURE_FACETED_UNRESOLVED" {
@@ -4597,9 +5063,16 @@ fn tool_boolean(
         )
     };
     let target_scene = scene_of(&input.topology);
-    let topology = faceted_boolean::combine_bodies(&target_scene, &scene_of(&tool), add, precision)
-        .ok_or_else(|| {
-            declined(error(
+    let topology = match faceted_boolean::combine_bodies(
+        &target_scene,
+        &scene_of(&tool),
+        add,
+        precision,
+        cancellation,
+    ) {
+        Ok(Some(topology)) => topology,
+        Ok(None) => {
+            return Err(declined(error(
                 KernelErrorCode::Unsupported,
                 KernelStage::Construction,
                 input.id,
@@ -4612,8 +5085,33 @@ fn tool_boolean(
                      rebuilt shell did not close within the approximation budget."
                     ),
                 )],
-            ))
-        })?;
+            )));
+        }
+        Err(faceted_boolean::FacetedRefusal::BudgetExceeded { polygons, ceiling }) => {
+            return Err(declined(faceted_budget_error(
+                input.id, noun, polygons, ceiling,
+            )));
+        }
+        Err(faceted_boolean::FacetedRefusal::Cancelled) => {
+            return Err(
+                check_cancelled(input.id, cancellation, KernelStage::Construction)
+                    .err()
+                    .unwrap_or_else(|| {
+                        error(
+                            KernelErrorCode::Cancelled,
+                            KernelStage::Construction,
+                            input.id,
+                            "operation cancelled; no snapshot was committed",
+                            vec![simple_diagnostic(
+                                "OPERATION_CANCELLED",
+                                KernelStage::Construction,
+                                "The cancellation token was set before publication.",
+                            )],
+                        )
+                    }),
+            );
+        }
+    };
     certify_faceted_candidate(input.id, &topology, precision).map_err(declined)?;
     certify_faceted_change(
         input.id,
@@ -4654,6 +5152,7 @@ fn spline_face_feature(
     operation: FaceExtrusionOperation,
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
+    cancellation: &CancellationToken,
 ) -> Result<(Topology, &'static str), KernelError> {
     let refuse = |reason: FaceFeatureInputError| {
         planar_profile_input_error(input.id, PlanarProfileInputError::FaceFeature(reason))
@@ -4715,7 +5214,15 @@ fn spline_face_feature(
     )
     .map_err(|reason| spline_profile_error(input.id, reason))?;
     let tool = spline_profile::build_spline_extrusion(&regions);
-    tool_boolean(input, tool, add, precision, warnings, &SPLINE_FACE_BOOLEAN)
+    tool_boolean(
+        input,
+        tool,
+        add,
+        precision,
+        warnings,
+        &SPLINE_FACE_BOOLEAN,
+        cancellation,
+    )
 }
 
 /// The named refusal for a profile with splines.
@@ -4864,6 +5371,41 @@ fn regularized_edge_finish(
         ) => {}
     }
 
+    // A concave rim — a boss standing on a plane, or a pocket's wall meeting
+    // its floor: a torus or cone band built in place on the air side of the
+    // corner, with its material added (ADR 0056, F2). It comes before the
+    // hole-rim rung because a boss rim is an inner loop of its plate, which
+    // that rung would otherwise take for a hole and refuse for want of bore.
+    match concave_rim_blend::build_concave_rim_blend(
+        input.id,
+        &input.topology,
+        targets,
+        kind,
+        distance,
+        precision,
+    ) {
+        Ok(topology)
+            if validator::validate(&topology, precision.linear_agreement)
+                .diagnostics
+                .is_empty() =>
+        {
+            return Ok((topology, "edge-finish/concave-rim-blend"));
+        }
+        Ok(_) => {}
+        Err(concave_rim_blend::ConcaveRimBlendError::DistanceInvalid) => {
+            return Err(simple_invalid_input(
+                input.id,
+                "CONCAVE_RIM_DISTANCE_INVALID",
+                "The rim finish must fit within the plane around the rim and the height of the \
+                 wall standing on it.",
+            ));
+        }
+        Err(
+            concave_rim_blend::ConcaveRimBlendError::TargetInvalid
+            | concave_rim_blend::ConcaveRimBlendError::DomainUnsupported,
+        ) => {}
+    }
+
     // The rim of a hole through any wall: a torus or cone band built in
     // place between the grown hole and the sunk bore ring, one closed edge
     // with no corners to close.
@@ -4894,6 +5436,42 @@ fn regularized_edge_finish(
             hole_rim_blend::HoleRimBlendError::TargetInvalid
             | hole_rim_blend::HoleRimBlendError::DomainUnsupported,
         ) => {}
+    }
+
+    // Concave straight edges between flat faces on a body no prism rung owns
+    // (ADR 0056, F2 and F3): each filled by unioning its own corner region
+    // into the body, then any convex edges of the same selection finished on
+    // the filled body — bounded against the fill where they meet it, and by
+    // the rungs below everywhere else. This route owns every selection with
+    // a concave edge in it: nothing below adds material, so a refusal here
+    // is the answer.
+    let (concave, rest) = concave_edge_fill::partition(&input.topology, targets, precision);
+    if !concave.is_empty() {
+        let mut ladder = |body: &Snapshot, remaining: &[EntityRef]| {
+            regularized_edge_finish(body, remaining, kind, distance, precision, warnings)
+        };
+        return concave_edge_fill::finish_with_fills(
+            input,
+            &concave,
+            &rest,
+            kind,
+            distance,
+            precision,
+            &mut ladder,
+        )
+        .map_err(|refusal| {
+            error(
+                KernelErrorCode::InvalidInput,
+                KernelStage::Preflight,
+                input.id,
+                refusal.message.clone(),
+                vec![simple_diagnostic(
+                    refusal.code,
+                    KernelStage::Preflight,
+                    &refusal.message,
+                )],
+            )
+        });
     }
 
     // The last exact rung: convex edges between planar faces, with a sphere or
@@ -5008,6 +5586,32 @@ fn regularized_edge_finish(
          solid rather than certifying it.",
     ));
     Ok((topology, certified_by))
+}
+
+/// The faceted tier's budget refusal (ADR 0056 R3): the polygon count it
+/// reached and the ceiling it passed, named rather than a silent decline.
+fn faceted_budget_error(
+    snapshot: SnapshotId,
+    noun: &str,
+    polygons: usize,
+    ceiling: usize,
+) -> KernelError {
+    error(
+        KernelErrorCode::ResourceLimitExceeded,
+        KernelStage::Construction,
+        snapshot,
+        format!("the {noun} is too large for the faceted tier's polygon budget"),
+        vec![simple_diagnostic(
+            "FACETED_BUDGET_EXCEEDED",
+            KernelStage::Construction,
+            &format!(
+                "The {noun} and the body tessellate to {polygons} polygons together, past the \
+                 faceted tier's budget of {ceiling}. Raise the precision policy's subdivision \
+                 budget, simplify the operands, or combine them where an exact engine carries \
+                 their surfaces."
+            ),
+        )],
+    )
 }
 
 /// Publishes the corner-blend rung's own refusal, code and sentence intact.
@@ -5768,6 +6372,11 @@ fn tessellate_torus_face(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 3]> {
+    // A face that is more than its parameter rectangle — holed, or bounded
+    // by a traced curve — is drawn from its loops (ADR 0056 Track B).
+    if let Some(triangles) = trimmed_tessellation::tessellate(topology, face, budget, precision) {
+        return triangles;
+    }
     let Some(loop_record) = topology.loop_record(face.outer_loop) else {
         return Vec::new();
     };
@@ -5877,6 +6486,9 @@ fn tessellate_sphere_face(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 3]> {
+    if let Some(triangles) = trimmed_tessellation::tessellate(topology, face, budget, precision) {
+        return triangles;
+    }
     let Some((u_min, u_max, v_min, v_max)) = face_parameter_bounds(topology, face) else {
         return Vec::new();
     };
@@ -5978,6 +6590,9 @@ fn tessellate_cone_face(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 3]> {
+    if let Some(triangles) = trimmed_tessellation::tessellate(topology, face, budget, precision) {
+        return triangles;
+    }
     let Some(loop_record) = topology.loop_record(face.outer_loop) else {
         return Vec::new();
     };
@@ -6450,6 +7065,11 @@ fn tessellate_cylinder_face(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 3]> {
+    // A holed face, or one bounded by a traced curve, is drawn from its
+    // loops (ADR 0056 Track B); the strips below keep every other face.
+    if let Some(triangles) = trimmed_tessellation::tessellate(topology, face, budget, precision) {
+        return triangles;
+    }
     if !face.inner_loops.is_empty() {
         return Vec::new();
     }
@@ -7125,7 +7745,7 @@ fn point_in_or_on_triangle(
         && signed_area_2d(third, first, point) >= 0.0
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum HistoryMode {
     Generated,
     OneToOne,
@@ -7140,6 +7760,13 @@ enum HistoryMode {
     RegularizedFaceFeature,
     FacePushPull {
         target_face: EntityRef,
+    },
+    /// A STEP import: every entity generated, with each face and edge also
+    /// under the role of the STEP entity it came from (`#412`), so a later
+    /// step can name it as the file does (ADR 0056, I4).
+    Imported {
+        face_sources: Vec<u64>,
+        edge_sources: Vec<Option<u64>>,
     },
 }
 
@@ -7998,7 +8625,7 @@ fn face_push_pull_input_error(snapshot: SnapshotId, reason: FacePushPullInputErr
 }
 
 fn validate_transform_source(input: &Snapshot) -> Result<(), KernelError> {
-    if !input.topology.solids.is_empty() {
+    if !input.topology.solids.is_empty() || sheet::is_sheet(&input.topology) {
         return Ok(());
     }
     Err(error(
@@ -8302,6 +8929,7 @@ fn protocol_validation(
         ValidationProfile::Topology => false,
         ValidationProfile::ClosedShell => report.counts.shells == 0,
         ValidationProfile::Solid => report.counts.solids == 0,
+        ValidationProfile::Sheet => report.counts.shells == 0 || report.counts.solids > 0,
     };
     if profile_missing {
         diagnostics.push(simple_diagnostic(
@@ -8498,6 +9126,52 @@ fn generated_history(snapshot: &Snapshot) -> Vec<HistoryRecord> {
         add(EntityKind::Solid, record.id.get(), ordinal);
     }
     history
+}
+
+/// The history of an imported body: every entity generated under its kind
+/// and ordinal, and every face and edge that came from one STEP entity also
+/// under that entity's number as its role, ordinal by ordinal where one
+/// STEP face became several kernel faces (a cylinder split at its seams).
+fn imported_history(
+    snapshot: &Snapshot,
+    face_sources: &[u64],
+    edge_sources: &[Option<u64>],
+) -> Vec<HistoryRecord> {
+    let mut history = generated_history(snapshot);
+    let mut ordinals: BTreeMap<(EntityKind, u64), u32> = BTreeMap::new();
+    let mut add = |kind: EntityKind, id: u64, source: u64| {
+        let ordinal = ordinals.entry((kind, source)).or_insert(0);
+        history.push(HistoryRecord {
+            relation: HistoryRelation::Generated,
+            inputs: Vec::new(),
+            outputs: vec![entity_ref(snapshot.id, id, kind)],
+            role: Some(OperationRole::new(format!("#{source}"), Some(*ordinal))),
+        });
+        *ordinal += 1;
+    };
+    for (record, source) in snapshot.topology.faces.iter().zip(face_sources) {
+        if *source != 0 {
+            add(EntityKind::Face, record.id.get(), *source);
+        }
+    }
+    for (record, source) in snapshot.topology.edges.iter().zip(edge_sources) {
+        if let Some(source) = source {
+            add(EntityKind::Edge, record.id.get(), *source);
+        }
+    }
+    history
+}
+
+/// A STEP import that produced nothing: the refusals as the error's
+/// diagnostics, so the caller sees every face named.
+fn step_import_error(snapshot: SnapshotId, failure: step_import::ImportFailure) -> KernelError {
+    error(
+        KernelErrorCode::Unsupported,
+        KernelStage::Construction,
+        snapshot,
+        failure.message,
+        failure.diagnostics,
+    )
 }
 
 fn regularized_face_feature_history(input: &Snapshot, output: &Snapshot) -> Vec<HistoryRecord> {

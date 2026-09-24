@@ -391,7 +391,17 @@ fn validate_supported_command(command: &KernelCommand) -> Result<(), Parameteriz
         | KernelCommand::LinearPatternSnapshot { .. }
         | KernelCommand::ShellSnapshot { .. }
         | KernelCommand::FinishEdge { .. }
-        | KernelCommand::FinishEdges { .. } => {
+        | KernelCommand::FinishEdges { .. }
+        // Sheet bodies (ADR 0056, Track S) are not parameterized yet: their
+        // lengths live in the chain, the profile and the thickness, none of
+        // which the part library binds to a variable.
+        | KernelCommand::SurfaceExtrude { .. }
+        | KernelCommand::SurfaceRevolve { .. }
+        | KernelCommand::PlanarPatch { .. }
+        | KernelCommand::ThickenSheet { .. }
+        | KernelCommand::TrimSheetByPlane { .. }
+        // An imported body's dimensions are the file's.
+        | KernelCommand::ImportStep { .. } => {
             return Err(ParameterizedKernelError::UnsupportedCommand);
         }
     };

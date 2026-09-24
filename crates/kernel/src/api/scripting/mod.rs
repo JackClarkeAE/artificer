@@ -519,6 +519,7 @@ fn prelude() -> Names {
 const BUILTINS: &[&str] = &[
     "box",
     "cylinder",
+    "import_step",
     "line",
     "circle",
     "arc",
@@ -537,6 +538,12 @@ const BUILTINS: &[&str] = &[
     "union",
     "difference",
     "intersection",
+    "surface_extrude",
+    "surface_revolve",
+    "patch",
+    "stitch",
+    "thicken",
+    "trim",
     "faces",
     "edges",
     "edge_between",
@@ -1665,6 +1672,12 @@ impl<'a> Interp<'a> {
                 radius: args.radius()?,
                 height: args.number("height")?,
             })),
+            // A body read from a STEP file (ADR 0056, Track I).
+            "import_step" => Ok(Value::command(ApiCommand::ImportStep {
+                label: args.label()?,
+                path: args.required("path")?.as_string()?.to_owned(),
+                text: None,
+            })),
             // ---- sketches and what grows from them --------------------------
             "line" => Ok(Value::entity(SketchEntity::Line {
                 start: args.required("start")?.as_point2()?,
@@ -1913,6 +1926,71 @@ impl<'a> Interp<'a> {
                 target: args.required("target")?.as_step()?,
                 tool: args.required("tool")?.as_step()?,
             })),
+            // ---- sheets (ADR 0056, Track S) ---------------------------------
+            "surface_extrude" => Ok(Value::command(ApiCommand::SurfaceExtrude {
+                label: args.label()?,
+                sketch: args.required("sketch")?.as_step()?,
+                distance: args.number("distance")?,
+            })),
+            "surface_revolve" => {
+                let (axis_origin, axis_direction, axis_placement) = match args.values.get("axis") {
+                    Some(Value::Axis(axis)) => {
+                        if args.values.contains_key("axis_origin") {
+                            return Err(ScriptError::eval(
+                                "surface_revolve(): an axis(...) says where it runs; leave out `axis_origin`",
+                            ));
+                        }
+                        match axis {
+                            ScriptAxis::Line { origin, direction } => (*origin, *direction, None),
+                            ScriptAxis::Placed(placement) => (origin, up, Some(placement.clone())),
+                        }
+                    }
+                    _ => (
+                        args.point3_or("axis_origin", origin)?,
+                        args.vector3_or("axis", up)?,
+                        None,
+                    ),
+                };
+                Ok(Value::command(ApiCommand::SurfaceRevolve {
+                    label: args.label()?,
+                    sketch: args.required("sketch")?.as_step()?,
+                    axis_origin,
+                    axis_direction,
+                    angle_degrees: args.number_or("angle", 360.0)?,
+                    axis_placement,
+                }))
+            }
+            "patch" => Ok(Value::command(ApiCommand::Patch {
+                label: args.label()?,
+                sketch: args.required("sketch")?.as_step()?,
+                regions: args.regions()?,
+            })),
+            "stitch" => {
+                let sheets = match args.required("sheets")? {
+                    Value::Array(items) => items
+                        .iter()
+                        .map(Value::as_step)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    other => {
+                        return Err(ScriptError::eval(format!(
+                            "stitch(): `sheets` is an array of sheet steps, got {}",
+                            other.describe()
+                        )));
+                    }
+                };
+                Ok(Value::command(ApiCommand::Stitch {
+                    label: args.label()?,
+                    sheets,
+                }))
+            }
+            "thicken" => Ok(Value::command(ApiCommand::Thicken {
+                label: args.label()?,
+                thickness: args.number("thickness")?,
+            })),
+            "trim" => Ok(Value::command(ApiCommand::Trim {
+                label: args.label()?,
+                plane: sketch_plane(args.required("plane")?)?,
+            })),
             // ---- selectors --------------------------------------------------
             "faces" => match spelling {
                 None => named_selector(EntityKind::Face, args).map(Value::Selector),
@@ -1948,7 +2026,7 @@ impl<'a> Interp<'a> {
                 }))
             }
             other => Err(ScriptError::eval(format!(
-                "Unknown function `{other}`; the features are box, cylinder, sketch, plane, extrude, loft, revolve, drill, push_pull, fillet, chamfer, mirror, pattern, union, difference and intersection{}",
+                "Unknown function `{other}`; the features are box, cylinder, sketch, plane, axis, extrude, loft, revolve, drill, push_pull, fillet, chamfer, mirror, pattern, shell, union, difference, intersection, surface_extrude, surface_revolve, patch, stitch, thicken and trim{}",
                 if self.functions.is_empty() {
                     String::new()
                 } else {

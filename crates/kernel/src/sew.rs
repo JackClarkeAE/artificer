@@ -33,11 +33,110 @@ pub(crate) enum SewError {
 
 /// One face piece awaiting sewing: a surface carrier and its boundary loops
 /// in that surface's own parameter space, outer loop first.
+///
+/// A loop may carry numerically traced arcs (ADR 0056, Track B2): each is a
+/// placeholder line in `loops` whose ends are the arc's, beside the arc
+/// itself in `numerical`, indexed loop by loop and segment by segment. An
+/// empty `numerical` means every piece is exact.
 #[derive(Clone, Debug)]
 pub(crate) struct SewFace {
     pub(crate) surface: Surface,
     pub(crate) loops: Vec<Vec<Segment>>,
     pub(crate) role: FaceRole,
+    pub(crate) numerical: Vec<Vec<Option<NumericalPiece>>>,
+}
+
+/// A stretch of a numerically traced intersection curve as an edge: the
+/// fitted space curve both faces share, and this face's own parameter trace
+/// of it, over one parameter range.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NumericalPiece {
+    pub(crate) curve: crate::bspline::SplineCurve3,
+    pub(crate) pcurve: crate::bspline::SplineCurve2,
+    pub(crate) from: f64,
+    pub(crate) to: f64,
+}
+
+impl SewFace {
+    /// The numerical arc standing behind a loop's segment, if any.
+    fn numerical(&self, loop_index: usize, segment_index: usize) -> Option<NumericalPiece> {
+        self.numerical
+            .get(loop_index)
+            .and_then(|pieces| pieces.get(segment_index))
+            .copied()
+            .flatten()
+    }
+
+    fn has_numerical(&self) -> bool {
+        self.numerical.iter().flatten().any(|piece| piece.is_some())
+    }
+}
+
+/// A hash grid over sewn vertices, keyed by position quantised to the weld
+/// distance. Two points within `weld` land in the same cell or an adjacent
+/// one, so a query scans the 27-cell neighbourhood rather than every vertex.
+struct VertexGrid {
+    cell: f64,
+    buckets: std::collections::BTreeMap<[i64; 3], Vec<usize>>,
+}
+
+impl VertexGrid {
+    fn new(weld: f64) -> Self {
+        Self {
+            cell: weld.max(f64::MIN_POSITIVE),
+            buckets: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn key(&self, point: Point3) -> [i64; 3] {
+        let quantize = |value: f64| {
+            let cell = (value / self.cell).floor();
+            if cell.is_finite() { cell as i64 } else { 0 }
+        };
+        [quantize(point.x), quantize(point.y), quantize(point.z)]
+    }
+
+    /// The vertex `point` welds into, adding it when none is within `weld`.
+    /// Among the vertices within reach the lowest index wins, so the result
+    /// is the very vertex a linear scan in insertion order would return.
+    fn find_or_insert(
+        &mut self,
+        topology: &mut Topology,
+        next_id: &mut u64,
+        point: Point3,
+    ) -> VertexKey {
+        let base = self.key(point);
+        let mut best: Option<usize> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let cell = [base[0] + dx, base[1] + dy, base[2] + dz];
+                    let Some(bucket) = self.buckets.get(&cell) else {
+                        continue;
+                    };
+                    for &index in bucket {
+                        if (topology.vertices[index].value.point - point).length() <= self.cell
+                            && best.is_none_or(|current| index < current)
+                        {
+                            best = Some(index);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(index) = best {
+            return VertexKey(index);
+        }
+        let index = topology.vertices.len();
+        let id = EntityId::from_raw(*next_id);
+        *next_id += 1;
+        topology.vertices.push(Record {
+            id,
+            value: Vertex { point },
+        });
+        self.buckets.entry(base).or_default().push(index);
+        VertexKey(index)
+    }
 }
 
 /// Sews face pieces into a topology of one or more solids with cavities.
@@ -55,9 +154,15 @@ pub(crate) fn sew_shells(
         .flat_map(|segment| [segment.start(), segment.end()])
         .map(|point| point.x.abs().max(point.y.abs()))
         .fold(1.0_f64, f64::max);
-    let weld = precision.linear_agreement.max(1.0e-12) * scale * 32.0;
-    let merged = without_needless_vertices(pieces, weld);
+    // The one agreement model (ADR 0056 G1): a section weld, `·32` the point
+    // agreement, at the body's own scale — the same value the literal gave.
+    let weld =
+        crate::agreement::Agreement::from(precision).weld(scale, crate::agreement::SECTION_WELD);
+    let merged = crate::perf::stage("kernel.sew.needless_vertices", pieces.len(), || {
+        without_needless_vertices(pieces, weld)
+    });
     let pieces = merged.as_slice();
+    let welding = std::time::Instant::now();
 
     let mut topology = Topology::default();
     let mut next_id = 1_u64;
@@ -67,41 +172,44 @@ pub(crate) fn sew_shells(
         id
     }
 
-    // Vertex weld by position; edge weld by endpoint pair plus midpoint.
-    fn find_vertex(
-        topology: &mut Topology,
-        next_id: &mut u64,
-        weld: f64,
-        point: Point3,
-    ) -> VertexKey {
-        if let Some(index) = topology
-            .vertices
-            .iter()
-            .position(|candidate| (candidate.value.point - point).length() <= weld)
-        {
-            return VertexKey(index);
-        }
-        let key = VertexKey(topology.vertices.len());
-        topology.vertices.push(Record {
-            id: allocate(next_id),
-            value: Vertex { point },
-        });
-        key
-    }
+    // Vertex weld by position, through a hash grid so a body of thousands of
+    // welded vertices costs the cell it lands in rather than a scan of every
+    // vertex before it. A point within `weld` of a vertex shares its cell or
+    // a neighbour's, and among the matches the lowest index wins — exactly
+    // the vertex a linear `position()` would have returned.
+    let mut vertex_grid = VertexGrid::new(weld);
+
+    // Edge weld by endpoint pair plus midpoint, through a map keyed by the
+    // unordered vertex pair, so an edge is matched against the few edges on
+    // the same two vertices rather than every edge already sewn.
+    let mut edges_by_pair: std::collections::BTreeMap<[usize; 2], Vec<usize>> =
+        std::collections::BTreeMap::new();
 
     let mut face_keys: Vec<FaceKey> = Vec::with_capacity(pieces.len());
     for piece in pieces {
         let mut loop_keys = Vec::with_capacity(piece.loops.len());
-        for segments in &piece.loops {
+        for (loop_index, segments) in piece.loops.iter().enumerate() {
             if segments.is_empty() {
                 return Err(SewError::Inconsistent);
             }
             let mut coedges = Vec::with_capacity(segments.len());
-            for segment in segments {
-                let start_world =
-                    surface_point(piece.surface, segment.start()).ok_or(SewError::Inconsistent)?;
-                let end_world =
-                    surface_point(piece.surface, segment.end()).ok_or(SewError::Inconsistent)?;
+            for (segment_index, segment) in segments.iter().enumerate() {
+                // A numerically traced arc is the one fitted space curve both
+                // faces hold, over one parameter: its ends and its middle are
+                // that curve's, so the weld below finds the same edge from
+                // either face.
+                let numerical = piece.numerical(loop_index, segment_index);
+                let start_world = match numerical {
+                    Some(arc) => arc.curve.point(arc.from),
+                    None => surface_point(piece.surface, segment.start())
+                        .ok_or(SewError::Inconsistent)?,
+                };
+                let end_world = match numerical {
+                    Some(arc) => arc.curve.point(arc.to),
+                    None => {
+                        surface_point(piece.surface, segment.end()).ok_or(SewError::Inconsistent)?
+                    }
+                };
                 // A trace is read over the pair's one parameter from here on,
                 // and its midpoint is that parameter's midpoint, so the weld
                 // below compares the same point from either face.
@@ -116,33 +224,64 @@ pub(crate) fn sew_shells(
                         trace.pcurve.evaluate((range.start + range.end) / 2.0)
                     },
                 );
-                let middle_world =
-                    surface_point(piece.surface, middle_2d).ok_or(SewError::Inconsistent)?;
-                let start_vertex = find_vertex(&mut topology, &mut next_id, weld, start_world);
-                let end_vertex = find_vertex(&mut topology, &mut next_id, weld, end_world);
-
-                let (curve, parameter_range) = match canonical {
-                    Some(trace) => (trace.curve, trace.range),
-                    None => segment_curve(piece.surface, *segment).ok_or(SewError::Inconsistent)?,
-                };
-                let found = topology.edges.iter().position(|edge| {
-                    let vertices = edge.value.vertices;
-                    let aligned = vertices == [start_vertex, end_vertex];
-                    let swapped = vertices == [end_vertex, start_vertex];
-                    if !aligned && !swapped {
-                        return false;
+                let middle_world = match numerical {
+                    Some(arc) => arc.curve.point(0.5 * (arc.from + arc.to)),
+                    None => {
+                        surface_point(piece.surface, middle_2d).ok_or(SewError::Inconsistent)?
                     }
-                    let range = edge.value.parameter_range;
-                    let middle = edge.value.curve.evaluate((range.start + range.end) / 2.0);
-                    (middle - middle_world).length() <= weld
+                };
+                let start_vertex =
+                    vertex_grid.find_or_insert(&mut topology, &mut next_id, start_world);
+                let end_vertex = vertex_grid.find_or_insert(&mut topology, &mut next_id, end_world);
+
+                let (curve, parameter_range) = match (numerical, canonical) {
+                    (Some(arc), _) => (
+                        Curve3::Bspline { curve: arc.curve },
+                        ParameterRange::new(arc.from, arc.to),
+                    ),
+                    (None, Some(trace)) => (trace.curve, trace.range),
+                    (None, None) => {
+                        segment_curve(piece.surface, *segment).ok_or(SewError::Inconsistent)?
+                    }
+                };
+                let pair = if start_vertex.0 <= end_vertex.0 {
+                    [start_vertex.0, end_vertex.0]
+                } else {
+                    [end_vertex.0, start_vertex.0]
+                };
+                // The lowest-index edge on this vertex pair whose midpoint
+                // agrees: what a linear scan over every edge would have found.
+                let found = edges_by_pair.get(&pair).and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|index| {
+                            let range = topology.edges[*index].value.parameter_range;
+                            let middle = topology.edges[*index]
+                                .value
+                                .curve
+                                .evaluate((range.start + range.end) / 2.0);
+                            (middle - middle_world).length() <= weld
+                        })
+                        .min()
                 });
                 let (edge_key, orientation) = match found {
                     Some(index) => {
-                        let aligned =
-                            topology.edges[index].value.vertices == [start_vertex, end_vertex];
+                        let vertices = topology.edges[index].value.vertices;
+                        let aligned = vertices == [start_vertex, end_vertex];
+                        // A pole edge has both ends at one vertex, so its
+                        // direction cannot say which way a face walks it;
+                        // the two faces that share it take opposite senses,
+                        // as the edge-use family requires of every edge.
+                        let degenerate = vertices[0] == vertices[1];
+                        let already_forward = degenerate
+                            && topology.coedges.iter().any(|coedge| {
+                                coedge.value.edge == EdgeKey(index)
+                                    && coedge.value.orientation == Orientation::Forward
+                            });
                         (
                             EdgeKey(index),
-                            if aligned {
+                            if aligned && !already_forward {
                                 Orientation::Forward
                             } else {
                                 Orientation::Reverse
@@ -159,12 +298,17 @@ pub(crate) fn sew_shells(
                                 parameter_range,
                             },
                         });
+                        edges_by_pair.entry(pair).or_default().push(key.0);
                         (key, Orientation::Forward)
                     }
                 };
-                let (pcurve, pcurve_range) = match canonical {
-                    Some(trace) => (trace.pcurve, trace.pcurve_range),
-                    None => segment_pcurve(*segment),
+                let (pcurve, pcurve_range) = match (numerical, canonical) {
+                    (Some(arc), _) => (
+                        Curve2::Bspline { curve: arc.pcurve },
+                        ParameterRange::new(arc.from, arc.to),
+                    ),
+                    (None, Some(trace)) => (trace.pcurve, trace.pcurve_range),
+                    (None, None) => segment_pcurve(*segment),
                 };
                 let coedge_key = CoedgeKey(topology.coedges.len());
                 topology.coedges.push(Record {
@@ -197,6 +341,8 @@ pub(crate) fn sew_shells(
         });
         face_keys.push(face_key);
     }
+    crate::perf::record("kernel.sew.weld", pieces.len(), welding.elapsed());
+    let components = std::time::Instant::now();
 
     // Edge-connected components become shells.
     let mut face_edges: Vec<Vec<EdgeKey>> = vec![Vec::new(); topology.faces.len()];
@@ -237,6 +383,8 @@ pub(crate) fn sew_shells(
         }
     }
 
+    crate::perf::record("kernel.sew.components", pieces.len(), components.elapsed());
+    let volumes_started = std::time::Instant::now();
     // Component volumes decide which are solids and which are cavities.
     let mut volumes = Vec::with_capacity(component_count);
     let mut samples = Vec::with_capacity(component_count);
@@ -261,9 +409,10 @@ pub(crate) fn sew_shells(
         }];
         let measures = crate::validator::calculate_exact_shell_measures(&probe, None)
             .ok_or(SewError::Degenerate)?;
-        if !measures.signed_volume.is_finite()
-            || measures.signed_volume.abs() <= precision.min_feature_size.powi(3)
-        {
+        // A component enclosing less than a cubic feature-size is a sliver,
+        // not a solid — the feature floor from the one agreement model.
+        let feature = crate::agreement::Agreement::from(precision).feature();
+        if !measures.signed_volume.is_finite() || measures.signed_volume.abs() <= feature.powi(3) {
             return Err(SewError::Degenerate);
         }
         volumes.push(measures.signed_volume);
@@ -276,6 +425,11 @@ pub(crate) fn sew_shells(
         );
         samples.push(surface_point(sample_face.surface, sample_2d).ok_or(SewError::Inconsistent)?);
     }
+    crate::perf::record(
+        "kernel.sew.volumes",
+        component_count,
+        volumes_started.elapsed(),
+    );
 
     // Assemble shells and solids: positive components own themselves,
     // negative components are cavities of whichever positive component's
@@ -384,11 +538,17 @@ fn without_needless_vertices(pieces: &[SewFace], weld: f64) -> Vec<SewFace> {
         .map(|(face, piece)| SewFace {
             surface: piece.surface,
             role: piece.role,
+            numerical: piece.numerical.clone(),
             loops: piece
                 .loops
                 .iter()
                 .map(|segments| {
                     let mut segments = segments.clone();
+                    // A loop with a traced arc in it keeps every vertex: the
+                    // placeholder lines are not pieces of any carrier.
+                    if piece.has_numerical() {
+                        return segments;
+                    }
                     let mut index = 0;
                     while segments.len() > 2 && index < segments.len() {
                         let next = (index + 1) % segments.len();
@@ -677,17 +837,22 @@ pub(crate) fn ray_face_crossings(
             }
             Some(crossings)
         }
-        Surface::Torus(_)
-        | Surface::Cone(_)
-        | Surface::Sphere(_)
-        | Surface::Ruled(_)
-        | Surface::Bspline(_) => None,
+        // A cone or a sphere is a quadric in the ray parameter, a torus a
+        // quartic; the hits land in the face's parameter space as a
+        // cylinder's do (ADR 0056 B1).
+        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => {
+            let revolved = crate::revolved::Revolved::of(face.surface)?;
+            crate::revolved::ray_face_crossings(revolved, point, direction, guard, &|local| {
+                interior_parity(&loops, local, guard)
+            })
+        }
+        Surface::Ruled(_) | Surface::Bspline(_) => None,
     }
 }
 
 /// Even-odd membership of a 2D point in a face's parameter loops, rejecting
 /// hits within `guard` of any boundary segment.
-fn interior_parity(loops: &[Vec<Segment>], point: Point2, guard: f64) -> Option<usize> {
+pub(crate) fn interior_parity(loops: &[Vec<Segment>], point: Point2, guard: f64) -> Option<usize> {
     for segments in loops {
         for segment in segments {
             if segment_distance(*segment, point) <= guard {
@@ -786,13 +951,12 @@ fn segment_midpoint(segment: Segment) -> Point2 {
 /// accepts.
 fn surface_point(surface: Surface, point: Point2) -> Option<Point3> {
     match surface {
-        Surface::Plane(plane) => Some(plane.evaluate(point)),
-        Surface::Cylinder(cylinder) => Some(cylinder.evaluate(point)),
-        Surface::Torus(_)
+        Surface::Plane(_)
+        | Surface::Cylinder(_)
+        | Surface::Torus(_)
         | Surface::Cone(_)
-        | Surface::Sphere(_)
-        | Surface::Ruled(_)
-        | Surface::Bspline(_) => None,
+        | Surface::Sphere(_) => Some(surface.evaluate(point)),
+        Surface::Ruled(_) | Surface::Bspline(_) => None,
     }
 }
 
@@ -899,6 +1063,12 @@ fn segment_curve(surface: Surface, segment: Segment) -> Option<(Curve3, Paramete
                 ParameterRange::new(section.angle_at(start.x), section.angle_at(end.x)),
             ))
         }
+        // A ring, a meridian, a cone's generator or a pole on a carrier of
+        // revolution (ADR 0056 B1).
+        (
+            Surface::Cone(_) | Surface::Sphere(_) | Surface::Torus(_),
+            Segment::Line { start, end },
+        ) => crate::revolved::line_curve(crate::revolved::Revolved::of(surface)?, start, end),
         // A trace's curve is the pair's canonical reading, which
         // `canonical_trace` builds with its pcurve; nothing reaches here.
         _ => None,

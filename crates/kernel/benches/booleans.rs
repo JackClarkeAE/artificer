@@ -84,6 +84,30 @@ fn booleans(criterion: &mut Criterion) {
             ))
         });
     });
+
+    // Two drilled plates through the general analytic engine, over 10² and
+    // 10³ faces (ADR 0056 R2): the face-extent index turns the per-face
+    // section and overlay passes from O(faces²) toward O(faces).
+    for n in [8_usize, 22] {
+        let first = common::drilled_plate(n);
+        let second = common::second_drilled_plate(n);
+        let faces = first.counts().faces + second.counts().faces;
+        let request = common::boolean_request(&first, &second, BooleanOperation::Union);
+        group.bench_with_input(
+            BenchmarkId::new("drilled_plate_union_faces", faces),
+            &request,
+            |bencher, request| {
+                bencher.iter(|| {
+                    black_box(NativeKernel::execute_boolean(
+                        &first,
+                        &second,
+                        request,
+                        &CancellationToken::new(),
+                    ))
+                });
+            },
+        );
+    }
     group.finish();
 }
 

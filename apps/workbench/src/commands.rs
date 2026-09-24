@@ -31,16 +31,23 @@ pub enum RibbonTab {
     Assembly,
     View,
     Parametric,
+    /// Studies over the model: motion, structural, thermal, and the
+    /// experimental topology optimisation (ADR 0058).
+    Simulation,
+    /// CAM from the history (ADR 0057): a ribbon tab only, like View.
+    Cam,
     Theme,
 }
 
 impl RibbonTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Model,
         Self::Sketch,
         Self::Assembly,
         Self::View,
         Self::Parametric,
+        Self::Simulation,
+        Self::Cam,
         Self::Theme,
     ];
 
@@ -51,7 +58,9 @@ impl RibbonTab {
             Self::Assembly => "Assembly",
             Self::View => "View",
             Self::Parametric => "Parametric",
+            Self::Simulation => "Simulation",
             Self::Theme => "Theme",
+            Self::Cam => "CAM",
         }
     }
 
@@ -72,7 +81,9 @@ impl RibbonTab {
             Self::Assembly => "Assembly ribbon tab",
             Self::View => "View ribbon tab",
             Self::Parametric => "Parametric ribbon tab",
+            Self::Simulation => "Simulation ribbon tab",
             Self::Theme => "Theme ribbon tab",
+            Self::Cam => "CAM ribbon tab",
         }
     }
 }
@@ -104,11 +115,21 @@ pub enum RibbonGroupId {
     ThemeChoice,
     ThemeColours,
     ParametricVariables,
+    /// The studies a Simulation tab runs over the model.
+    SimulationStudies,
+    /// The mechanism's motion under a timeline.
+    SimulationMotion,
+    /// The CAM tab (ADR 0057): plan, simulate, export.
+    CamPlan,
+    CamSimulate,
+    CamExport,
 }
 
 impl RibbonGroupId {
     pub const fn caption(self) -> &'static str {
         match self {
+            Self::SimulationStudies => "STUDIES",
+            Self::SimulationMotion => "TIMELINE",
             Self::Create => "CREATE",
             Self::Place => "PLACE",
             Self::Solid | Self::SketchSolid => "SOLID",
@@ -128,6 +149,9 @@ impl RibbonGroupId {
             Self::ThemeChoice => "THEME",
             Self::ThemeColours => "COLOURS",
             Self::ParametricVariables => "VARIABLES",
+            Self::CamPlan => "PLAN",
+            Self::CamSimulate => "SIMULATE",
+            Self::CamExport => "EXPORT",
         }
     }
 
@@ -135,6 +159,8 @@ impl RibbonGroupId {
     /// two groups may share a caption without colliding.
     pub const fn stable_key(self) -> &'static str {
         match self {
+            Self::SimulationStudies => "group_simulation_studies",
+            Self::SimulationMotion => "group_simulation_motion",
             Self::Create => "group_create",
             Self::Place => "group_place",
             Self::Solid => "group_solid",
@@ -156,6 +182,9 @@ impl RibbonGroupId {
             Self::ThemeChoice => "group_theme_choice",
             Self::ThemeColours => "group_theme_colours",
             Self::ParametricVariables => "group_parametric_variables",
+            Self::CamPlan => "group_cam_plan",
+            Self::CamSimulate => "group_cam_simulate",
+            Self::CamExport => "group_cam_export",
         }
     }
 }
@@ -225,6 +254,18 @@ pub enum ModelCommand {
     NewLengthVariable,
     NewAngleVariable,
     NewFactorVariable,
+    StructuralStudy,
+    ThermalStudy,
+    TopologyStudy,
+    MotionTimeline,
+    /// CAM (ADR 0057): plan the active body, show a section of the card,
+    /// play the simulation, rewind it, export the G-code.
+    AutoCam,
+    CamSetup,
+    CamOperations,
+    CamSimulate,
+    CamRewind,
+    CamExport,
 }
 
 /// Static presentation metadata for one command.
@@ -805,6 +846,55 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         "Switch between the light and dark workbench themes.",
         None,
     ),
+    // ---- Simulation tab --------------------------------------------------
+    command(
+        ModelCommand::StructuralStudy,
+        "simulation.structural",
+        RibbonTab::Simulation,
+        RibbonGroupId::SimulationStudies,
+        CommandIcon::Stress,
+        CommandSize::Large,
+        "Structural",
+        "Structural study",
+        "Hold the active body on some faces, load others, and see where it bends and how hard it is worked: stress as colour, deflection exaggerated on the part. A voxel approximation that says how coarse it is.",
+        None,
+    ),
+    command(
+        ModelCommand::ThermalStudy,
+        "simulation.thermal",
+        RibbonTab::Simulation,
+        RibbonGroupId::SimulationStudies,
+        CommandIcon::Thermal,
+        CommandSize::Large,
+        "Thermal",
+        "Thermal study",
+        "Hold faces of the active body at temperatures, let the rest lose heat to the air, and see the steady temperature as colour on the part. The same voxel grid as the structural study.",
+        None,
+    ),
+    command(
+        ModelCommand::TopologyStudy,
+        "simulation.topology",
+        RibbonTab::Simulation,
+        RibbonGroupId::SimulationStudies,
+        CommandIcon::Optimise,
+        CommandSize::Large,
+        "Optimise",
+        "Topology optimisation (experimental)",
+        "Experimental: carve the active body down to a fraction of its volume that carries the structural study's loads best, watching the material melt away iteration by iteration. Nothing is written back to the model.",
+        None,
+    ),
+    command(
+        ModelCommand::MotionTimeline,
+        "simulation.timeline",
+        RibbonTab::Simulation,
+        RibbonGroupId::SimulationMotion,
+        CommandIcon::Timeline,
+        CommandSize::Large,
+        "Timeline",
+        "Motion timeline",
+        "Scrub the mechanism through its motion, play it at a speed, and measure the clearance at every frame: the frame two parts first meet is flagged on the part and on the plot.",
+        None,
+    ),
     // ---- Theme tab -------------------------------------------------------
     command(
         ModelCommand::ThemeLight,
@@ -903,6 +993,79 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         "Create a named dimensionless factor for scaling other variables.",
         None,
     ),
+    // ---- CAM tab ---------------------------------------------------------
+    command(
+        ModelCommand::AutoCam,
+        "cam.auto",
+        RibbonTab::Cam,
+        RibbonGroupId::CamPlan,
+        CommandIcon::Cam,
+        CommandSize::Large,
+        "Auto-CAM",
+        "Auto-CAM",
+        "Decide whether the active body is turned or milled, choose stock, tools and operations, generate toolpaths, post G-code and simulate it. Stages a plan; confirm to keep it.",
+        None,
+    ),
+    command(
+        ModelCommand::CamSetup,
+        "cam.setup",
+        RibbonTab::Cam,
+        RibbonGroupId::CamPlan,
+        CommandIcon::Plane,
+        CommandSize::Small,
+        "Setup",
+        "CAM setup",
+        "Show what Auto-CAM decided: the machine, the stock, the work origin and the allowances, which can be changed.",
+        None,
+    ),
+    command(
+        ModelCommand::CamOperations,
+        "cam.operations",
+        RibbonTab::Cam,
+        RibbonGroupId::CamPlan,
+        CommandIcon::History,
+        CommandSize::Small,
+        "Operations",
+        "CAM operations",
+        "Show the operation list with each one's tool, feeds and time; move an operation earlier or later.",
+        None,
+    ),
+    command(
+        ModelCommand::CamSimulate,
+        "cam.simulate",
+        RibbonTab::Cam,
+        RibbonGroupId::CamSimulate,
+        CommandIcon::Play,
+        CommandSize::Large,
+        "Simulate",
+        "Simulate machining",
+        "Play the posted G-code against the stock: the tool takes material off the billet until the stock is the part. Press again to pause.",
+        None,
+    ),
+    command(
+        ModelCommand::CamRewind,
+        "cam.rewind",
+        RibbonTab::Cam,
+        RibbonGroupId::CamSimulate,
+        CommandIcon::Rewind,
+        CommandSize::Small,
+        "Rewind",
+        "Rewind simulation",
+        "Put the simulation back to the untouched stock at time zero.",
+        None,
+    ),
+    command(
+        ModelCommand::CamExport,
+        "cam.export",
+        RibbonTab::Cam,
+        RibbonGroupId::CamExport,
+        CommandIcon::Export,
+        CommandSize::Large,
+        "G-code",
+        "Export G-code",
+        "Write the confirmed plan's G-code to a file in the LinuxCNC/Fanuc dialect, one file for the setup.",
+        None,
+    ),
 ];
 
 /// The commands of one tab, grouped in registry order.
@@ -928,6 +1091,15 @@ pub fn groups_for_tab(tab: RibbonTab) -> Vec<(RibbonGroupId, Vec<&'static Comman
         // another once several are on screen — and it is a picker rather than
         // a command, so the group carries no members and the ribbon fills it.
         groups.push((RibbonGroupId::BodyAppearance, Vec::new()));
+    }
+    // A study is set up by picking the faces it holds and loads, so the
+    // Select group rides along on the Simulation tab too.
+    if tab == RibbonTab::Simulation {
+        groups.extend(
+            groups_for_tab(RibbonTab::Model)
+                .into_iter()
+                .filter(|(group, _)| *group == RibbonGroupId::Select),
+        );
     }
     groups
 }

@@ -125,10 +125,12 @@ fn every_built_step_names_its_rung_and_tier() {
 }
 
 #[test]
-fn a_faceted_step_marks_the_body_approximate() {
+fn an_approximate_step_marks_the_body_approximate() {
     // A hole drilled through a blended rim leaves the exact ladder — the
     // blend's torus meets the hole off its axis — and the report says so on
-    // the step and on the body.
+    // the step and on the body. Since ADR 0056 Track B the numerical
+    // intersection rung answers it, an approximation of its own kind: the
+    // body keeps its torus, and the step carries the rung's own label.
     let source = include_str!("../examples/blend_then_drill.art");
     let mut session = Session::new();
     let outcome = session.run_script(source, &BTreeMap::new(), &CancellationToken::default());
@@ -140,33 +142,31 @@ fn a_faceted_step_marks_the_body_approximate() {
         .filter(|step| step.tier == Tier::Approximate)
         .map(|step| step.label.as_str())
         .collect();
-    assert!(!approximate.is_empty(), "the crossing cut is faceted");
+    assert_eq!(
+        approximate,
+        vec!["rim_hole"],
+        "the crossing cut is approximate"
+    );
     for step in report
         .steps
         .iter()
         .filter(|step| step.tier == Tier::Approximate)
     {
-        assert!(
-            step.rung
-                .as_deref()
-                .is_some_and(|rung| rung.ends_with("/faceted")),
-            "{:?}",
-            step.rung
-        );
+        assert_eq!(step.rung.as_deref(), Some("face-feature/numerical-boolean"));
         assert!(
             step.warnings
                 .iter()
-                .any(|warning| warning.code.ends_with("_FACETED_APPROXIMATION"))
+                .any(|warning| warning.code == "BOOLEAN_INTERSECTION_APPROXIMATED")
         );
     }
     assert_eq!(report.tier, Tier::Approximate);
     let body = report.body.as_ref().unwrap();
     assert_eq!(body.tier, Tier::Approximate);
     assert_eq!(body.approximate_feature_count as usize, approximate.len());
-    assert_eq!(
-        body.surfaces.total(),
-        body.surfaces.planes,
-        "facets are planes"
+    assert!(
+        body.surfaces.tori >= 1,
+        "the body keeps its analytic carriers: {:?}",
+        body.surfaces
     );
 }
 
@@ -490,9 +490,16 @@ fn the_schema_lists_every_diagnostic_code_the_kernel_can_emit() {
             } else if path
                 .file_name()
                 .is_some_and(|name| name == "step_export.rs")
+                || (path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .is_some_and(|name| name == "step_import")
+                    && path.file_name().is_some_and(|name| name != "mod.rs"))
             {
-                // The STEP writer's upper-case literals are entity type
-                // names in the file it writes, not diagnostic codes.
+                // The STEP writer's and reader's upper-case literals are
+                // entity type names in the files they write and read, not
+                // diagnostic codes; the reader keeps its codes in `mod.rs`,
+                // which is scanned.
                 continue;
             } else if path.extension().is_some_and(|extension| extension == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();

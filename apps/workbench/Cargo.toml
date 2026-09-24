@@ -15,12 +15,14 @@ perf-spans = ["artificer-compute/perf-spans"]
 [dependencies]
 eframe.workspace = true
 egui.workspace = true
+artificer-cam = { path = "../../crates/cam" }
 artificer-catalog = { path = "../../crates/catalog" }
 artificer-compute = { path = "../../crates/compute" }
 artificer-geometry = { path = "../../crates/geometry" }
 artificer-kernel = { path = "../../crates/kernel" }
 artificer-protocol = { path = "../../crates/protocol" }
 artificer-model = { path = "../../crates/model" }
+artificer-sim = { path = "../../crates/sim" }
 artificer-sketch = { path = "../../crates/sketch" }
 artificer-sketch-ui = { path = "../../crates/sketch-ui" }
 artificer-spacemouse = { path = "../../crates/spacemouse" }

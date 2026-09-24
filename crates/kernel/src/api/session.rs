@@ -8,7 +8,8 @@ use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,
     ExecuteRequest, KernelCommand, LoftOperation, LoftSection, OperationReport, PlanarAxis2,
     PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3,
-    PrecisionPolicy, RequestId, RevolveAngle, SnapshotId, SolidOperation, Tier, Vector3,
+    PrecisionPolicy, RequestId, RevolveAngle, SnapshotId, SolidOperation, StitchRequest, Tier,
+    Vector3,
 };
 
 use artificer_protocol::FaceExtrusionOperation;
@@ -113,6 +114,42 @@ impl Session {
         self.execute_recorded(command, token, true)
     }
 
+    /// Reads a STEP file at `path` into a new body under `label` (ADR 0056,
+    /// Track I): the file is read now and each time the journal replays.
+    pub fn import_step(
+        &mut self,
+        label: impl Into<String>,
+        path: impl Into<String>,
+        token: &CancellationToken,
+    ) -> Result<CommandResult, ApiError> {
+        self.execute(
+            ApiCommand::ImportStep {
+                label: label.into(),
+                path: path.into(),
+                text: None,
+            },
+            token,
+        )
+    }
+
+    /// Reads STEP text into a new body under `label`; the text travels in
+    /// the journal, so the step replays without the file.
+    pub fn import_step_text(
+        &mut self,
+        label: impl Into<String>,
+        text: impl Into<String>,
+        token: &CancellationToken,
+    ) -> Result<CommandResult, ApiError> {
+        self.execute(
+            ApiCommand::ImportStep {
+                label: label.into(),
+                path: String::new(),
+                text: Some(text.into()),
+            },
+            token,
+        )
+    }
+
     /// Executes one command. With `record`, the step is journaled and can
     /// be undone; without it, the step is an instance of a feature pattern,
     /// committed under the pattern's journal entry.
@@ -164,6 +201,7 @@ impl Session {
                 BooleanOperation::Intersection,
                 token,
             )?,
+            ApiCommand::Stitch { sheets, .. } => self.execute_stitch(sheets, token)?,
             _ => {
                 let kernel_cmd = self.lower_command(&command)?;
                 // A command that starts a body of its own runs from an empty
@@ -239,10 +277,24 @@ impl Session {
                 step_label,
                 outcome.snapshot.id(),
                 outcome.snapshot.counts(),
-                if tier == Tier::Approximate {
-                    " Approximate: the faceted tier built this step."
-                } else {
+                if tier != Tier::Approximate {
                     ""
+                } else if outcome
+                    .report
+                    .rung
+                    .as_deref()
+                    .is_some_and(|rung| rung.ends_with("/approximate"))
+                {
+                    " Approximate: an approximated surface built this step."
+                } else if outcome
+                    .report
+                    .rung
+                    .as_deref()
+                    .is_some_and(|rung| rung.contains("numerical"))
+                {
+                    " Approximate: the numerical intersection rung built this step."
+                } else {
+                    " Approximate: the faceted tier built this step."
                 }
             ),
         };
@@ -659,7 +711,12 @@ impl Session {
     /// current one.
     fn starts_new_body(command: &ApiCommand) -> bool {
         match command {
-            ApiCommand::MakeBox { .. } | ApiCommand::MakeCylinder { .. } => true,
+            ApiCommand::MakeBox { .. }
+            | ApiCommand::MakeCylinder { .. }
+            | ApiCommand::SurfaceExtrude { .. }
+            | ApiCommand::SurfaceRevolve { .. }
+            | ApiCommand::Patch { .. }
+            | ApiCommand::ImportStep { .. } => true,
             ApiCommand::Extrude { operation, .. }
             | ApiCommand::Revolve { operation, .. }
             | ApiCommand::Loft { operation, .. } => *operation == ExtrudeOp::New,
@@ -765,8 +822,51 @@ impl Session {
             .map_err(ApiError::from)
     }
 
+    /// Stitches the sheets the named steps left, in the order given.
+    fn execute_stitch(
+        &self,
+        sheets: &[StepLabel],
+        token: &CancellationToken,
+    ) -> Result<ExecutionOutcome, ApiError> {
+        let mut snapshots = Vec::with_capacity(sheets.len());
+        for step in sheets {
+            let id = self.step_snapshots.get(&step.0).copied().ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::SelectorNotFound,
+                    format!("Step \"{}\" not found in session history", step.0),
+                )
+            })?;
+            let snapshot = self.snapshot_cache.get(&id).ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::SessionError,
+                    format!("Snapshot {id} for step \"{}\" not found in cache", step.0),
+                )
+            })?;
+            snapshots.push(snapshot);
+        }
+        let request = StitchRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id: RequestId::new("session::stitch"),
+            expected_snapshots: snapshots.iter().map(|snapshot| snapshot.id()).collect(),
+            precision: self.precision,
+        };
+        NativeKernel::stitch_sheets(&snapshots, &request, token).map_err(ApiError::from)
+    }
+
     fn lower_command(&self, cmd: &ApiCommand) -> Result<KernelCommand, ApiError> {
         match cmd {
+            ApiCommand::ImportStep { path, text, .. } => {
+                let text = match text {
+                    Some(text) => text.clone(),
+                    None => std::fs::read_to_string(path).map_err(|error| {
+                        ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            format!("The STEP file \"{path}\" could not be read: {error}"),
+                        )
+                    })?,
+                };
+                Ok(KernelCommand::ImportStep { text })
+            }
             ApiCommand::MakeBox { origin, size, .. } => Ok(KernelCommand::MakeCuboid {
                 origin: *origin,
                 size_x: size[0],
@@ -1009,51 +1109,14 @@ impl Session {
                     Some(placement) => &self.placed_axis(placement)?,
                     None => &(*axis_origin, *axis_direction),
                 };
-                // A full turn, or a partial one measured right-handed about
-                // the axis direction; a negative angle turns the other way.
-                let angle = if (angle_degrees.abs() - 360.0).abs() <= 1.0e-9 {
-                    RevolveAngle::FullTurn
-                } else if angle_degrees.is_finite() && angle_degrees.abs() < 360.0 {
-                    let sweep = angle_degrees.abs().to_radians();
-                    RevolveAngle::partial(if *angle_degrees < 0.0 { -sweep } else { 0.0 }, sweep)
-                } else {
-                    return Err(ApiError::new(
-                        ApiErrorCode::InvalidInput,
-                        "A revolve turns through at most 360 degrees either way",
-                    ));
-                };
+                let angle = revolve_angle(*angle_degrees)?;
                 let (frame, profile) = self.build_sketch_profile(sketch)?;
                 let profile = select_regions(profile, regions)?;
-                // The axis must lie in the sketch plane: project its origin
-                // and direction into the frame and refuse anything that
-                // leaves it.
-                let relative = Vector3::new(
-                    axis_origin.x - frame.origin.x,
-                    axis_origin.y - frame.origin.y,
-                    axis_origin.z - frame.origin.z,
-                );
-                let normal = Vector3::new(
-                    frame.u.y * frame.v.z - frame.u.z * frame.v.y,
-                    frame.u.z * frame.v.x - frame.u.x * frame.v.z,
-                    frame.u.x * frame.v.y - frame.u.y * frame.v.x,
-                );
-                let dot = |a: Vector3, b: Vector3| a.x * b.x + a.y * b.y + a.z * b.z;
-                let off_plane = dot(relative, normal).abs() + dot(*axis_direction, normal).abs();
-                if off_plane > 1.0e-9 {
-                    return Err(ApiError::new(
-                        ApiErrorCode::InvalidInput,
-                        "The revolve axis must lie in the sketch plane",
-                    ));
-                }
-                let start = Point2::new(dot(relative, frame.u), dot(relative, frame.v));
-                let end = Point2::new(
-                    start.x + dot(*axis_direction, frame.u),
-                    start.y + dot(*axis_direction, frame.v),
-                );
+                let axis = axis_in_frame(frame, *axis_origin, *axis_direction)?;
                 Ok(KernelCommand::RevolvePlanarProfile {
                     frame,
                     profile,
-                    axis: PlanarAxis2 { start, end },
+                    axis,
                     angle,
                     operation: match operation {
                         ExtrudeOp::New => SolidOperation::New,
@@ -1062,9 +1125,64 @@ impl Session {
                     },
                 })
             }
+            ApiCommand::SurfaceExtrude {
+                sketch, distance, ..
+            } => {
+                let (frame, chain) = self.build_sketch_chain(sketch)?;
+                Ok(KernelCommand::SurfaceExtrude {
+                    frame,
+                    chain,
+                    distance: *distance,
+                })
+            }
+            ApiCommand::SurfaceRevolve {
+                sketch,
+                axis_origin,
+                axis_direction,
+                angle_degrees,
+                axis_placement,
+                ..
+            } => {
+                let (axis_origin, axis_direction) = match axis_placement {
+                    Some(placement) => self.placed_axis(placement)?,
+                    None => (*axis_origin, *axis_direction),
+                };
+                let angle = revolve_angle(*angle_degrees)?;
+                let (frame, chain) = self.build_sketch_chain(sketch)?;
+                let axis = axis_in_frame(frame, axis_origin, axis_direction)?;
+                Ok(KernelCommand::SurfaceRevolve {
+                    frame,
+                    chain,
+                    axis,
+                    angle,
+                })
+            }
+            ApiCommand::Patch {
+                sketch, regions, ..
+            } => {
+                let (frame, profile) = self.build_sketch_profile(sketch)?;
+                let profile = select_regions(profile, regions)?;
+                Ok(KernelCommand::PlanarPatch { frame, profile })
+            }
+            ApiCommand::Thicken { thickness, .. } => Ok(KernelCommand::ThickenSheet {
+                thickness: *thickness,
+            }),
+            ApiCommand::Trim { plane, .. } => {
+                let frame = self.sketch_frame(plane)?;
+                let (u, v) = (frame.u, frame.v);
+                Ok(KernelCommand::TrimSheetByPlane {
+                    plane_origin: frame.origin,
+                    plane_normal: Vector3::new(
+                        u.y * v.z - u.z * v.y,
+                        u.z * v.x - u.x * v.z,
+                        u.x * v.y - u.y * v.x,
+                    ),
+                })
+            }
             ApiCommand::BooleanUnion { .. }
             | ApiCommand::BooleanDifference { .. }
             | ApiCommand::BooleanIntersection { .. }
+            | ApiCommand::Stitch { .. }
             | ApiCommand::FeaturePattern { .. } => unreachable!("handled in execute()"),
         }
     }
@@ -1115,63 +1233,7 @@ impl Session {
     ) -> Result<(PlanarFrame3, PlanarProfile2), ApiError> {
         match self.sketch_command(sketch)? {
             ApiCommand::Sketch { on, entities, .. } => {
-                let frame = match on {
-                    SketchPlane::XY => PlanarFrame3 {
-                        origin: Point3::new(0.0, 0.0, 0.0),
-                        u: Vector3::new(1.0, 0.0, 0.0),
-                        v: Vector3::new(0.0, 1.0, 0.0),
-                    },
-                    SketchPlane::XZ => PlanarFrame3 {
-                        origin: Point3::new(0.0, 0.0, 0.0),
-                        u: Vector3::new(1.0, 0.0, 0.0),
-                        v: Vector3::new(0.0, 0.0, 1.0),
-                    },
-                    SketchPlane::YZ => PlanarFrame3 {
-                        origin: Point3::new(0.0, 0.0, 0.0),
-                        u: Vector3::new(0.0, 1.0, 0.0),
-                        v: Vector3::new(0.0, 0.0, 1.0),
-                    },
-                    SketchPlane::OnFace { face: face_sel } => {
-                        let face_ref = resolve_selector(
-                            face_sel,
-                            &self.snapshot,
-                            &self.step_order,
-                            &self.step_reports,
-                        )?;
-                        let support = NativeKernel::planar_face_support(&self.snapshot, face_ref)
-                            .map_err(ApiError::from)?;
-                        support.frame
-                    }
-                    SketchPlane::Frame { frame } => *frame,
-                    SketchPlane::OffsetFace { face, offset, flip } => {
-                        let face = self.planar_face_frame(face)?;
-                        planes::placed(face, *offset, *flip)?
-                    }
-                    SketchPlane::Midplane {
-                        first,
-                        second,
-                        offset,
-                        flip,
-                    } => {
-                        let middle = planes::midplane(
-                            self.planar_face_frame(first)?,
-                            self.planar_face_frame(second)?,
-                        )?;
-                        planes::placed(middle, *offset, *flip)?
-                    }
-                    SketchPlane::ThroughEdge {
-                        edge,
-                        face,
-                        angle_degrees,
-                        offset,
-                        flip,
-                    } => {
-                        let hinge = self.straight_edge_on_face(edge, face.as_deref())?;
-                        let turned = planes::through_edge(hinge, *angle_degrees)?;
-                        planes::placed(turned, *offset, *flip)?
-                    }
-                };
-
+                let frame = self.sketch_frame(on)?;
                 let loops = sketch_loops(entities)?;
                 let profile = nest_loops(loops)?;
                 Ok((frame, profile))
@@ -1181,6 +1243,86 @@ impl Session {
                 "Target step is not a Sketch",
             )),
         }
+    }
+
+    /// A sketch's entities as one chain of lines and arcs, open or closed,
+    /// for a surface extrusion or revolve (ADR 0056, Track S).
+    fn build_sketch_chain(
+        &self,
+        sketch: &crate::api::commands::StepLabel,
+    ) -> Result<(PlanarFrame3, Vec<PlanarCurve2>), ApiError> {
+        match self.sketch_command(sketch)? {
+            ApiCommand::Sketch { on, entities, .. } => {
+                let frame = self.sketch_frame(on)?;
+                let chain = sketch_chain(entities)?;
+                Ok((frame, chain))
+            }
+            _ => Err(ApiError::new(
+                ApiErrorCode::InvalidInput,
+                "Target step is not a Sketch",
+            )),
+        }
+    }
+
+    /// The frame a sketch plane names, resolved against the body as it
+    /// now stands.
+    fn sketch_frame(&self, on: &SketchPlane) -> Result<PlanarFrame3, ApiError> {
+        Ok(match on {
+            SketchPlane::XY => PlanarFrame3 {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                u: Vector3::new(1.0, 0.0, 0.0),
+                v: Vector3::new(0.0, 1.0, 0.0),
+            },
+            SketchPlane::XZ => PlanarFrame3 {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                u: Vector3::new(1.0, 0.0, 0.0),
+                v: Vector3::new(0.0, 0.0, 1.0),
+            },
+            SketchPlane::YZ => PlanarFrame3 {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                u: Vector3::new(0.0, 1.0, 0.0),
+                v: Vector3::new(0.0, 0.0, 1.0),
+            },
+            SketchPlane::OnFace { face: face_sel } => {
+                let face_ref = resolve_selector(
+                    face_sel,
+                    &self.snapshot,
+                    &self.step_order,
+                    &self.step_reports,
+                )?;
+                let support = NativeKernel::planar_face_support(&self.snapshot, face_ref)
+                    .map_err(ApiError::from)?;
+                support.frame
+            }
+            SketchPlane::Frame { frame } => *frame,
+            SketchPlane::OffsetFace { face, offset, flip } => {
+                let face = self.planar_face_frame(face)?;
+                planes::placed(face, *offset, *flip)?
+            }
+            SketchPlane::Midplane {
+                first,
+                second,
+                offset,
+                flip,
+            } => {
+                let middle = planes::midplane(
+                    self.planar_face_frame(first)?,
+                    self.planar_face_frame(second)?,
+                )?;
+                planes::placed(middle, *offset, *flip)?
+            }
+            SketchPlane::ThroughEdge {
+                edge,
+                face,
+                angle_degrees,
+                offset,
+                flip,
+            } => {
+                let hinge = self.straight_edge_on_face(edge, face.as_deref())?;
+                let turned = planes::through_edge(hinge, *angle_degrees)?;
+                planes::placed(turned, *offset, *flip)?
+            }
+        })
     }
 
     /// The line an `axis(...)` placed by the body names, as the body now
@@ -1919,6 +2061,266 @@ fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, Api
         ));
     }
     Ok(loops)
+}
+
+/// A sketch's lines and arcs as one chain joined end to end, open or
+/// closed, in the order and direction they chain from the first entity
+/// drawn; a lone circle or rectangle is a closed chain of its own.
+fn sketch_chain(entities: &[SketchEntity]) -> Result<Vec<PlanarCurve2>, ApiError> {
+    const JOIN: f64 = 1.0e-9;
+    let mut open = Vec::new();
+    let mut closed = Vec::new();
+    for entity in entities {
+        match entity {
+            SketchEntity::Circle { center, radius } => closed.push(vec![PlanarCurve2::Circle {
+                center: *center,
+                radius: *radius,
+                direction: ArcDirection::CounterClockwise,
+            }]),
+            SketchEntity::Rectangle {
+                origin,
+                width,
+                height,
+            } => {
+                let corners = [
+                    *origin,
+                    Point2::new(origin.x + width, origin.y),
+                    Point2::new(origin.x + width, origin.y + height),
+                    Point2::new(origin.x, origin.y + height),
+                ];
+                closed.push(
+                    (0..4)
+                        .map(|index| PlanarCurve2::Line {
+                            start: corners[index],
+                            end: corners[(index + 1) % 4],
+                        })
+                        .collect(),
+                );
+            }
+            SketchEntity::Line { start, end } => open.push(PlanarCurve2::Line {
+                start: *start,
+                end: *end,
+            }),
+            SketchEntity::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } => open.push(PlanarCurve2::CircularArc {
+                center: *center,
+                start: Point2::new(
+                    center.x + radius * start_angle.cos(),
+                    center.y + radius * start_angle.sin(),
+                ),
+                end: Point2::new(
+                    center.x + radius * end_angle.cos(),
+                    center.y + radius * end_angle.sin(),
+                ),
+                direction: ArcDirection::CounterClockwise,
+            }),
+            // A closed spline is a chain of its own; an open one joins the
+            // lines and arcs it meets end to end.
+            SketchEntity::Spline { .. } | SketchEntity::ControlSpline { .. } => {
+                if let Some((curve, is_closed)) = entity_spline(entity)? {
+                    if is_closed {
+                        closed.push(vec![curve]);
+                    } else {
+                        open.push(curve);
+                    }
+                }
+            }
+        }
+    }
+    match (closed.len(), open.is_empty()) {
+        (1, true) => return Ok(closed.remove(0)),
+        (0, false) => {}
+        _ => {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidInput,
+                "A surface is swept from one chain: lines, arcs and splines joined end to end, or one circle, rectangle or closed spline on its own",
+            ));
+        }
+    }
+    let endpoints = |curve: &PlanarCurve2| -> (Point2, Point2) {
+        match curve {
+            PlanarCurve2::Line { start, end } | PlanarCurve2::CircularArc { start, end, .. } => {
+                (*start, *end)
+            }
+            PlanarCurve2::Circle { center, .. } => (*center, *center),
+            PlanarCurve2::Bspline { control_points, .. } => (
+                control_points.first().copied().unwrap_or_default(),
+                control_points.last().copied().unwrap_or_default(),
+            ),
+        }
+    };
+    let near = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= JOIN;
+    let reversed = |curve: &PlanarCurve2| -> PlanarCurve2 {
+        match curve {
+            PlanarCurve2::Line { start, end } => PlanarCurve2::Line {
+                start: *end,
+                end: *start,
+            },
+            PlanarCurve2::CircularArc {
+                center,
+                start,
+                end,
+                direction,
+            } => PlanarCurve2::CircularArc {
+                center: *center,
+                start: *end,
+                end: *start,
+                direction: match direction {
+                    ArcDirection::CounterClockwise => ArcDirection::Clockwise,
+                    ArcDirection::Clockwise => ArcDirection::CounterClockwise,
+                },
+            },
+            // The same locus walked the other way: the control points in
+            // reverse, on the knots reflected in the middle of the domain,
+            // with the ends kept exact.
+            PlanarCurve2::Bspline {
+                degree,
+                control_points,
+                knots,
+                weights,
+            } => {
+                let (first, last) = (
+                    knots.first().copied().unwrap_or(0.0),
+                    knots.last().copied().unwrap_or(1.0),
+                );
+                let count = knots.len();
+                PlanarCurve2::Bspline {
+                    degree: *degree,
+                    control_points: control_points.iter().rev().copied().collect(),
+                    knots: knots
+                        .iter()
+                        .rev()
+                        .enumerate()
+                        .map(|(index, knot)| {
+                            if index <= *degree {
+                                first
+                            } else if index + degree + 1 >= count {
+                                last
+                            } else {
+                                first + last - knot
+                            }
+                        })
+                        .collect(),
+                    weights: weights
+                        .as_ref()
+                        .map(|weights| weights.iter().rev().copied().collect()),
+                }
+            }
+            other => other.clone(),
+        }
+    };
+    // Grow the chain from the first entity: forward from its end while a
+    // piece continues it, then backward from its start.
+    let first = open.remove(0);
+    let mut chain = std::collections::VecDeque::from([first]);
+    loop {
+        let (_, cursor) = endpoints(chain.back().unwrap());
+        let next = open.iter().position(|candidate| {
+            let (start, end) = endpoints(candidate);
+            near(start, cursor) || near(end, cursor)
+        });
+        let Some(index) = next else { break };
+        let candidate = open.remove(index);
+        let (start, _) = endpoints(&candidate);
+        let mut oriented = if near(start, cursor) {
+            candidate
+        } else {
+            reversed(&candidate)
+        };
+        set_endpoint(&mut oriented, true, cursor);
+        chain.push_back(oriented);
+    }
+    loop {
+        let (cursor, _) = endpoints(chain.front().unwrap());
+        let previous = open.iter().position(|candidate| {
+            let (start, end) = endpoints(candidate);
+            near(start, cursor) || near(end, cursor)
+        });
+        let Some(index) = previous else { break };
+        let candidate = open.remove(index);
+        let (_, end) = endpoints(&candidate);
+        let mut oriented = if near(end, cursor) {
+            candidate
+        } else {
+            reversed(&candidate)
+        };
+        set_endpoint(&mut oriented, false, cursor);
+        chain.push_front(oriented);
+    }
+    if !open.is_empty() {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidInput,
+            "The sketch has more than one chain; a surface is swept from one chain of lines and arcs joined end to end",
+        ));
+    }
+    let mut chain: Vec<PlanarCurve2> = chain.into();
+    // A chain that comes back to where it started closes exactly.
+    if chain.len() > 1 {
+        let (start, _) = endpoints(&chain[0]);
+        let (_, end) = endpoints(chain.last().unwrap());
+        if near(end, start) {
+            let last = chain.len() - 1;
+            set_endpoint(&mut chain[last], false, start);
+        }
+    }
+    Ok(chain)
+}
+
+/// A revolve's angle in degrees as the kernel's: a full turn, or a partial
+/// one measured right-handed about the axis direction, a negative angle
+/// turning the other way.
+fn revolve_angle(angle_degrees: f64) -> Result<RevolveAngle, ApiError> {
+    if (angle_degrees.abs() - 360.0).abs() <= 1.0e-9 {
+        Ok(RevolveAngle::FullTurn)
+    } else if angle_degrees.is_finite() && angle_degrees.abs() < 360.0 {
+        let sweep = angle_degrees.abs().to_radians();
+        Ok(RevolveAngle::partial(
+            if angle_degrees < 0.0 { -sweep } else { 0.0 },
+            sweep,
+        ))
+    } else {
+        Err(ApiError::new(
+            ApiErrorCode::InvalidInput,
+            "A revolve turns through at most 360 degrees either way",
+        ))
+    }
+}
+
+/// An axis in space as the sketch frame's own, refused when it leaves the
+/// sketch plane.
+fn axis_in_frame(
+    frame: PlanarFrame3,
+    axis_origin: Point3,
+    axis_direction: Vector3,
+) -> Result<PlanarAxis2, ApiError> {
+    let relative = Vector3::new(
+        axis_origin.x - frame.origin.x,
+        axis_origin.y - frame.origin.y,
+        axis_origin.z - frame.origin.z,
+    );
+    let normal = Vector3::new(
+        frame.u.y * frame.v.z - frame.u.z * frame.v.y,
+        frame.u.z * frame.v.x - frame.u.x * frame.v.z,
+        frame.u.x * frame.v.y - frame.u.y * frame.v.x,
+    );
+    let dot = |a: Vector3, b: Vector3| a.x * b.x + a.y * b.y + a.z * b.z;
+    let off_plane = dot(relative, normal).abs() + dot(axis_direction, normal).abs();
+    if off_plane > 1.0e-9 {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidInput,
+            "The revolve axis must lie in the sketch plane",
+        ));
+    }
+    let start = Point2::new(dot(relative, frame.u), dot(relative, frame.v));
+    let end = Point2::new(
+        start.x + dot(axis_direction, frame.u),
+        start.y + dot(axis_direction, frame.v),
+    );
+    Ok(PlanarAxis2 { start, end })
 }
 
 /// A polygon that follows a loop closely enough to decide containment.

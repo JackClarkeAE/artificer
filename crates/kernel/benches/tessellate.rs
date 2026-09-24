@@ -36,6 +36,20 @@ fn tessellate(criterion: &mut Criterion) {
     group.bench_function("display_prism_256", |bencher| {
         bencher.iter(|| black_box(NativeKernel::debug_scene(&prism)));
     });
+
+    // Display tessellation of a 10²-face drilled plate (ADR 0056 R2). It
+    // stops at 10² because a face with hundreds of holes tessellates in
+    // quadratic time today (the hole-stitching in
+    // `triangulate_face_boundaries`, a finding of this track): a 10³-face
+    // plate's display scene is tens of seconds, too long for a bench sample.
+    let plate = common::drilled_plate(8);
+    group.bench_with_input(
+        criterion::BenchmarkId::new("display_drilled_plate_faces", plate.counts().faces),
+        &plate,
+        |bencher, plate| {
+            bencher.iter(|| black_box(NativeKernel::debug_scene(plate)));
+        },
+    );
     group.finish();
 }
 

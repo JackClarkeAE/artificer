@@ -77,15 +77,24 @@ pub(crate) fn profile_boolean_multi(
     let tolerances = Tolerances::from(precision);
     let first_loops = oriented_loop_sets(first, tolerances)?;
     let second_loops = oriented_loop_sets(second, tolerances)?;
+    let segments = first_loops.iter().chain(&second_loops).map(Vec::len).sum();
+    let imprint = std::time::Instant::now();
 
     // Imprint: every cross-operand segment pair contributes its crossings to
     // both sides' cut lists, sharing the exact intersection points.
     let mut first_cuts = cut_lists(&first_loops);
     let mut second_cuts = cut_lists(&second_loops);
+    // A grid over the second operand's segments, so a segment of the first
+    // is imprinted against the few second segments its box reaches rather
+    // than all of them. Two segments whose boxes are disjoint neither cross,
+    // touch, nor share a carrier stretch, so skipping the pair changes no
+    // cut; below the grid's threshold every pair is still visited.
+    let grid = SegmentGrid::new(&second_loops);
     for (loop_a, segments_a) in first_loops.iter().enumerate() {
         for (index_a, segment_a) in segments_a.iter().enumerate() {
-            for (loop_b, segments_b) in second_loops.iter().enumerate() {
-                for (index_b, segment_b) in segments_b.iter().enumerate() {
+            for (loop_b, index_b) in grid.candidates(segment_bounds(*segment_a)) {
+                let segment_b = &second_loops[loop_b][index_b];
+                {
                     let crossings = match segment_crossings(*segment_a, *segment_b, tolerances) {
                         Ok(crossings) => crossings,
                         Err(refusal) => {
@@ -137,6 +146,13 @@ pub(crate) fn profile_boolean_multi(
         }
     }
 
+    crate::perf::record(
+        "kernel.profile_boolean.imprint",
+        segments,
+        imprint.elapsed(),
+    );
+    let classify = std::time::Instant::now();
+
     // Split, classify, and select.
     let first_wrapped = wrap_loops(&first_loops);
     let second_wrapped = wrap_loops(&second_loops);
@@ -159,6 +175,11 @@ pub(crate) fn profile_boolean_multi(
         tolerances,
         &mut pieces,
     )?;
+    crate::perf::record(
+        "kernel.profile_boolean.classify",
+        segments,
+        classify.elapsed(),
+    );
     if pieces.is_empty() {
         return Err(ProfileBooleanError::EmptyResult);
     }
@@ -170,9 +191,11 @@ pub(crate) fn profile_boolean_multi(
     // crossing where one of them ends — a tangential touch rather than a
     // transverse cut — produce exactly that: the crossing is a vertex of one
     // and an endpoint of the other, and the chain dead-ends between them.
-    let pieces = weld_piece_endpoints(pieces, tolerances);
-    let loops = chain_pieces(pieces)?;
-    nest_loops(loops, tolerances)
+    crate::perf::stage("kernel.profile_boolean.chain", segments, || {
+        let pieces = weld_piece_endpoints(pieces, tolerances);
+        let loops = chain_pieces(pieces)?;
+        nest_loops(loops, tolerances)
+    })
 }
 
 /// The first operand's loops — welded, oriented, and split at every
@@ -190,17 +213,17 @@ pub(crate) fn imprinted_first_loops(
     let first_loops = oriented_loops(first, tolerances)?;
     let second_loops = oriented_loops(second, tolerances)?;
     let mut first_cuts = cut_lists(&first_loops);
+    let grid = SegmentGrid::new(&second_loops);
     for (loop_a, segments_a) in first_loops.iter().enumerate() {
         for (index_a, segment_a) in segments_a.iter().enumerate() {
-            for segments_b in &second_loops {
-                for segment_b in segments_b {
-                    for crossing in segment_crossings(*segment_a, *segment_b, tolerances)? {
-                        if let Some(parameter) = crossing.first_interior {
-                            first_cuts[loop_a][index_a].push(Cut {
-                                parameter,
-                                point: crossing.point,
-                            });
-                        }
+            for (loop_b, index_b) in grid.candidates(segment_bounds(*segment_a)) {
+                let segment_b = second_loops[loop_b][index_b];
+                for crossing in segment_crossings(*segment_a, segment_b, tolerances)? {
+                    if let Some(parameter) = crossing.first_interior {
+                        first_cuts[loop_a][index_a].push(Cut {
+                            parameter,
+                            point: crossing.point,
+                        });
                     }
                 }
             }
@@ -469,6 +492,41 @@ pub(crate) fn chain_welded_segments(
         loops.push(chain);
     }
     Ok(loops)
+}
+
+/// The two ends of the stretch two segments share along one carrier, or
+/// `None` where they do not run along each other.
+pub(crate) fn overlap_ends(
+    first: Segment,
+    second: Segment,
+    precision: PrecisionPolicy,
+) -> Option<[Point2; 2]> {
+    carrier_overlap(first, second, Tolerances::from(precision)).map(|overlap| overlap.ends)
+}
+
+/// One segment split at points on it that another curve's ends supplied —
+/// the ends of a numerically traced arc landing on a face's boundary — each
+/// placed by projection, with the pieces reusing the given points exactly.
+pub(crate) fn split_segment_at_points(
+    segment: Segment,
+    points: &[Point2],
+    precision: PrecisionPolicy,
+) -> Result<Vec<Segment>, ProfileBooleanError> {
+    let tolerances = Tolerances::from(precision);
+    let length = segment_length(segment);
+    let cuts: Vec<Cut> = points
+        .iter()
+        .filter_map(
+            |point| match place(parameter_of(segment, *point), length, tolerances) {
+                Placement::Interior(parameter) => Some(Cut {
+                    parameter,
+                    point: *point,
+                }),
+                _ => None,
+            },
+        )
+        .collect();
+    split_segment(segment, &cuts, tolerances)
 }
 
 /// Rewrites a loop so consecutive endpoints are bit-identical, for callers
@@ -1827,6 +1885,286 @@ fn point_key(point: Point2) -> (u64, u64) {
     (point.x.to_bits(), point.y.to_bits())
 }
 
+/// The face count below which the crossing grid reports every segment rather
+/// than building cells. Below it the imprint is the exhaustive pairwise scan
+/// unchanged; only operands large enough for O(segments²) to bite bucket.
+const CROSSING_GRID_THRESHOLD: usize = 64;
+const CROSSING_CELLS_PER_AXIS: usize = 64;
+
+/// A conservative axis-aligned box a segment cannot leave, or `None` for a
+/// trace, whose parameter is not a plane coordinate: a trace is a candidate
+/// for every query, which is safe and rare (traces arise only in the small
+/// section operands, never in the large profiles this grid is for).
+fn segment_bounds(segment: Segment) -> Option<[Point2; 2]> {
+    let mut low = Point2::new(f64::INFINITY, f64::INFINITY);
+    let mut high = Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut include = |point: Point2| {
+        low = Point2::new(low.x.min(point.x), low.y.min(point.y));
+        high = Point2::new(high.x.max(point.x), high.y.max(point.y));
+    };
+    match segment {
+        Segment::Line { start, end } => {
+            include(start);
+            include(end);
+        }
+        Segment::Arc {
+            center,
+            radius,
+            start_angle,
+            sweep,
+            start,
+            end,
+        } => {
+            include(start);
+            include(end);
+            // An arc bulges past its chord only where it passes a cardinal
+            // direction; those are its only interior extremes.
+            for quarter in 0..4 {
+                let angle = f64::from(quarter) * std::f64::consts::FRAC_PI_2;
+                let ahead = if sweep >= 0.0 {
+                    (angle - start_angle).rem_euclid(std::f64::consts::TAU)
+                } else {
+                    (start_angle - angle).rem_euclid(std::f64::consts::TAU)
+                };
+                if ahead <= sweep.abs() {
+                    include(Point2::new(
+                        radius.mul_add(angle.cos(), center.x),
+                        radius.mul_add(angle.sin(), center.y),
+                    ));
+                }
+            }
+        }
+        Segment::Ellipse {
+            center,
+            major,
+            minor,
+            ..
+        } => {
+            let reach = major.abs() + minor.abs();
+            include(Point2::new(center.x - reach, center.y - reach));
+            include(Point2::new(center.x + reach, center.y + reach));
+        }
+        Segment::Harmonic {
+            mean,
+            amplitude,
+            start,
+            end,
+            ..
+        } => {
+            include(Point2::new(start.x, mean - amplitude.abs()));
+            include(Point2::new(end.x, mean + amplitude.abs()));
+        }
+        Segment::Trace { .. } => return None,
+    }
+    (low.x.is_finite() && low.y.is_finite() && high.x.is_finite() && high.y.is_finite())
+        .then_some([low, high])
+}
+
+/// A uniform grid over one operand's boundary segments, keyed by their boxes,
+/// so a crossing query visits the segments a box reaches rather than all of
+/// them. See [`profile_boolean_multi`]'s imprint for why box-disjoint pairs
+/// can be skipped without changing a single cut.
+struct SegmentGrid {
+    all: Vec<(usize, usize)>,
+    grid: Option<CrossingGrid>,
+}
+
+struct CrossingGrid {
+    origin: Point2,
+    cell: [f64; 2],
+    dims: [usize; 2],
+    cells: Vec<Vec<usize>>,
+    large: Vec<usize>,
+    /// Segments with no box (traces): a candidate for every query.
+    unbounded: Vec<usize>,
+    entries: Vec<(usize, usize, Option<[Point2; 2]>)>,
+}
+
+impl SegmentGrid {
+    fn new(loops: &[Vec<Segment>]) -> Self {
+        let all: Vec<(usize, usize)> = loops
+            .iter()
+            .enumerate()
+            .flat_map(|(loop_index, segments)| {
+                (0..segments.len()).map(move |index| (loop_index, index))
+            })
+            .collect();
+        let grid = (all.len() >= CROSSING_GRID_THRESHOLD).then(|| CrossingGrid::new(loops, &all));
+        Self { all, grid }
+    }
+
+    /// The second-operand `(loop, index)` pairs whose box may meet `query`,
+    /// ascending, so the imprint visits them in the order the exhaustive scan
+    /// did and produces the same cuts. A body without a grid, or a query with
+    /// no box, matches every segment.
+    fn candidates(&self, query: Option<[Point2; 2]>) -> Vec<(usize, usize)> {
+        match (&self.grid, query) {
+            (Some(grid), Some(query)) => grid.candidates(query),
+            _ => self.all.clone(),
+        }
+    }
+}
+
+impl CrossingGrid {
+    fn new(loops: &[Vec<Segment>], all: &[(usize, usize)]) -> Self {
+        let entries: Vec<(usize, usize, Option<[Point2; 2]>)> = all
+            .iter()
+            .map(|&(loop_index, index)| {
+                (loop_index, index, segment_bounds(loops[loop_index][index]))
+            })
+            .collect();
+        let mut low = Point2::new(f64::INFINITY, f64::INFINITY);
+        let mut high = Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut bounded = 0_usize;
+        for (_, _, bounds) in &entries {
+            if let Some([box_low, box_high]) = bounds {
+                low = Point2::new(low.x.min(box_low.x), low.y.min(box_low.y));
+                high = Point2::new(high.x.max(box_high.x), high.y.max(box_high.y));
+                bounded += 1;
+            }
+        }
+        let per_axis = (bounded as f64).sqrt().ceil().max(1.0) as usize;
+        let per_axis = per_axis.clamp(1, CROSSING_CELLS_PER_AXIS);
+        let span = [high.x - low.x, high.y - low.y];
+        let cell = span.map(|extent| {
+            let size = extent / per_axis as f64;
+            if size.is_finite() && size > 0.0 {
+                size
+            } else {
+                1.0
+            }
+        });
+        let dims = [per_axis, per_axis];
+        let mut cells = vec![Vec::new(); dims[0] * dims[1]];
+        let mut large = Vec::new();
+        let mut unbounded = Vec::new();
+        for (entry_index, (_, _, bounds)) in entries.iter().enumerate() {
+            let Some(bounds) = bounds else {
+                unbounded.push(entry_index);
+                continue;
+            };
+            let range = cell_span(bounds, low, cell, dims);
+            let spans =
+                (0..2).any(|axis| range[axis].1 - range[axis].0 + 1 > dims[axis].max(2) / 2);
+            if spans {
+                large.push(entry_index);
+                continue;
+            }
+            for x in range[0].0..=range[0].1 {
+                for y in range[1].0..=range[1].1 {
+                    cells[y * dims[0] + x].push(entry_index);
+                }
+            }
+        }
+        Self {
+            origin: low,
+            cell,
+            dims,
+            cells,
+            large,
+            unbounded,
+            entries,
+        }
+    }
+
+    fn candidates(&self, query: [Point2; 2]) -> Vec<(usize, usize)> {
+        let mut found = self.large.clone();
+        found.extend_from_slice(&self.unbounded);
+        let range = cell_span(&query, self.origin, self.cell, self.dims);
+        for x in range[0].0..=range[0].1 {
+            for y in range[1].0..=range[1].1 {
+                for &entry in &self.cells[y * self.dims[0] + x] {
+                    if self.entries[entry]
+                        .2
+                        .is_some_and(|bounds| boxes_overlap(&bounds, &query))
+                    {
+                        found.push(entry);
+                    }
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
+            .into_iter()
+            .map(|entry| {
+                let (loop_index, index, _) = self.entries[entry];
+                (loop_index, index)
+            })
+            .collect()
+    }
+}
+
+fn cell_span(
+    bounds: &[Point2; 2],
+    origin: Point2,
+    cell: [f64; 2],
+    dims: [usize; 2],
+) -> [(usize, usize); 2] {
+    let axis = |value: f64, minimum: f64, size: f64, count: usize| -> usize {
+        let index = ((value - minimum) / size).floor();
+        if index.is_finite() {
+            (index as i64).clamp(0, count as i64 - 1) as usize
+        } else {
+            0
+        }
+    };
+    [0, 1].map(|dimension| {
+        let (min, max, origin_axis) = if dimension == 0 {
+            (bounds[0].x, bounds[1].x, origin.x)
+        } else {
+            (bounds[0].y, bounds[1].y, origin.y)
+        };
+        let count = dims[dimension];
+        let low = axis(min, origin_axis, cell[dimension], count).saturating_sub(1);
+        let high = (axis(max, origin_axis, cell[dimension], count) + 1).min(count - 1);
+        (low, high)
+    })
+}
+
+/// A loop's bounding box, the union of its segments' boxes, or `None` when a
+/// segment has no closed-form box (a trace) — then the loop is never pruned.
+fn loop_bounds(chain: &[Segment]) -> Option<[Point2; 2]> {
+    let mut low = Point2::new(f64::INFINITY, f64::INFINITY);
+    let mut high = Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for segment in chain {
+        let [box_low, box_high] = segment_bounds(*segment)?;
+        low = Point2::new(low.x.min(box_low.x), low.y.min(box_low.y));
+        high = Point2::new(high.x.max(box_high.x), high.y.max(box_high.y));
+    }
+    (low.x.is_finite() && high.x.is_finite()).then_some([low, high])
+}
+
+/// Whether a point could lie inside a loop with this box, growing the box by
+/// a relative margin so a point on the boundary is never pruned. `None` (a
+/// loop with no box) always could.
+fn box_contains(bounds: Option<[Point2; 2]>, point: Point2) -> bool {
+    let Some([low, high]) = bounds else {
+        return true;
+    };
+    let scale = point.x.abs().max(point.y.abs()).max(1.0);
+    let margin = 1.0e-9 * scale;
+    point.x >= low.x - margin
+        && point.x <= high.x + margin
+        && point.y >= low.y - margin
+        && point.y <= high.y + margin
+}
+
+fn boxes_overlap(left: &[Point2; 2], right: &[Point2; 2]) -> bool {
+    let scale = [left[0], left[1], right[0], right[1]]
+        .iter()
+        .map(|point| point.x.abs().max(point.y.abs()))
+        .fold(1.0_f64, f64::max);
+    // Generous against any agreement a caller might set, so a tangent touch
+    // the classifier would keep is never pruned; a slightly loose box only
+    // costs an exact crossing test that finds nothing.
+    let margin = 1.0e-6 * scale;
+    left[0].x - margin <= right[1].x
+        && right[0].x - margin <= left[1].x
+        && left[0].y - margin <= right[1].y
+        && right[0].y - margin <= left[1].y
+}
+
 /// Makes endpoints that agree within the precision policy into one point, so
 /// the exact-identity chaining below sees the arrangement the geometry means
 /// rather than the one the arithmetic produced.
@@ -2021,12 +2359,20 @@ fn nest_loops(
     }
 
     let wrapped = wrap_loops(&loops);
+    // A loop's bounding box, computed once: a point outside the box is
+    // outside the loop, so the box pre-filter turns the containment depth
+    // from O(loops²) point-in-loop tests into O(loops²) cheap box checks plus
+    // one point-in-loop per loop that actually encloses the point. On a face
+    // carrying hundreds of holes that is the difference between a quadratic
+    // pass and a near-linear one.
+    let boxes: Vec<Option<[Point2; 2]>> = loops.iter().map(|chain| loop_bounds(chain)).collect();
     let depth_of = |index: usize| -> usize {
         wrapped
             .iter()
             .enumerate()
             .filter(|(other, profile_loop)| {
                 *other != index
+                    && box_contains(boxes[*other], samples[index])
                     && point_in_loops(samples[index], std::slice::from_ref(profile_loop))
             })
             .count()
@@ -2062,6 +2408,7 @@ fn nest_loops(
                 .iter_mut()
                 .filter(|(outer_index, _)| {
                     depths[*outer_index] + 1 == depths[index]
+                        && box_contains(boxes[*outer_index], samples[index])
                         && point_in_loops(
                             samples[index],
                             std::slice::from_ref(&wrapped[*outer_index]),

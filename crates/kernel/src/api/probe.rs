@@ -241,10 +241,10 @@ fn clearance_between(session: &Session, a: &str, b: &str) -> Result<ProbeResult,
 fn tier_detail(tier: Tier) -> String {
     match tier {
         Tier::Exact => "every step of this body was exact".to_owned(),
-        Tier::Approximate => {
-            "a step of this body fell to the faceted tier; the integral is exact over its facets"
-                .to_owned()
-        }
+        Tier::Approximate => "a step of this body is approximate, built on the faceted tier or \
+                              by the numerical intersection rung; the integral is exact over the \
+                              faces it has"
+            .to_owned(),
     }
 }
 

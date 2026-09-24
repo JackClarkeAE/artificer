@@ -18305,6 +18305,13 @@ mod tests {
     fn oversized_profile_resources_reject_before_pairwise_curve_analysis() {
         use std::time::{Duration, Instant};
 
+        // The bound is a proxy for the shape of the cost, not a frame budget:
+        // a pairwise pass over sixteen thousand curves takes seconds even
+        // optimised, while the counting preflight takes a few milliseconds
+        // in a debug build. Wide enough that a loaded machine running the
+        // suite in parallel cannot fail it by scheduling alone.
+        const PREFLIGHT_BUDGET: Duration = Duration::from_millis(250);
+
         let circles = (0..=MAX_PLANAR_PROFILE_CURVES)
             .map(|index| SketchEntity {
                 id: SketchEntityId(index as u64 + 1),
@@ -18325,7 +18332,7 @@ mod tests {
             }
         );
         assert!(
-            elapsed < Duration::from_micros(16_667),
+            elapsed < PREFLIGHT_BUDGET,
             "curve-limit preflight took {elapsed:?}"
         );
 
@@ -18349,7 +18356,7 @@ mod tests {
             }
         );
         assert!(
-            elapsed < Duration::from_micros(16_667),
+            elapsed < PREFLIGHT_BUDGET,
             "loop-limit preflight took {elapsed:?}"
         );
 
@@ -18380,7 +18387,7 @@ mod tests {
             }
         );
         assert!(
-            elapsed < Duration::from_micros(16_667),
+            elapsed < PREFLIGHT_BUDGET,
             "linear-loop preflight took {elapsed:?}"
         );
     }

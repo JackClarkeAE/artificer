@@ -22,6 +22,14 @@ if printf '%s\n' "$sketch_tree" | rg --ignore-case '(^|[^[:alnum:]_-])(egui|efra
     exit 1
 fi
 
+# CAM (ADR 0057) lives below the workbench: it takes a snapshot and returns
+# data, and never draws.
+cam_tree="$(cargo tree --package artificer-cam --edges normal,build)"
+if printf '%s\n' "$cam_tree" | rg --ignore-case '(^|[^[:alnum:]_-])(egui|eframe|wgpu|artificer-viewport|artificer-ui-core)([^[:alnum:]_-]|$)'; then
+    printf 'error: a UI or rendering dependency entered the CAM crate\n' >&2
+    exit 1
+fi
+
 # The presentation split is a dependency boundary, not just a file move.
 # ui-core is pure presentation and must not see the kernel or the document
 # model at all; sketch-ui authors exact profiles and reaches the kernel's
@@ -61,9 +69,14 @@ fi
 # execution sites are the bounded async extrusion commit and read-only preview
 # helpers; both consume immutable snapshots and cannot publish through widgets.
 # Extracted presentation modules may stage intents but must never execute the
-# kernel or mutate the parametric document directly.
+# kernel or mutate the parametric document directly. The simulation tab (ADR
+# 0058) reads immutable snapshots through kernel queries and runs the
+# simulation crate off the UI thread; it never executes the kernel and never
+# writes to the document. The CAM tab (ADR 0057) reads the kernel only
+# through its public queries and stages a plan that Confirm keeps as data;
+# it is listed here so it can never grow an execution site.
 mutation_pattern='NativeKernel::execute\(|execute_case\(|execute_sketch_extrusion\(|execute_face_push_pull\(|execute_library_insertion\(|apply_transform_preview\(|apply_component_placement_preview\(|apply_component_grounding\(|apply_revolute_joint\(|set_component_pose\(|set_component_grounded\(|add_joint\('
-for module in apps/workbench/src/material.rs apps/workbench/src/ribbon.rs; do
+for module in apps/workbench/src/material.rs apps/workbench/src/ribbon.rs apps/workbench/src/simulation.rs apps/workbench/src/simulation/*.rs apps/workbench/src/cam.rs; do
     if rg "$mutation_pattern" "$module"; then
         printf 'error: a kernel-execution or document-mutation site entered the %s presentation module\n' "$module" >&2
         exit 1

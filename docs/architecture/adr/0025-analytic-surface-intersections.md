@@ -51,6 +51,31 @@ approximated or discovered:
 Everything in the matrix is derived algebraically and is exact. Everything
 outside returns `IntersectionError::Unsupported`.
 
+**Status, 2026-09-24 (ADR 0056 Track B).** The matrix above is unchanged,
+but it is no longer the Boolean's domain, only its exact core:
+
+- *B1, in the matrix.* The general engine (`analytic_boolean.rs`) sews
+  cone, sphere and torus faces, not only planes and cylinders: their faces
+  are closed by the cells of the section's arrangement in parameter space
+  (`section_cells.rs`), each cell classified in 3D, so a single ring on a
+  sphere or a ring coincident with a cone's rim closes as well as a bounded
+  loop does. Every pair the matrix answers is exact and unlabelled through
+  it: a sphere seated on a plate, a coaxial counterbore in a drafted boss,
+  a bore that clears a torus blend.
+- *B2–B4, outside the matrix.* A pair of analytic carriers the matrix
+  refuses, whose faces are within reach of one another, is traced
+  numerically (`surface_marching.rs`: marching along `n₁ × n₂` with
+  Newton projection onto both surfaces, refined until a degree-5 B-spline
+  through the samples departs from both surfaces by less than an absolute
+  5e-10) and carried as `Curve3::Bspline` with `Curve2::Bspline` pcurves.
+  The result is `Tier::Approximate` and carries
+  `BOOLEAN_INTERSECTION_APPROXIMATED` with the largest measured departure.
+  The pairs the rung answers today: torus × cylinder off-axis, sphere ×
+  cylinder off-centre, cone × oblique plane, torus × torus crossing. Ruled
+  and B-spline carriers remain refused (`BOOLEAN_SURFACE_PAIR_UNSUPPORTED`)
+  and fall to the faceted tier where one exists.
+- The ladder is prism → coaxial → analytic → numerical → faceted.
+
 Three results are distinguished, because reconstruction will treat them
 differently:
 

@@ -555,7 +555,7 @@ pub(crate) fn build_hole_rim_blend(
     Ok(result)
 }
 
-fn next_entity_id(topology: &Topology) -> u64 {
+pub(crate) fn next_entity_id(topology: &Topology) -> u64 {
     topology
         .vertices
         .iter()
@@ -580,7 +580,7 @@ fn next_entity_id(topology: &Topology) -> u64 {
 /// Anything else is bracketed on a fine sampling and each bracket narrowed
 /// to its minimum, which converges on the true nearest point rather than on
 /// the nearest sample.
-fn distance_from_axis(edge: Edge, center: Point3, normal: Vector3) -> f64 {
+pub(crate) fn distance_from_axis(edge: Edge, center: Point3, normal: Vector3) -> f64 {
     let across = |point: Point3| {
         let offset = point - center;
         offset - normal * offset.dot(normal)

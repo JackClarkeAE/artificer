@@ -387,6 +387,34 @@ enum ActiveDatumDrag {
     },
 }
 
+/// One mesh the shell draws over the committed scene: the CAM tab's stock
+/// ghost, its remaining stock and its tool (ADR 0057). Triangles are in
+/// document space and carry a colour with its alpha; a shaded mesh takes the
+/// scene's light rig, an unshaded one is painted flat.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverlayMesh {
+    pub triangles: Vec<[Point3; 3]>,
+    pub color: Color32,
+    pub shaded: bool,
+}
+
+/// One polyline the shell draws over the scene: a toolpath's rapids or cuts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverlayPolyline {
+    pub points: Vec<Point3>,
+    pub color: Color32,
+    pub width: f32,
+}
+
+/// Presentation-only geometry painted over the committed bodies, after them
+/// and in depth order among itself, so a translucent stock reads as a ghost
+/// around the part and a tool as a solid sitting on it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SceneOverlay {
+    pub meshes: Vec<OverlayMesh>,
+    pub polylines: Vec<OverlayPolyline>,
+}
+
 /// Combined result for the interactive document viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DocumentViewportOutput {
@@ -944,6 +972,10 @@ pub struct SurfaceField<'a> {
     /// Changes whenever the readings do. The GPU buffer cache keys on this
     /// rather than hashing a megabyte of vertices every frame.
     pub epoch: u64,
+    /// The legend to print beside the model in place of the palette's own,
+    /// for a field that is not a clearance in millimetres: a stress, a
+    /// temperature. `None` prints the palette's clearance legend.
+    pub legend: Option<&'a [HeatBand]>,
 }
 
 impl SurfaceField<'_> {
@@ -1642,6 +1674,7 @@ pub fn show_document(
         None,
         None,
         artificer_ui_core::navigation::NavigationPreset::Artificer.bindings(),
+        None,
     )
     .selected_face
 }
@@ -1703,6 +1736,68 @@ pub fn show_document_with_feature_drag(
         Some(feature_drag_state),
         Some(edge_frame_memo),
         navigation,
+        None,
+    )
+}
+
+/// [`show_document_with_feature_drag`] with presentation-only geometry
+/// painted over the scene: the CAM tab's stock, tool and toolpath.
+#[allow(clippy::too_many_arguments)]
+pub fn show_document_with_overlay(
+    ui: &mut Ui,
+    bodies: &[DocumentBodyInstance<'_>],
+    reported_bounds: Option<Aabb3>,
+    edge_overlay: bool,
+    display_mode: ModelDisplayMode,
+    selected: Option<DocumentFaceSelection>,
+    selected_edge: Option<DocumentEdgeSelection>,
+    selected_vertex: Option<DocumentVertexSelection>,
+    selected_faces: &[DocumentFaceSelection],
+    selected_edges: &[DocumentEdgeSelection],
+    selected_vertices: &[DocumentVertexSelection],
+    active_body: Option<BodyInstanceKey>,
+    active_tool: ActiveTool,
+    active_display_transform: &mut DisplayTransform,
+    view: &mut ViewState,
+    animation_phase: f64,
+    feature_preview: Option<&FeaturePreview>,
+    sketch_overlays: &[ModelSketchOverlay],
+    selected_sketch_regions: &[ModelSketchRegionSelection],
+    measured_edges: &[DocumentEdgeSelection],
+    measurement: Option<&DocumentMeasurement>,
+    edge_finish_preview: Option<&EdgeFinishPreview>,
+    feature_drag_state: &mut FeaturePreviewDragState,
+    edge_frame_memo: &mut Option<EdgeFrameMemo>,
+    navigation: artificer_ui_core::navigation::Bindings,
+    overlay: Option<&SceneOverlay>,
+) -> DocumentViewportOutput {
+    show_document_impl(
+        ui,
+        bodies,
+        reported_bounds,
+        edge_overlay,
+        display_mode,
+        selected,
+        selected_edge,
+        selected_vertex,
+        selected_faces,
+        selected_edges,
+        selected_vertices,
+        active_body,
+        active_tool,
+        active_display_transform,
+        view,
+        animation_phase,
+        feature_preview,
+        sketch_overlays,
+        selected_sketch_regions,
+        measured_edges,
+        measurement,
+        edge_finish_preview,
+        Some(feature_drag_state),
+        Some(edge_frame_memo),
+        navigation,
+        overlay,
     )
 }
 
@@ -1733,6 +1828,7 @@ fn show_document_impl(
     mut feature_drag_state: Option<&mut FeaturePreviewDragState>,
     mut edge_frame_memo: Option<&mut Option<EdgeFrameMemo>>,
     navigation: artificer_ui_core::navigation::Bindings,
+    overlay: Option<&SceneOverlay>,
 ) -> DocumentViewportOutput {
     let size = ui.available_size().max(Vec2::new(260.0, 260.0));
     let (canvas, painter) = ui.allocate_painter(size, Sense::click_and_drag());
@@ -2626,6 +2722,10 @@ fn show_document_impl(
         paint_datum_handles(&painter, geometry, datum_interaction.hovered);
     }
 
+    if let Some(overlay) = overlay {
+        paint_scene_overlay(&painter, overlay, projection, *view);
+    }
+
     let mut selected_from_ui = clicked;
     // The secondary-button twin of `selected_from_ui`: the per-face
     // accessibility rects below sense clicks, and egui's hit test is
@@ -2750,8 +2850,11 @@ fn show_document_impl(
     // A body painted by a measurement is unreadable without the scale it was
     // painted to, so the legend is part of the overlay rather than something
     // the host has to remember to print beside it.
-    if let Some(palette) = bodies.iter().find_map(|body| body.field.map(|f| f.palette)) {
-        paint_heat_legend(&painter, canvas.rect, palette);
+    if let Some(field) = bodies.iter().find_map(|body| body.field) {
+        let bands = field
+            .legend
+            .map_or_else(|| field.palette.legend(), <[HeatBand]>::to_vec);
+        paint_heat_legend(&painter, canvas.rect, &bands);
     }
     // A secondary click is a menu gesture, never a camera gesture: egui only
     // reports `clicked_by` once it has ruled out a drag, so the right-drag
@@ -7578,6 +7681,89 @@ fn paint_feature_preview(
     painter.galley(text_origin, galley, accent);
 }
 
+/// Paints the shell's overlay: meshes in depth order, far first, each
+/// triangle lit by the scene's rig when the mesh asks for it, then the
+/// polylines over them.
+fn paint_scene_overlay(
+    painter: &egui::Painter,
+    overlay: &SceneOverlay,
+    projection: Projection,
+    view: ViewState,
+) {
+    let presentation = InstancePresentation::identity(Point3::new(0.0, 0.0, 0.0));
+    let mut projected: Vec<(ProjectedFeatureTriangle, Color32)> = Vec::new();
+    for mesh in &overlay.meshes {
+        for triangle in &mesh.triangles {
+            let camera = triangle.map(|point| presentation.project_point(point, view));
+            let points = camera.map(|point| projection.camera_point(point));
+            if triangle_signed_area(points).abs() <= 1.0e-4 {
+                continue;
+            }
+            let color = if mesh.shaded {
+                let a = triangle[0];
+                let b = triangle[1];
+                let c = triangle[2];
+                let u = [b.x - a.x, b.y - a.y, b.z - a.z];
+                let v = [c.x - a.x, c.y - a.y, c.z - a.z];
+                let normal = [
+                    u[1].mul_add(v[2], -(u[2] * v[1])),
+                    u[2].mul_add(v[0], -(u[0] * v[2])),
+                    u[0].mul_add(v[1], -(u[1] * v[0])),
+                ];
+                // Either side of a translucent facet may face the camera.
+                let level = vertex_lighting(normal, view)
+                    .level
+                    .max(vertex_lighting([-normal[0], -normal[1], -normal[2]], view).level);
+                let scale = 0.45 + 0.55 * level.clamp(0.0, 1.0);
+                let channel =
+                    |value: u8| (f32::from(value) * scale).round().clamp(0.0, 255.0) as u8;
+                Color32::from_rgba_unmultiplied(
+                    channel(mesh.color.r()),
+                    channel(mesh.color.g()),
+                    channel(mesh.color.b()),
+                    mesh.color.a(),
+                )
+            } else {
+                mesh.color
+            };
+            projected.push((
+                ProjectedFeatureTriangle {
+                    points,
+                    depth: camera.iter().map(|point| point.depth).sum::<f64>() / 3.0,
+                },
+                color,
+            ));
+        }
+    }
+    projected.sort_by(|left, right| left.0.depth.total_cmp(&right.0.depth));
+    let mut mesh = Mesh::default();
+    mesh.reserve_vertices(projected.len() * 3);
+    mesh.reserve_triangles(projected.len());
+    for (triangle, color) in projected {
+        let first = mesh.vertices.len() as u32;
+        for point in triangle.points {
+            mesh.colored_vertex(point, color);
+        }
+        mesh.add_triangle(first, first + 1, first + 2);
+    }
+    if !mesh.is_empty() {
+        painter.add(Shape::mesh(mesh));
+    }
+    for polyline in &overlay.polylines {
+        let points = polyline
+            .points
+            .iter()
+            .map(|point| projection.instance_point(*point, view, presentation))
+            .collect::<Vec<_>>();
+        for pair in points.windows(2) {
+            painter.line_segment(
+                [pair[0], pair[1]],
+                Stroke::new(polyline.width, polyline.color),
+            );
+        }
+    }
+}
+
 fn paint_preview_arrow(
     painter: &egui::Painter,
     start: Pos2,
@@ -7808,8 +7994,7 @@ fn projected_triad_axes(view: ViewState) -> [CameraProjection; 3] {
 
 /// The key to a heat map: one swatch per band, with the reading it stands
 /// for, in the corner the axis triad leaves free.
-fn paint_heat_legend(painter: &egui::Painter, rect: Rect, palette: HeatPalette) {
-    let bands = palette.legend();
+fn paint_heat_legend(painter: &egui::Painter, rect: Rect, bands: &[HeatBand]) {
     if bands.is_empty() {
         return;
     }
@@ -9560,6 +9745,7 @@ mod tests {
             values: &readings,
             palette,
             epoch,
+            legend: None,
         };
         let ramp = HeatPalette::Gradient {
             near: 0.0,
@@ -11967,20 +12153,23 @@ mod tests {
         let plate = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");";
         let crossed = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");\ndrill(face: faces(\">Z\"), center: [15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_b\");\ndrill(face: faces(\"<Y\"), center: [0.0, 0.0], diameter: 20.0, depth: 30.0, label: \"side_cut\");";
         let slot = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet s = sketch(on: faces(\">Z\"), entities: [line(start: [-10, -5], end: [10, -5]), arc(center: [10, 0], radius: 5, start_angle: -90, end_angle: 90), line(start: [10, 5], end: [-10, 5]), arc(center: [-10, 0], radius: 5, start_angle: 90, end_angle: 270)], label: \"s\");\nextrude(sketch: s, distance: 10, operation: \"cut\", label: \"slot\");";
-        // A hub whose flange rim is blended, a bolt hole drilled beside the
-        // band, and a second hole drilled through the band: that last step
-        // meets the torus off its axis and reaches the faceted tier, which
-        // re-facets the whole body, the bolt hole's rim included.
-        let hub = "let section = sketch(on: \"XZ\", label: \"section\", entities: [line(start: [6, 0], end: [45, 0]), line(start: [45, 0], end: [45, 8]), line(start: [45, 8], end: [20, 8]), line(start: [20, 8], end: [20, 40]), line(start: [20, 40], end: [6, 40]), line(start: [6, 40], end: [6, 0])]);\nlet hub = revolve(sketch: section, axis: [0, 0, 1], label: \"hub\");\nfillet(edges: [nearest(point: [0, 45, 8], kind: \"edge\"), nearest(point: [0, -45, 8], kind: \"edge\")], radius: 2, label: \"flange_top_rim\");\ndrill(face: nearest(point: [-30.0, 5.0, 8.0]), center: [-30.0, 0.0], diameter: 6.0, depth: 8.0, label: \"bolt\");\ndrill(face: nearest(point: [25.0, 10.0, 8.0]), center: [43.0, 0.0], diameter: 6.0, depth: 8.0, label: \"rim_hole\");";
+        // A body extruded from a spline profile, a bolt hole drilled in its
+        // top, and a second hole drilled out through the spline wall: that
+        // last step meets a B-spline face, which no exact or numerical rung
+        // carries, and reaches the faceted tier, which re-facets the whole
+        // body, the bolt hole's rim included. (A drill through a torus band
+        // used to be the step that faceted this fixture; since ADR 0056
+        // Track B the numerical intersection rung keeps that rim exact.)
+        let hub = "let blob = sketch(on: \"XY\", entities: [spline(points: [[40, 0], [28, 28], [0, 40], [-28, 28], [-40, 0], [-28, -28], [0, -40], [28, -28]], closed: true)], label: \"blob\");\nlet body = extrude(sketch: blob, distance: 20, label: \"body\");\ndrill(face: faces(\">Z\"), center: [0.0, 0.0], diameter: 6.0, depth: 20.0, label: \"bolt\");\ndrill(face: faces(\">Z\"), center: [38.0, 0.0], diameter: 6.0, depth: 20.0, label: \"rim_hole\");";
         // Each case names a bore's rim on a top face: hole_a's at z = 40,
-        // eight from (35, 25), or the bolt hole's at z = 8, three from
-        // (−30, 0). The faceted tier splits a rim's polygon sides at points
+        // eight from (35, 25), or the bolt hole's at z = 20, three from
+        // (0, 0). The faceted tier splits a rim's polygon sides at points
         // along the chord, which sit inside the circle by up to the sagitta
         // of a sixteen-gon, so the band is half a millimetre.
         for (label, script, centre, radius, expected_sources) in [
             ("exact plate", plate, (35.0, 25.0, 40.0), 8.0, 2),
             ("crossing cut", crossed, (35.0, 25.0, 40.0), 8.0, 2),
-            ("faceted hub", hub, (-30.0, 0.0, 8.0), 3.0, 0),
+            ("faceted blob", hub, (0.0, 0.0, 20.0), 3.0, 0),
         ] {
             let on_hole_a = |edge: &&DebugEdge| {
                 edge.endpoints.iter().all(|point| {
