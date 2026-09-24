@@ -66,6 +66,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0053](0053-a-part-can-be-saved-into-the-library.md) | A part can be saved into the library, and placed at any values | Implemented | 0017, 0018, 0052 |
 | [0054](0054-a-sketch-dimension-can-follow-a-variable.md) | A sketch dimension can follow a variable | Implemented | 0021, 0052, 0053 |
 | [0055](0055-revolve-and-sweep-are-features.md) | Revolve and sweep are features | Accepted (R1–R3, S1–S3 and construction axes implemented) | 0023, 0026, 0041, 0049, 0050, 0051 |
+| [0056](0056-the-general-geometry-programme.md) | The general-geometry programme: Booleans, blends, surfacing, scale, and STEP import | Proposed | 0002, 0025, 0026, 0045, 0047, 0050 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.
