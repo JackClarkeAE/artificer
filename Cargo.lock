@@ -326,6 +326,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "artificer-sim"
+version = "0.99.81"
+dependencies = [
+ "artificer-kernel",
+ "artificer-protocol",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "artificer-sketch"
 version = "0.99.81"
 dependencies = [

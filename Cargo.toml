@@ -12,6 +12,7 @@ members = [
     "crates/protocol",
     "crates/testkit",
     "crates/model",
+    "crates/sim",
     "crates/sketch",
     "crates/sketch-ui",
     "crates/spacemouse",
@@ -76,3 +77,13 @@ debug = false
 [profile.test.package."*"]
 opt-level = 1
 debug = false
+
+# The simulation solver is a conjugate-gradient loop over every voxel of a
+# part, run by the tests that check it against the textbook. Unoptimised it
+# is thirty times slower, which turns a two-second gate into a minute, so
+# the one crate that is pure arithmetic is optimised even in a debug build.
+[profile.dev.package.artificer-sim]
+opt-level = 3
+
+[profile.test.package.artificer-sim]
+opt-level = 3

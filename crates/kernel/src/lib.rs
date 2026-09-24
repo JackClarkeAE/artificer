@@ -50,6 +50,7 @@ mod sheet_stitch;
 mod sheet_thicken;
 mod sheet_trim;
 mod shell;
+mod sim_queries;
 mod spline_profile;
 mod step_export;
 mod surface_intersection;
@@ -103,6 +104,7 @@ pub use crate::describe::{
     EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, RailGeometry, RailKind,
     SurfaceCounts,
 };
+pub use crate::sim_queries::{MAX_VOXELS, SurfaceCell, VoxelGrid};
 pub use crate::step_export::{StepBody, StepPlacement};
 pub use crate::topology::FaceRole;
 
