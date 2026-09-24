@@ -9,6 +9,7 @@ pub mod api;
 pub mod brep;
 mod bspline;
 mod coaxial_boolean;
+mod concave_rim_blend;
 mod corner_blend;
 mod cuboid;
 mod cylinder_trace;
@@ -4861,6 +4862,41 @@ fn regularized_edge_finish(
             rim_loop_blend::RimLoopBlendError::ReflexCorner
             | rim_loop_blend::RimLoopBlendError::TargetInvalid
             | rim_loop_blend::RimLoopBlendError::DomainUnsupported,
+        ) => {}
+    }
+
+    // A concave rim — a boss standing on a plane, or a pocket's wall meeting
+    // its floor: a torus or cone band built in place on the air side of the
+    // corner, with its material added (ADR 0056, F2). It comes before the
+    // hole-rim rung because a boss rim is an inner loop of its plate, which
+    // that rung would otherwise take for a hole and refuse for want of bore.
+    match concave_rim_blend::build_concave_rim_blend(
+        input.id,
+        &input.topology,
+        targets,
+        kind,
+        distance,
+        precision,
+    ) {
+        Ok(topology)
+            if validator::validate(&topology, precision.linear_agreement)
+                .diagnostics
+                .is_empty() =>
+        {
+            return Ok((topology, "edge-finish/concave-rim-blend"));
+        }
+        Ok(_) => {}
+        Err(concave_rim_blend::ConcaveRimBlendError::DistanceInvalid) => {
+            return Err(simple_invalid_input(
+                input.id,
+                "CONCAVE_RIM_DISTANCE_INVALID",
+                "The rim finish must fit within the plane around the rim and the height of the \
+                 wall standing on it.",
+            ));
+        }
+        Err(
+            concave_rim_blend::ConcaveRimBlendError::TargetInvalid
+            | concave_rim_blend::ConcaveRimBlendError::DomainUnsupported,
         ) => {}
     }
 
