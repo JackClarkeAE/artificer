@@ -341,6 +341,46 @@ pub enum ApiCommand {
         target: StepLabel,
         tool: StepLabel,
     },
+    /// A sheet body (ADR 0056, Track S): the walls a sketch's open or closed
+    /// chain of lines and arcs sweeps along the sketch plane's normal, with
+    /// no caps. A new body of its own.
+    SurfaceExtrude {
+        label: String,
+        sketch: StepLabel,
+        distance: f64,
+    },
+    /// A sheet body: the bands a sketch's chain sweeps about an axis in
+    /// the sketch plane, with no wedge faces closing a partial turn. A new
+    /// body of its own.
+    SurfaceRevolve {
+        label: String,
+        sketch: StepLabel,
+        axis_origin: Point3,
+        axis_direction: Vector3,
+        angle_degrees: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis_placement: Option<AxisPlacement>,
+    },
+    /// A sheet body of one planar face per region of a sketch, holes
+    /// included. A new body of its own.
+    Patch {
+        label: String,
+        sketch: StepLabel,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        regions: Vec<u32>,
+    },
+    /// Several sheet bodies welded along their boundaries into one body,
+    /// a solid when they close (ADR 0056, S3).
+    Stitch {
+        label: String,
+        sheets: Vec<StepLabel>,
+    },
+    /// The current sheet body thickened into a solid (ADR 0056, S4):
+    /// positive along the sheet's normal, negative against it.
+    Thicken { label: String, thickness: f64 },
+    /// The current sheet body trimmed by a plane, keeping the side the
+    /// plane faces (ADR 0056, S2).
+    Trim { label: String, plane: SketchPlane },
 }
 
 impl ApiCommand {
@@ -366,6 +406,12 @@ impl ApiCommand {
             Self::BooleanUnion { .. } => "boolean_union",
             Self::BooleanDifference { .. } => "boolean_difference",
             Self::BooleanIntersection { .. } => "boolean_intersection",
+            Self::SurfaceExtrude { .. } => "surface_extrude",
+            Self::SurfaceRevolve { .. } => "surface_revolve",
+            Self::Patch { .. } => "patch",
+            Self::Stitch { .. } => "stitch",
+            Self::Thicken { .. } => "thicken",
+            Self::Trim { .. } => "trim",
         }
     }
 
@@ -388,7 +434,13 @@ impl ApiCommand {
             | Self::Shell { label, .. }
             | Self::BooleanUnion { label, .. }
             | Self::BooleanDifference { label, .. }
-            | Self::BooleanIntersection { label, .. } => label,
+            | Self::BooleanIntersection { label, .. }
+            | Self::SurfaceExtrude { label, .. }
+            | Self::SurfaceRevolve { label, .. }
+            | Self::Patch { label, .. }
+            | Self::Stitch { label, .. }
+            | Self::Thicken { label, .. }
+            | Self::Trim { label, .. } => label,
         }
     }
 }

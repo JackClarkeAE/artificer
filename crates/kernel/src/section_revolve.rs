@@ -1314,6 +1314,27 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
     build_turned_region(section, &[], sweep)
 }
 
+/// Revolves a section chain into a sheet (ADR 0056, Track S): the bands
+/// every segment sweeps, exactly as a solid's are built, with no wedge
+/// faces closing a partial turn and no solid. The chain may be open at both
+/// ends, clear of the axis or on it, or closed on itself.
+pub(crate) fn build_turned_sheet(section: &RzSection, sweep: f64) -> Topology {
+    let mut builder = Builder {
+        topology: Topology::default(),
+        next_id: 1,
+        section,
+        sweep: sweep.min(FULL_TURN),
+    };
+    let _ = sweep_section(&mut builder, section);
+    let shell_id = builder.allocate();
+    let faces = (0..builder.topology.faces.len()).map(FaceKey).collect();
+    builder.topology.shells.push(Record {
+        id: shell_id,
+        value: Shell { faces },
+    });
+    builder.topology
+}
+
 /// Revolves a region with holes through `sweep` radians. `outer` runs
 /// anticlockwise and every hole clockwise, all in the one section frame, so
 /// material lies on the left of each chain and the builder faces every band

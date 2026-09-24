@@ -43,6 +43,12 @@ mod rim_loop_blend;
 mod ruled;
 mod section_revolve;
 mod sew;
+mod sheet;
+mod sheet_build;
+mod sheet_sew;
+mod sheet_stitch;
+mod sheet_thicken;
+mod sheet_trim;
 mod shell;
 mod spline_profile;
 mod step_export;
@@ -890,6 +896,70 @@ impl NativeKernel {
                     "The request precision policy differs from the input snapshot policy.",
                 )],
             ));
+        }
+
+        // A sheet body (ADR 0056, Track S) is edited by the sheet commands
+        // and carried by the whole-snapshot ones; everything else reads a
+        // solid and refuses a sheet by name rather than its first solid.
+        if sheet::is_sheet(&input.topology) && !sheet::command_accepts_sheet(&request.command) {
+            return Err(sheet::unsupported_here(input.id, "This operation"));
+        }
+        match &request.command {
+            KernelCommand::SurfaceExtrude {
+                frame,
+                chain,
+                distance,
+            } => {
+                return sheet_build::execute_surface_extrude(
+                    input,
+                    request,
+                    cancellation,
+                    *frame,
+                    chain,
+                    *distance,
+                );
+            }
+            KernelCommand::SurfaceRevolve {
+                frame,
+                chain,
+                axis,
+                angle,
+            } => {
+                return sheet_build::execute_surface_revolve(
+                    input,
+                    request,
+                    cancellation,
+                    *frame,
+                    chain,
+                    *axis,
+                    *angle,
+                );
+            }
+            KernelCommand::PlanarPatch { frame, profile } => {
+                return sheet_build::execute_planar_patch(
+                    input,
+                    request,
+                    cancellation,
+                    *frame,
+                    profile,
+                );
+            }
+            KernelCommand::ThickenSheet { thickness } => {
+                return sheet_thicken::execute_thicken(input, request, cancellation, *thickness);
+            }
+            KernelCommand::TrimSheetByPlane {
+                plane_origin,
+                plane_normal,
+            } => {
+                return sheet_trim::execute_trim(
+                    input,
+                    request,
+                    cancellation,
+                    *plane_origin,
+                    *plane_normal,
+                );
+            }
+            _ => {}
         }
 
         // Warnings a construction rung wants the caller to see. Most rungs
@@ -2190,13 +2260,30 @@ impl NativeKernel {
                     (topology, HistoryMode::RegularizedFaceFeature)
                 }
             }
+            KernelCommand::SurfaceExtrude { .. }
+            | KernelCommand::SurfaceRevolve { .. }
+            | KernelCommand::PlanarPatch { .. }
+            | KernelCommand::ThickenSheet { .. }
+            | KernelCommand::TrimSheetByPlane { .. } => {
+                unreachable!("sheet commands are answered before the ladder")
+            }
         };
 
         check_cancelled(input.id, cancellation, KernelStage::Construction)?;
-        let internal_validation =
-            validator::validate(&topology, request.precision.linear_agreement);
-        let validation =
-            protocol_validation(input.id, ValidationProfile::Solid, &internal_validation);
+        // A sheet carried whole — moved, mirrored, patterned — is still a
+        // sheet, and is held to the sheet profile (ADR 0056, Track S).
+        let carried_sheet = sheet::is_sheet(&input.topology) && sheet::is_sheet(&topology);
+        let internal_validation = if carried_sheet {
+            sheet::validate_sheet(&topology, request.precision.linear_agreement)
+        } else {
+            validator::validate(&topology, request.precision.linear_agreement)
+        };
+        let profile = if carried_sheet {
+            ValidationProfile::Sheet
+        } else {
+            ValidationProfile::Solid
+        };
+        let validation = protocol_validation(input.id, profile, &internal_validation);
         if !validation.valid {
             return Err(error(
                 KernelErrorCode::ValidationFailed,
@@ -2302,6 +2389,9 @@ impl NativeKernel {
                     "Target, tool, and request must use the same persisted precision policy.",
                 )],
             ));
+        }
+        if sheet::is_sheet(&target.topology) || sheet::is_sheet(&tool.topology) {
+            return Err(sheet::unsupported_here(target.id, "A Boolean"));
         }
         if target.topology.solids.is_empty() || tool.topology.solids.is_empty() {
             return Err(error(
@@ -2608,7 +2698,11 @@ impl NativeKernel {
         profile: ValidationProfile,
     ) -> ProtocolValidationReport {
         let tolerance = snapshot.precision.unwrap_or_default().linear_agreement;
-        let report = validator::validate_with_pool(compute, &snapshot.topology, tolerance);
+        let report = if profile == ValidationProfile::Sheet {
+            sheet::validate_sheet(&snapshot.topology, tolerance)
+        } else {
+            validator::validate_with_pool(compute, &snapshot.topology, tolerance)
+        };
         protocol_validation(snapshot.id, profile, &report)
     }
 
@@ -8092,7 +8186,7 @@ fn face_push_pull_input_error(snapshot: SnapshotId, reason: FacePushPullInputErr
 }
 
 fn validate_transform_source(input: &Snapshot) -> Result<(), KernelError> {
-    if !input.topology.solids.is_empty() {
+    if !input.topology.solids.is_empty() || sheet::is_sheet(&input.topology) {
         return Ok(());
     }
     Err(error(
@@ -8396,6 +8490,7 @@ fn protocol_validation(
         ValidationProfile::Topology => false,
         ValidationProfile::ClosedShell => report.counts.shells == 0,
         ValidationProfile::Solid => report.counts.solids == 0,
+        ValidationProfile::Sheet => report.counts.shells == 0 || report.counts.solids > 0,
     };
     if profile_missing {
         diagnostics.push(simple_diagnostic(

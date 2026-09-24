@@ -1757,6 +1757,70 @@ pub enum KernelCommand {
         #[serde(default)]
         standing_apart: bool,
     },
+    /// A sheet body (ADR 0056, Track S): the walls an open or closed chain
+    /// of lines and arcs sweeps along the frame's normal, with no caps. A
+    /// straight piece sweeps a plane and an arc a cylinder, exactly as an
+    /// extrusion's walls are. The sheet faces to the right of the chain as
+    /// drawn, seen from the side the frame faces, so a counter-clockwise
+    /// closed chain faces outward. Built from the empty snapshot.
+    SurfaceExtrude {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_curves::deserialize")]
+        chain: Vec<PlanarCurve2>,
+        #[serde(with = "finite_f64")]
+        distance: f64,
+    },
+    /// A sheet body: the bands an open or closed chain of lines and arcs
+    /// sweeps about an axis in its own frame (ADR 0056, Track S), with no
+    /// wedge faces closing a partial turn. A straight piece sweeps a
+    /// cylinder, a cone or a planar annulus and an arc a torus or a sphere,
+    /// exactly as a revolve's bands are. Built from the empty snapshot.
+    SurfaceRevolve {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_curves::deserialize")]
+        chain: Vec<PlanarCurve2>,
+        axis: PlanarAxis2,
+        angle: RevolveAngle,
+    },
+    /// A sheet body of one planar face per region of a certified profile,
+    /// holes included, facing the way the frame does (ADR 0056, Track S).
+    /// Built from the empty snapshot.
+    PlanarPatch {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_profile::deserialize")]
+        profile: PlanarProfile2,
+    },
+    /// Thickens the sheet body of the input snapshot into a solid: every
+    /// face offset by `thickness` along the sheet's normal (against it when
+    /// negative), with side walls between the two boundaries (ADR 0056,
+    /// S4). Faces that are planes, cylinders, cones, spheres or tori offset
+    /// exactly; a ruled or B-spline face offsets by its sampled normals and
+    /// the result is labelled approximate.
+    ThickenSheet {
+        #[serde(with = "finite_f64")]
+        thickness: f64,
+    },
+    /// Trims the sheet body of the input snapshot by a plane, keeping the
+    /// side the normal faces (ADR 0056, S2). The plane's section curves are
+    /// imprinted on every face and the faces split along them.
+    TrimSheetByPlane {
+        plane_origin: Point3,
+        plane_normal: Vector3,
+    },
+}
+
+/// Several sheet snapshots to stitch into one body (ADR 0056, S3): every
+/// boundary edge that pairs with another within the precision policy's
+/// linear agreement, scaled to the bodies, is welded, and a set that
+/// closes becomes a solid. A boundary edge that lines up with another but
+/// falls outside that agreement is a gap, refused by name with the gap
+/// measured: nothing is moved to close it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StitchRequest {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: RequestId,
+    pub expected_snapshots: Vec<SnapshotId>,
+    pub precision: PrecisionPolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2050,6 +2114,10 @@ pub enum ValidationProfile {
     Topology,
     ClosedShell,
     Solid,
+    /// A sheet body (ADR 0056, Track S): shells and no solid. Every edge
+    /// is used once or twice, an edge used once being a boundary edge; the
+    /// closed-shell and solid families are not applied.
+    Sheet,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

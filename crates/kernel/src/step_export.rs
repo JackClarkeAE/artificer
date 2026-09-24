@@ -160,6 +160,7 @@ impl NativeKernel {
         let mut file = StepFile::new(product);
         let mut solids = Vec::new();
         let mut styled_items = Vec::new();
+        let mut sheets = 0_usize;
         for body in bodies {
             let (snapshot, name, placement) = (body.snapshot, body.name, &body.placement);
             if !placement.is_rigid() {
@@ -171,6 +172,49 @@ impl NativeKernel {
                     Vec::new(),
                 ));
             }
+            let mut writer = BodyWriter {
+                file: &mut file,
+                topology: &snapshot.topology,
+                placement: *placement,
+                vertices: BTreeMap::new(),
+                edges: BTreeMap::new(),
+            };
+            // A sheet body (ADR 0056, Track S) is its shells as open
+            // shells under one shell-based surface model, every face,
+            // edge and vertex written exactly as a solid's are.
+            if crate::sheet::is_sheet(&snapshot.topology) {
+                let mut shells = Vec::new();
+                for index in 0..snapshot.topology.shells.len() {
+                    let label = if snapshot.topology.shells.len() == 1 {
+                        (*name).to_owned()
+                    } else {
+                        format!("{name} {}", index + 1)
+                    };
+                    let open = writer
+                        .shell_of_kind(crate::topology::ShellKey(index), &label, "OPEN_SHELL")
+                        .map_err(|why| {
+                            error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                snapshot.id,
+                                why,
+                                Vec::new(),
+                            )
+                        })?;
+                    shells.push(open);
+                }
+                let model = writer.file.entity(format!(
+                    "SHELL_BASED_SURFACE_MODEL({},({}))",
+                    quoted(name),
+                    ids(&shells)
+                ));
+                solids.push(model);
+                sheets += 1;
+                if let Some(colour) = body.colour {
+                    styled_items.push(writer.file.styled_item(model, colour));
+                }
+                continue;
+            }
             if snapshot.topology.solids.is_empty() {
                 return Err(error(
                     KernelErrorCode::InvalidInput,
@@ -180,13 +224,6 @@ impl NativeKernel {
                     Vec::new(),
                 ));
             }
-            let mut writer = BodyWriter {
-                file: &mut file,
-                topology: &snapshot.topology,
-                placement: *placement,
-                vertices: BTreeMap::new(),
-                edges: BTreeMap::new(),
-            };
             for (index, solid) in snapshot.topology.solids.iter().enumerate() {
                 let label = if snapshot.topology.solids.len() == 1 {
                     (*name).to_owned()
@@ -246,7 +283,17 @@ impl NativeKernel {
         if !styled_items.is_empty() {
             file.presentation(&styled_items);
         }
-        Ok(file.finish(&solids, "ADVANCED_BREP_SHAPE_REPRESENTATION"))
+        // Solids alone are an advanced B-rep representation and sheets
+        // alone a manifold surface one; a file with both takes the general
+        // shape representation, which admits either item.
+        let representation = if sheets == 0 {
+            "ADVANCED_BREP_SHAPE_REPRESENTATION"
+        } else if sheets == bodies.len() {
+            "MANIFOLD_SURFACE_SHAPE_REPRESENTATION"
+        } else {
+            "SHAPE_REPRESENTATION"
+        };
+        Ok(file.finish(&solids, representation))
     }
 
     /// Writes the snapshot's display tessellation as an AP214 faceted
@@ -454,17 +501,28 @@ impl BodyWriter<'_> {
     }
 
     fn shell(&mut self, key: crate::topology::ShellKey, label: &str) -> Result<u64, String> {
+        self.shell_of_kind(key, label, "CLOSED_SHELL")
+    }
+
+    /// A shell as the given entity: `CLOSED_SHELL` for a solid's, and
+    /// `OPEN_SHELL` for a sheet's.
+    fn shell_of_kind(
+        &mut self,
+        key: crate::topology::ShellKey,
+        label: &str,
+        kind: &str,
+    ) -> Result<u64, String> {
         let shell = self
             .topology
             .shell(key)
-            .ok_or_else(|| "a solid refers to a shell that does not exist".to_owned())?;
+            .ok_or_else(|| "a body refers to a shell that does not exist".to_owned())?;
         let mut faces = Vec::new();
         for face_key in &shell.value.faces {
             faces.push(self.face(*face_key)?);
         }
         Ok(self
             .file
-            .entity(format!("CLOSED_SHELL({},({}))", quoted(label), ids(&faces))))
+            .entity(format!("{kind}({},({}))", quoted(label), ids(&faces))))
     }
 
     fn face(&mut self, key: crate::topology::FaceKey) -> Result<u64, String> {

@@ -199,45 +199,7 @@ impl Writer<'_> {
                 quoted(&label)
             ),
             ApiCommand::Sketch { on, entities, .. } => {
-                let plane = match on {
-                    SketchPlane::XY => "\"XY\"".to_owned(),
-                    SketchPlane::XZ => "\"XZ\"".to_owned(),
-                    SketchPlane::YZ => "\"YZ\"".to_owned(),
-                    SketchPlane::OnFace { face } => self.selector(face)?,
-                    SketchPlane::Frame { frame } => plane_text(*frame),
-                    SketchPlane::OffsetFace { face, offset, flip } => format!(
-                        "plane(on: {}{})",
-                        self.selector(face)?,
-                        placement_text(*offset, *flip)
-                    ),
-                    SketchPlane::Midplane {
-                        first,
-                        second,
-                        offset,
-                        flip,
-                    } => format!(
-                        "plane(between: [{}, {}]{})",
-                        self.selector(first)?,
-                        self.selector(second)?,
-                        placement_text(*offset, *flip)
-                    ),
-                    SketchPlane::ThroughEdge {
-                        edge,
-                        face,
-                        angle_degrees,
-                        offset,
-                        flip,
-                    } => format!(
-                        "plane(through: {}{}, angle: {}{})",
-                        self.selector(edge)?,
-                        face.as_ref()
-                            .map(|face| self.selector(face).map(|text| format!(", face: {text}")))
-                            .transpose()?
-                            .unwrap_or_default(),
-                        number(*angle_degrees),
-                        placement_text(*offset, *flip)
-                    ),
-                };
+                let plane = self.plane_argument(on)?;
                 let entities = entities
                     .iter()
                     .map(|entity| match entity {
@@ -490,6 +452,63 @@ impl Writer<'_> {
                 self.step_ident(&tool.0)?,
                 quoted(&label)
             ),
+            ApiCommand::SurfaceExtrude {
+                sketch, distance, ..
+            } => format!(
+                "surface_extrude(sketch: {}, distance: {}, label: {})",
+                self.step_ident(&sketch.0)?,
+                self.dimension(&label, "distance", *distance),
+                quoted(&label)
+            ),
+            ApiCommand::SurfaceRevolve {
+                sketch,
+                axis_origin,
+                axis_direction,
+                angle_degrees,
+                axis_placement,
+                ..
+            } => {
+                let axis = match axis_placement {
+                    Some(placement) => format!("axis: {}", self.axis_text(placement)?),
+                    None => format!(
+                        "axis_origin: {}, axis: {}",
+                        point3(*axis_origin),
+                        vector3(*axis_direction)
+                    ),
+                };
+                format!(
+                    "surface_revolve(sketch: {}, {axis}, angle: {}, label: {})",
+                    self.step_ident(&sketch.0)?,
+                    number(*angle_degrees),
+                    quoted(&label)
+                )
+            }
+            ApiCommand::Patch {
+                sketch, regions, ..
+            } => format!(
+                "patch(sketch: {}{}, label: {})",
+                self.step_ident(&sketch.0)?,
+                regions_text(regions),
+                quoted(&label)
+            ),
+            ApiCommand::Stitch { sheets, .. } => format!(
+                "stitch(sheets: [{}], label: {})",
+                sheets
+                    .iter()
+                    .map(|sheet| self.step_ident(&sheet.0))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", "),
+                quoted(&label)
+            ),
+            ApiCommand::Thicken { thickness, .. } => format!(
+                "thicken(thickness: {}, label: {})",
+                self.dimension(&label, "thickness", *thickness),
+                quoted(&label)
+            ),
+            ApiCommand::Trim { plane, .. } => {
+                let plane = self.plane_argument(plane)?;
+                format!("trim(plane: {plane}, label: {})", quoted(&label))
+            }
         };
         let _ = writeln!(self.body, "let {ident} = {call};");
         Ok(())
@@ -506,7 +525,50 @@ impl Writer<'_> {
         })
     }
 
-    /// A selector as the script language spells it.
+    /// A sketch plane as a script argument: a world plane's name, a face
+    /// selector, or a `plane(...)` call.
+    fn plane_argument(&mut self, on: &SketchPlane) -> Result<String, ApiError> {
+        Ok(match on {
+            SketchPlane::XY => "\"XY\"".to_owned(),
+            SketchPlane::XZ => "\"XZ\"".to_owned(),
+            SketchPlane::YZ => "\"YZ\"".to_owned(),
+            SketchPlane::OnFace { face } => self.selector(face)?,
+            SketchPlane::Frame { frame } => plane_text(*frame),
+            SketchPlane::OffsetFace { face, offset, flip } => format!(
+                "plane(on: {}{})",
+                self.selector(face)?,
+                placement_text(*offset, *flip)
+            ),
+            SketchPlane::Midplane {
+                first,
+                second,
+                offset,
+                flip,
+            } => format!(
+                "plane(between: [{}, {}]{})",
+                self.selector(first)?,
+                self.selector(second)?,
+                placement_text(*offset, *flip)
+            ),
+            SketchPlane::ThroughEdge {
+                edge,
+                face,
+                angle_degrees,
+                offset,
+                flip,
+            } => format!(
+                "plane(through: {}{}, angle: {}{})",
+                self.selector(edge)?,
+                face.as_ref()
+                    .map(|face| self.selector(face).map(|text| format!(", face: {text}")))
+                    .transpose()?
+                    .unwrap_or_default(),
+                number(*angle_degrees),
+                placement_text(*offset, *flip)
+            ),
+        })
+    }
+
     /// An axis the body places, as `axis(...)` spells it.
     fn axis_text(&mut self, placement: &AxisPlacement) -> Result<String, ApiError> {
         let flip = |flip: bool| if flip { ", flip: true" } else { "" };
