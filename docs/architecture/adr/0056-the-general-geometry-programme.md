@@ -280,10 +280,16 @@ and convex edges fills the concave ones first, cuts a convex edge that meets
 a fill standing apart with its tool bounded at the band's tangency plane
 (the planar-cap corner, exact), and finishes the rest by the ladder or
 standing apart; the cube with all twelve edges was found to build already
-(vertex blend). Not landed: F1's `Surface::Pipe` and single construction,
-the rolling-ball patch at a concave–convex corner (planar cap only), a
-concave edge ending on a leaning face (`CONCAVE_EDGE_END_UNSUPPORTED`),
-F4–F7. Regressions: `crates/kernel/tests/fillet_frontier.rs`.
+(vertex blend). F5 has a first slice, approximate and labelled: a radius
+running linearly along a convex straight edge, reached through
+`NativeKernel::finish_edge_variable_radius` (no protocol command yet),
+whose band is lofted as flat facets between the two end sections and cut
+exactly, under `variable-radius/faceted` with the chords' sagitta in the
+warning and the volume certified against the cone's closed form. Not
+landed: F1's `Surface::Pipe` and single construction, the rolling-ball
+patch at a concave–convex corner (planar cap only), a concave edge ending
+on a leaning face (`CONCAVE_EDGE_END_UNSUPPORTED`), F4, F6, F7, and the
+rest of F5. Regressions: `crates/kernel/tests/fillet_frontier.rs`.
 
 ### F1. The rolling-ball blend as one construction
 

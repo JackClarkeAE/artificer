@@ -232,22 +232,22 @@ pub(crate) fn edge_is_reflex(
 
 /// The material wedge at a straight edge between two flat faces, read from
 /// the topology rather than guessed from the geometry.
-struct Wedge {
-    endpoints: [Point3; 2],
-    length: f64,
+pub(crate) struct Wedge {
+    pub(crate) endpoints: [Point3; 2],
+    pub(crate) length: f64,
     /// The edge's own direction, unit.
-    along: Vector3,
+    pub(crate) along: Vector3,
     /// The outward normals of the face whose coedge walks the edge forward
     /// and of the one that walks it in reverse, unit.
-    normals: [Vector3; 2],
+    pub(crate) normals: [Vector3; 2],
     /// The way into each of those faces from the edge, square to it and
     /// pointing at the material.
-    into: [Vector3; 2],
+    pub(crate) into: [Vector3; 2],
     /// Halfway between the two, into the material.
-    bisector: Vector3,
+    pub(crate) bisector: Vector3,
     /// The interior dihedral, measured through the material; below a half
     /// turn, since only a convex edge is read.
-    interior: f64,
+    pub(crate) interior: f64,
 }
 
 /// Reads the wedge at one edge, or says why it is not one this route cuts.
@@ -259,7 +259,7 @@ struct Wedge {
 /// other face's normal is right only at a convex edge, and at a reflex one
 /// it turns both directions round: the tool then takes the wedge of air
 /// between the faces for material and cuts into the body behind it.
-fn read_wedge(
+pub(crate) fn read_wedge(
     topology: &Topology,
     edge: usize,
     precision: PrecisionPolicy,

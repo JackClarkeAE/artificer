@@ -51,6 +51,7 @@ mod sweep_profile;
 mod topology;
 mod transform;
 mod validator;
+mod variable_radius_fillet;
 mod vertex_blend;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -794,6 +795,26 @@ impl NativeKernel {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// A fillet whose radius runs linearly from `radii[0]` at the edge's
+    /// first vertex to `radii[1]` at its second, on a convex straight edge
+    /// between two flat faces (ADR 0056, F5, first slice).
+    ///
+    /// The result is an approximation and is labelled as one: the band is
+    /// carried as flat facets, the report's rung is `variable-radius/faceted`
+    /// and its warnings carry `EDGE_FINISH_VARIABLE_RADIUS_FACETED_APPROXIMATION`
+    /// with the measured deviation from the true cone. The volume removed is
+    /// certified against the cone's closed form, and an edge this route
+    /// cannot carry — concave, curved, or running on into material at an
+    /// end — is refused by name.
+    pub fn finish_edge_variable_radius(
+        input: &Snapshot,
+        target: EntityRef,
+        radii: [f64; 2],
+        precision: PrecisionPolicy,
+    ) -> Result<ExecutionOutcome, KernelError> {
+        variable_radius_fillet::finish(input, target, radii, precision)
     }
 
     /// Returns the stable initial snapshot. Its precision policy is bound by

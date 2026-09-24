@@ -87,6 +87,7 @@ are stable, slash-separated paths:
 | `edge-finish/concave-rim-blend` | A fillet or chamfer along a concave rim — a boss on its plate, a counterbore's or pocket's floor rim (ADR 0056, F2): a torus or cone band built in place on the air side of the corner, with its material added. Exact, by Pappus. |
 | `edge-finish/concave-fill` | A concave straight edge between flat faces on a body no prism rung owns, filled by unioning its own corner region into the body (ADR 0056, F2); the material added is certified against the closed form. Convex edges in the same selection are finished on the filled body afterwards, bounded against the fill where they meet it (F3). Exact. |
 | `edge-finish/faceted` | A fillet or chamfer on the faceted tier. |
+| `variable-radius/faceted` | A fillet whose radius changes linearly along a convex straight edge (ADR 0056, F5, first slice), reached through `NativeKernel::finish_edge_variable_radius`: the band is carried as flat facets lofted between the two end sections and cut exactly, so the approximation is the tool's alone. Carries `EDGE_FINISH_VARIABLE_RADIUS_FACETED_APPROXIMATION` with the measured deviation; the volume removed is certified against the cone's closed form. |
 | `boolean/prism`, `boolean/analytic` | A union, difference or intersection by the prism reduction or the general engine. |
 | `mirror/exact` | A mirror: every carrier reflected as itself, faces reversed to face outward. |
 | `pattern/replay` | A feature pattern; the instance steps `<label>/<n>` under it carry the rungs that built each instance. |

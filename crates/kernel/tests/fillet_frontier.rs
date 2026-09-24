@@ -1126,6 +1126,130 @@ fn the_l_block_finishes_its_concave_and_convex_edges_in_one_call() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// F5, first slice: a radius that changes along the edge, approximate and
+// labelled
+// ---------------------------------------------------------------------------
+
+/// The material a fillet whose radius runs linearly from `r0` to `r1` takes
+/// from a right-angled edge of `length`: `(1 − π/4)∫r(s)² ds`.
+fn variable_fillet_removed(r0: f64, r1: f64, length: f64) -> f64 {
+    (1.0 - PI / 4.0) * (r0 * r0 + r0 * r1 + r1 * r1) / 3.0 * length
+}
+
+fn variable_fillet(
+    body: &Snapshot,
+    target: EntityRef,
+    radii: [f64; 2],
+) -> Result<ExecutionOutcome, String> {
+    NativeKernel::finish_edge_variable_radius(body, target, radii, PrecisionPolicy::default())
+        .map_err(|error| format!("{error:?}"))
+}
+
+#[test]
+fn a_fillet_whose_radius_changes_along_the_edge_is_approximate_and_says_so() {
+    let side = 10.0;
+    let cube = cuboid((0.0, 0.0, 0.0), (side, side, side), "cube");
+    let before = cube.measures().volume;
+    let (r0, r1) = (1.0, 2.0);
+    let outcome = variable_fillet(&cube, vertical_edge(&cube, side, side), [r0, r1])
+        .expect("a variable-radius fillet builds");
+    assert_valid(&outcome.snapshot);
+    assert_eq!(
+        outcome.report.rung.as_deref(),
+        Some("variable-radius/faceted")
+    );
+    assert_eq!(
+        outcome.report.tier(),
+        artificer_protocol::Tier::Approximate,
+        "a faceted band is an approximation"
+    );
+    let caveat = outcome
+        .report
+        .warnings
+        .iter()
+        .find(|warning| {
+            warning.code.as_str() == "EDGE_FINISH_VARIABLE_RADIUS_FACETED_APPROXIMATION"
+        })
+        .expect("the result carries its caveat");
+    let measurement = caveat
+        .measurement
+        .expect("the caveat carries the measured deviation");
+    assert!(
+        measurement.measured > 0.0 && measurement.measured < r1 * 1.0e-2,
+        "the deviation is the chords' sagitta: {}",
+        measurement.measured
+    );
+    // The facets lie inside the true arc, so the polyhedron takes at least
+    // the cone's corner and only a little more: the segments between the
+    // chords and the arc, which the sagitta bounds.
+    let removed = before - outcome.snapshot.measures().volume;
+    let exact = variable_fillet_removed(r0, r1, side);
+    assert!(
+        removed >= exact - 1.0e-9,
+        "removed {removed} is at least the cone's {exact}"
+    );
+    assert!(
+        removed <= exact + measurement.measured * PI / 2.0 * r1 * side,
+        "removed {removed} exceeds the cone's {exact} by more than the chords allow"
+    );
+}
+
+#[test]
+fn a_variable_fillet_builds_at_every_pair_of_radii() {
+    let side = 10.0;
+    let cube = cuboid((0.0, 0.0, 0.0), (side, side, side), "cube");
+    let before = cube.measures().volume;
+    let mut trouble = Vec::new();
+    for step in 1..=24 {
+        let r0 = 0.25 + f64::from(step) * 0.1;
+        let r1 = 3.5 - f64::from(step) * 0.1;
+        match variable_fillet(&cube, vertical_edge(&cube, side, side), [r0, r1]) {
+            Ok(outcome) => {
+                let removed = before - outcome.snapshot.measures().volume;
+                let exact = variable_fillet_removed(r0, r1, side);
+                let sagitta = outcome
+                    .report
+                    .warnings
+                    .iter()
+                    .find_map(|warning| warning.measurement)
+                    .map_or(f64::NAN, |measurement| measurement.measured);
+                if !(removed >= exact - 1.0e-9
+                    && removed <= exact + sagitta * PI / 2.0 * r0.max(r1) * side)
+                {
+                    trouble.push(format!(
+                        "{r0:.2}→{r1:.2}: removed {removed}, cone {exact}, sagitta {sagitta}"
+                    ));
+                }
+            }
+            Err(error) => trouble.push(format!("{r0:.2}→{r1:.2}: {error}")),
+        }
+    }
+    assert!(
+        trouble.is_empty(),
+        "{} of 24 variable fillets refused or drifted:\n{}",
+        trouble.len(),
+        trouble.join("\n")
+    );
+}
+
+#[test]
+fn a_variable_fillet_refuses_what_it_cannot_carry_by_name() {
+    let body = drilled_l_block();
+    // The reflex edge: this route only removes.
+    assert_refused(
+        variable_fillet(&body, vertical_edge(&body, 6.0, 4.0), [1.0, 2.0]),
+        "VARIABLE_RADIUS_EDGE_UNSUPPORTED",
+        "a variable fillet of a reflex edge",
+    );
+    let cube = cuboid((0.0, 0.0, 0.0), (10.0, 10.0, 10.0), "cube");
+    assert_refused(
+        variable_fillet(&cube, vertical_edge(&cube, 10.0, 10.0), [1.0, 0.0]),
+        "VARIABLE_RADIUS_DISTANCE_INVALID",
+        "a variable fillet running to nothing",
+    );
+}
+
 #[test]
 fn a_cube_with_all_twelve_edges_filleted_builds() {
     let side = 10.0;
