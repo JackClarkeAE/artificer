@@ -309,6 +309,13 @@ fn arc_disc_prisms_combine_exactly_and_print_their_timings() {
 /// which no optimisation may do. (`blend_then_drill` moved once, when the
 /// numerical intersection rung of ADR 0056 Track B took its drill through
 /// the torus band over from the faceted tier; the table carries that body.)
+///
+/// The digest hashes the body's coordinates, and four of the nine bodies
+/// turn by a transcendental function whose last bits the platform's maths
+/// library decides (the 0.99.7 notes tell that story), so each platform
+/// the kernel tests run on carries its own table; a platform with none
+/// prints the table it would pin and asserts nothing.
+#[cfg(target_os = "linux")]
 const EXAMPLE_DIGESTS: &[(&str, &str, &str, Tier)] = &[
     (
         "bearing_mount",
@@ -365,6 +372,68 @@ const EXAMPLE_DIGESTS: &[(&str, &str, &str, Tier)] = &[
         Tier::Exact,
     ),
 ];
+
+/// The same bodies as the Windows maths library computes them.
+#[cfg(windows)]
+const EXAMPLE_DIGESTS: &[(&str, &str, &str, Tier)] = &[
+    (
+        "bearing_mount",
+        "9ce84a69aae7bbfd08b6208db5576f32606e06f8167d00993c3ab499c7b29fac",
+        "9ce84a69aae7bbfd08b6208db5576f32",
+        Tier::Exact,
+    ),
+    (
+        "blend_then_drill",
+        "7323ad6a371f9b54a7da9b3a3624054d69e82ba7a737c05fd388c51f51bc3697",
+        "7323ad6a371f9b54a7da9b3a3624054d",
+        Tier::Approximate,
+    ),
+    (
+        "filleted_cube",
+        "178163bc63e983296206c22346b52eb8b2aabfd46704a4e103973075e284aa1a",
+        "178163bc63e983296206c22346b52eb8",
+        Tier::Exact,
+    ),
+    (
+        "filleted_flange",
+        "f8e26c18c7d986036c51d9e7492033d8f2b501ecd4222fca6af1d5a8628fe83a",
+        "f8e26c18c7d986036c51d9e7492033d8",
+        Tier::Exact,
+    ),
+    (
+        "flanged_hub",
+        "781c41804c972b9e5da068990b71d44ec4ce574058c9c24763a7b99016f853c2",
+        "781c41804c972b9e5da068990b71d44e",
+        Tier::Exact,
+    ),
+    (
+        "spline_vase",
+        "a9ba59205667e4b9b6a50224d4dcabcc34401c099f22778a0ecce2c18025eb7b",
+        "a9ba59205667e4b9b6a50224d4dcabcc",
+        Tier::Approximate,
+    ),
+    (
+        "square_to_circle_loft",
+        "51f9c49b6462b1118542aad593cdbc25048650432e08de0e63059e463aa0a082",
+        "51f9c49b6462b1118542aad593cdbc25",
+        Tier::Approximate,
+    ),
+    (
+        "standoff_plate",
+        "1a6dcf8c43c48e367825b0e66262d2bddb996a271ab34100b70e9f1d23691a94",
+        "1a6dcf8c43c48e367825b0e66262d2bd",
+        Tier::Exact,
+    ),
+    (
+        "three_holes_and_cut",
+        "794ee7840323fa976a6ea710642e3a63a9c21f12fec5d935e48e1cbf715cf11c",
+        "794ee7840323fa976a6ea710642e3a63",
+        Tier::Exact,
+    ),
+];
+
+#[cfg(not(any(target_os = "linux", windows)))]
+const EXAMPLE_DIGESTS: &[(&str, &str, &str, Tier)] = &[];
 
 fn example_sessions() -> Vec<(&'static str, Session)> {
     let sources: [(&str, &str); 9] = [
