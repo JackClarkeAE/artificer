@@ -41,6 +41,9 @@ pub enum OperationKind {
     BoreFinish,
     Finish,
     Groove,
+    /// A chamfer or round where the outside meets the back face, traced on
+    /// the parting blade's front corner before parting off.
+    BackCorner,
     PartOff,
     Pocket,
     Profile,
@@ -59,6 +62,7 @@ impl OperationKind {
             Self::BoreFinish => "Finish bore",
             Self::Finish => "Finish",
             Self::Groove => "Groove",
+            Self::BackCorner => "Back corner",
             Self::PartOff => "Part off",
             Self::Pocket => "Pocket",
             Self::Profile => "Profile",

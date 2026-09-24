@@ -58,6 +58,30 @@ pub struct Bore {
     pub bottom_z: Option<f64>,
 }
 
+/// The corner where the outside meets the back face, when it is chamfered
+/// or rounded: a run of curves facing the chuck that climbs from the back
+/// face's outer corner to the rim. A right-hand insert from the front
+/// cannot reach it, but the parting blade's front corner can trace it
+/// before parting off, the way a machinist breaks a back edge: the blade's
+/// body trails on the chuck side, in the kerf it is about to cut anyway.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackCorner {
+    /// The run from the rim down to the back face's outer corner, the way
+    /// the blade traces it.
+    pub curves: Vec<PlanarCurve2>,
+    /// The radius where the run meets the outside profile.
+    pub rim_radius: f64,
+    /// The radius where the run meets the back face.
+    pub inner_radius: f64,
+    /// Where the run leaves the rim.
+    pub front_z: f64,
+}
+
+/// How far, along the axis, a back corner may run for the parting blade to
+/// cut it: a chamfer or round up to twice the blade's width. A longer taper
+/// facing the chuck wants a second setup.
+pub const BACK_CORNER_BLADE_WIDTHS: f64 = 2.0;
+
 /// The section as the planner reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SectionReading {
@@ -65,9 +89,11 @@ pub struct SectionReading {
     /// The outside profile from the front outer corner to the back outer
     /// corner, exact, grooves included.
     pub outside: Vec<PlanarCurve2>,
-    /// The outside profile with its grooves filled in, front to back.
+    /// The outside profile with its grooves filled in and its back corner
+    /// squared off at the rim, front to back.
     pub envelope: Vec<PlanarCurve2>,
     pub grooves: Vec<Groove>,
+    pub back_corner: Option<BackCorner>,
     pub bore: Option<Bore>,
     pub front_outer_radius: f64,
     pub back_outer_radius: f64,
@@ -155,12 +181,25 @@ pub fn read_section(setup: &TurnedSetup) -> Result<SectionReading, CamRefusal> {
     }
     let front_outer_radius = r_of(front_outer);
 
+    // The back corner: a chamfer or round climbing from the back face's
+    // outer corner to the rim, every curve facing the chuck and never
+    // turning back. The envelope squares it off at the rim, and the parting
+    // blade traces it last.
+    let back_corner = read_back_corner(&outside_forward, tolerance);
+    let mut envelope_forward: Vec<PlanarCurve2> = Vec::new();
+    let mut cursor = 0;
+    if let Some(corner) = &back_corner {
+        envelope_forward.push(PlanarCurve2::Line {
+            start: Point2::new(corner.rim_radius, back_z),
+            end: Point2::new(corner.rim_radius, corner.front_z),
+        });
+        cursor = corner.curves.len();
+    }
+
     // Grooves: (inward radial wall, cylindrical floor, outward radial wall)
     // returning to the same rim. Any other curve facing the chuck is an
     // undercut.
     let mut grooves = Vec::new();
-    let mut envelope_forward: Vec<PlanarCurve2> = Vec::new();
-    let mut cursor = 0;
     while cursor < outside_forward.len() {
         let curve = &outside_forward[cursor];
         if faces_chuck(curve) {
@@ -301,9 +340,51 @@ pub fn read_section(setup: &TurnedSetup) -> Result<SectionReading, CamRefusal> {
         outside,
         envelope,
         grooves,
+        back_corner,
         bore,
         front_outer_radius,
         back_outer_radius,
+    })
+}
+
+/// The back corner at the start of the outside profile (read back to
+/// front): the longest run of lines and circular arcs that face the chuck
+/// while climbing outward and forward, ending where the profile stops facing
+/// the chuck. `None` when the profile starts squarely at the rim.
+fn read_back_corner(outside_forward: &[PlanarCurve2], tolerance: f64) -> Option<BackCorner> {
+    let climbs = |curve: &PlanarCurve2| -> bool {
+        if !matches!(
+            curve,
+            PlanarCurve2::Line { .. } | PlanarCurve2::CircularArc { .. }
+        ) {
+            return false;
+        }
+        let points = geom::sample_curve(curve, 1.0e-4);
+        let (start, end) = (geom::curve_start(curve), geom::curve_end(curve));
+        end.x > start.x + tolerance
+            && end.y > start.y + tolerance
+            && points.windows(2).all(|pair| {
+                pair[1].x >= pair[0].x - tolerance && pair[1].y >= pair[0].y - tolerance
+            })
+    };
+    let count = outside_forward
+        .iter()
+        .take_while(|curve| faces_chuck(curve) && climbs(curve))
+        .count();
+    if count == 0 || count == outside_forward.len() {
+        // A profile that faces the chuck all the way to the front is a
+        // taper the blade cannot be asked to trace; the groove reader
+        // refuses it by name.
+        return None;
+    }
+    let run = &outside_forward[..count];
+    let inner = geom::curve_start(&run[0]);
+    let rim = geom::curve_end(run.last()?);
+    Some(BackCorner {
+        curves: run.iter().rev().map(geom::reversed_curve).collect(),
+        rim_radius: rim.x,
+        inner_radius: inner.x,
+        front_z: rim.y,
     })
 }
 
@@ -778,6 +859,80 @@ pub fn plan_turning(
             feed: per_revolution(blade, material),
             moves,
             notes: Vec::new(),
+        });
+    }
+
+    // ---- Back corner ----------------------------------------------------
+    if let Some(corner) = &reading.back_corner {
+        let reach = corner.front_z - back_z;
+        let limit = BACK_CORNER_BLADE_WIDTHS * blade.diameter;
+        if reach > limit + 1.0e-9 {
+            return Err(CamRefusal::TurnedUndercut {
+                detail: format!(
+                    "the back corner runs {reach:.3} mm along the axis, more than the {limit:.1} mm the {:.1} mm parting blade can trace; a taper facing the chuck needs a second setup",
+                    blade.diameter
+                ),
+            });
+        }
+        // The blade's front corner comes in at the rim and follows the run
+        // down to the back face. Its body trails on the chuck side, in the
+        // kerf the part-off cuts next, so nothing it sweeps is the part's.
+        let mut moves = vec![
+            Move::Rapid {
+                to: lathe_point(r_clear, z_start),
+            },
+            Move::Rapid {
+                to: lathe_point(r_clear, corner.front_z),
+            },
+            Move::Feed {
+                to: lathe_point(corner.rim_radius, corner.front_z),
+            },
+        ];
+        for curve in &corner.curves {
+            match curve {
+                PlanarCurve2::Line { end, .. } => moves.push(Move::Feed {
+                    to: lathe_point(end.x, end.y),
+                }),
+                PlanarCurve2::CircularArc {
+                    center,
+                    end,
+                    direction,
+                    ..
+                } => moves.push(Move::Arc {
+                    to: lathe_point(end.x, end.y),
+                    center: *center,
+                    clockwise: *direction == artificer_protocol::ArcDirection::Clockwise,
+                }),
+                _ => {}
+            }
+        }
+        // Out through the kerf the blade's own body has just opened.
+        moves.push(Move::Rapid {
+            to: lathe_point(r_clear, back_z),
+        });
+        moves.push(Move::Rapid {
+            to: lathe_point(r_clear, z_start),
+        });
+        let rounded = corner
+            .curves
+            .iter()
+            .any(|curve| matches!(curve, PlanarCurve2::CircularArc { .. }));
+        operations.push(Operation {
+            kind: OperationKind::BackCorner,
+            name: format!(
+                "{} the back corner with the parting blade, Ø{:.1} to Ø{:.1}",
+                if rounded { "Round" } else { "Chamfer" },
+                corner.rim_radius * 2.0,
+                corner.inner_radius * 2.0
+            ),
+            tool: use_tool(blade),
+            spindle: surface_speed(blade, material, max_rpm),
+            feed: per_revolution(blade, material),
+            moves,
+            notes: vec![
+                "Traced on the blade's front corner before parting off; the blade's body runs in the part-off kerf."
+                    .to_owned(),
+            ],
         });
     }
 

@@ -272,3 +272,40 @@ fn the_kernel_queries_answer_in_closed_form() {
     assert!((artificer_cam::geom::signed_area(&prism.outer).abs() - 6.0).abs() < 1.0e-9);
     assert!(NativeKernel::prism_profile(&block, Vector3::new(1.0, 0.0, 0.0)).is_none());
 }
+
+/// A cylinder drilled through is a tube, and a lathe part, before any rim
+/// is chamfered: its section used to fail to chain and it was milled.
+#[test]
+fn a_drilled_cylinder_is_turned_before_it_is_chamfered() {
+    use std::collections::BTreeMap;
+
+    use artificer_kernel::api::scripting::NoModules;
+    use artificer_kernel::api::session::Session;
+    let mut session = Session::new();
+    let outcome = session.run_script_with(
+        "let s = sketch(on: \"XY\", entities: [circle(center: [0, 0], radius: 20)], label: \"s\");\nlet cyl = extrude(sketch: s, distance: 60, label: \"cyl\");\ndrill(face: faces(\">Z\"), center: [0, 0], diameter: 10, depth: 60, label: \"bore\");",
+        &BTreeMap::new(),
+        &NoModules,
+        &artificer_kernel::CancellationToken::default(),
+    );
+    assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+    let Setup::Turned(turned) = recognise(&session.snapshot) else {
+        panic!(
+            "a bored cylinder is turned: {:?}",
+            recognise(&session.snapshot).kind()
+        );
+    };
+    assert!(turned.through_bore);
+    assert!((turned.max_radius - 20.0).abs() < 1.0e-9);
+    let plan = artificer_cam::plan_setup(
+        &Setup::Turned(turned),
+        &artificer_cam::ToolLibrary::builtin(),
+        artificer_cam::Material::Aluminium,
+    )
+    .expect("a tube plans");
+    assert!(
+        plan.operations.iter().any(|operation| {
+            matches!(operation.kind, artificer_cam::plan::OperationKind::Drill)
+        })
+    );
+}

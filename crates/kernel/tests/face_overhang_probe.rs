@@ -275,3 +275,151 @@ fn a_fully_interior_circle_still_uses_the_exact_face_path() {
         "{volume} vs {expected}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A plate with a hole in it: the notch is still exact
+// ---------------------------------------------------------------------------
+
+/// The plate with a Ø0.5 hole through it at (1, 1.5).
+fn drilled_plate() -> Snapshot {
+    let base = plate();
+    NativeKernel::execute(
+        &base,
+        &ExecuteRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id: RequestId::new("overhang-drill"),
+            expected_snapshot: base.id(),
+            precision: PrecisionPolicy::default(),
+            command: KernelCommand::DrillHole {
+                target_face: top_face(&base),
+                frame: PlanarFrame3::new(
+                    Point3::new(0.0, 0.0, 1.0),
+                    Vector3::new(1.0, 0.0, 0.0),
+                    Vector3::new(0.0, 1.0, 0.0),
+                ),
+                center: Point2::new(1.0, 1.5),
+                diameter: 0.5,
+                depth: 10.0,
+            },
+        },
+        &CancellationToken::new(),
+    )
+    .expect("the hole should drill")
+    .snapshot
+}
+
+fn rectangle(min: (f64, f64), max: (f64, f64)) -> PlanarProfile2 {
+    PlanarProfile2 {
+        regions: vec![PlanarRegion2 {
+            outer: PlanarLoop2::from_polygon(&[
+                Point2::new(min.0, min.1),
+                Point2::new(max.0, min.1),
+                Point2::new(max.0, max.1),
+                Point2::new(min.0, max.1),
+            ]),
+            holes: vec![],
+        }],
+    }
+}
+
+/// A cut of `profile` sketched on the drilled plate's top, `distance` deep,
+/// with the report's warnings: an exact result carries none, and a body
+/// rebuilt from a tessellation says so.
+fn drilled_plate_cut(profile: PlanarProfile2, distance: f64) -> (Snapshot, Vec<String>) {
+    let base = drilled_plate();
+    let outcome = NativeKernel::execute(
+        &base,
+        &ExecuteRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id: RequestId::new("overhang-drilled-cut"),
+            expected_snapshot: base.id(),
+            precision: PrecisionPolicy::default(),
+            command: KernelCommand::ExtrudeFacePlanarProfile {
+                target_face: top_face(&base),
+                frame: PlanarFrame3::new(
+                    Point3::new(0.0, 0.0, 1.0),
+                    Vector3::new(1.0, 0.0, 0.0),
+                    Vector3::new(0.0, 1.0, 0.0),
+                ),
+                profile,
+                distance,
+                operation: FaceExtrusionOperation::Cut,
+            },
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap_or_else(|error| panic!("the notch should cut: {error:?}"));
+    let warnings = outcome
+        .report
+        .warnings
+        .iter()
+        .map(|warning| format!("{:?}", warning.code))
+        .collect();
+    (outcome.snapshot, warnings)
+}
+
+/// A notch part-way into a plate with a hole in it used to fail validation:
+/// the prism reduction glues a lower slab to an upper one at the notch
+/// floor, and the two halves of the hole's rim at that height, sharing both
+/// seam vertices and the circle, both welded onto one lower half. The weld
+/// tells them apart by their midpoints now, the notch is exact, and no
+/// tessellated rebuild stands in.
+#[test]
+fn a_notch_part_way_into_a_drilled_plate_stays_exact() {
+    let (cut, warnings) = drilled_plate_cut(rectangle((3.5, 1.0), (4.5, 2.0)), 0.4);
+    assert!(warnings.is_empty(), "an exact notch: {warnings:?}");
+    assert!(NativeKernel::validate(&cut, ValidationProfile::Solid).valid);
+    let hole = PI * 0.25 * 0.25 * 1.0;
+    let notch = 0.5 * 1.0 * 0.4;
+    let expected = 4.0 * 3.0 * 1.0 - hole - notch;
+    let volume = cut.measures().volume;
+    assert!(
+        (volume - expected).abs() <= EPSILON,
+        "cut volume {volume} vs {expected}"
+    );
+    // The hole is still a hole: its wall is the two cylindrical halves of
+    // the rim, or the two of each slab, welded along the rim at the notch
+    // floor's height — every one on the hole's own carrier.
+    let faces = NativeKernel::describe_faces(&cut);
+    let cylinders = faces
+        .values()
+        .filter(|face| face.geometry.surface_kind() == "cylinder")
+        .count();
+    assert!(matches!(cylinders, 2 | 4), "{faces:?}");
+}
+
+/// The same across the hole's rim: a notch that runs from the material out
+/// over the hole removes the material under it and nothing more.
+#[test]
+fn a_notch_across_a_hole_rim_stays_exact() {
+    let (min, max) = ((0.9, 1.3), (1.6, 1.7));
+    let (cut, warnings) = drilled_plate_cut(rectangle(min, max), 0.4);
+    assert!(warnings.is_empty(), "an exact notch: {warnings:?}");
+    assert!(NativeKernel::validate(&cut, ValidationProfile::Solid).valid);
+    // The material the notch removes: the rectangle less the part of the
+    // hole's disc inside it, by a fine Riemann sum over x.
+    let strips = 400_000;
+    let width = max.0 - min.0;
+    let mut overlap = 0.0;
+    for step in 0..strips {
+        let x = (f64::from(step) + 0.5) / f64::from(strips) * width + min.0;
+        let dx = x - 1.0;
+        if dx.abs() >= 0.25 {
+            continue;
+        }
+        let half = (0.25_f64 * 0.25 - dx * dx).sqrt();
+        let low = (1.5 - half).max(min.1);
+        let high = (1.5 + half).min(max.1);
+        if high > low {
+            overlap += (high - low) * width / f64::from(strips);
+        }
+    }
+    let hole = PI * 0.25 * 0.25 * 1.0;
+    let notch = (width * (max.1 - min.1) - overlap) * 0.4;
+    let expected = 4.0 * 3.0 * 1.0 - hole - notch;
+    let volume = cut.measures().volume;
+    assert!(
+        (volume - expected).abs() <= 1.0e-6,
+        "cut volume {volume} vs {expected}"
+    );
+}

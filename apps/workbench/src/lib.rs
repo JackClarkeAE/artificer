@@ -51,7 +51,6 @@ use artificer_catalog::CatalogStore;
 use artificer_compute::{
     ComputePool, ExecutionMode, JobError, JobHandle, JobPriority, JobScheduler,
 };
-use artificer_geometry::{Orientation2, Point2 as GeometryPoint2, orient2d};
 use artificer_kernel::{
     CancellationToken, DebugScene, ExecutionOutcome, FaceBoundaryCurve2, FaceRole, NativeKernel,
     PlanarFaceSupport, Snapshot, SnapshotMeasures,
@@ -1650,7 +1649,6 @@ pub enum SketchExtrusionEligibility {
     NumericallyIndeterminate,
     FaceRectangleRequired,
     ProfileOutsideSupport,
-    BooleanUnionRequired,
 }
 
 impl SketchExtrusionEligibility {
@@ -1721,11 +1719,7 @@ impl SketchExtrusionEligibility {
                     .to_owned(),
             ),
             Self::ProfileOutsideSupport => Some(
-                "The feature loop must stay inside the selected face material and outside every face hole."
-                    .to_owned(),
-            ),
-            Self::BooleanUnionRequired => Some(
-                "The selected regions cross a face edge or hole. Rejoining those material islands is a same-body Boolean union, not a regular face extrusion; that exact merge is not implemented yet."
+                "The selected profile lies wholly outside the face's material: off its edge, or inside a hole. Draw at least part of it on the face."
                     .to_owned(),
             ),
         }
@@ -1748,8 +1742,7 @@ impl SketchExtrusionEligibility {
             | Self::Concave
             | Self::CollinearTurn
             | Self::FaceRectangleRequired
-            | Self::ProfileOutsideSupport
-            | Self::BooleanUnionRequired => KernelErrorCode::InvalidInput,
+            | Self::ProfileOutsideSupport => KernelErrorCode::InvalidInput,
         }
     }
 }
@@ -2618,7 +2611,9 @@ struct HydratedWorkbenchRuntime {
 /// bound to `SketchSupport` and the immutable committed snapshot.
 #[derive(Clone, Debug)]
 struct FaceSketchDisplayContext {
-    fit_key: SketchContextFitKey,
+    /// Fits the canvas to the projection once; `None` leaves the canvas
+    /// where it is.
+    fit_key: Option<SketchContextFitKey>,
     axis_labels: [&'static str; 2],
     raw_triangles: Vec<(f64, SketchContextTriangle)>,
     raw_edges: Vec<(f64, SketchContextEdge)>,
@@ -2629,6 +2624,9 @@ struct FaceSketchDisplayContext {
     /// The support face's exact boundary curves, offered to sketch snapping.
     /// Unlike `edges`, these are analytic and never a chord approximation.
     snap_curves: Vec<SketchContextCurve>,
+    /// A construction or origin plane has no material side: whatever stands
+    /// on either side of it is in view, so nothing is an x-ray layer.
+    two_sided: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2652,6 +2650,22 @@ impl FaceSketchDisplayContext {
         // Depth is signed along the outward face normal: zero on the face,
         // positive for material raised from it, negative below it.
         const SURFACE_TOLERANCE: f64 = 1.0e-4;
+        if self.two_sided {
+            // Seen through a plane, a body behind it is as plain as one in
+            // front: painter order, deepest first.
+            let mut body = self.raw_triangles.clone();
+            body.sort_by(|left, right| left.0.total_cmp(&right.0));
+            self.triangles = body
+                .into_iter()
+                .map(|(_, triangle)| triangle.with_layer(SketchContextLayer::Body))
+                .collect();
+            self.edges = self
+                .raw_edges
+                .iter()
+                .map(|(_, edge)| edge.with_layer(SketchContextLayer::Body))
+                .collect();
+            return;
+        }
         let depth_shade = |depth: f64| -> f32 {
             if max_depth <= SURFACE_TOLERANCE {
                 return 0.0;
@@ -2707,11 +2721,15 @@ impl FaceSketchDisplayContext {
     }
 
     fn viewport_context(&self) -> SketchViewportContext<'_> {
-        SketchViewportContext::new(&self.triangles, &self.edges)
-            .with_selected_face(&self.boundary, self.fit_key)
+        let mut context = SketchViewportContext::new(&self.triangles, &self.edges)
             .with_selected_face_inner_boundaries(&self.inner_boundaries)
             .with_snap_curves(&self.snap_curves)
-            .with_axis_labels(self.axis_labels)
+            .with_axis_labels(self.axis_labels);
+        match self.fit_key {
+            Some(key) => context = context.with_selected_face(&self.boundary, key),
+            None => context.selected_face_boundary = &self.boundary,
+        }
+        context
     }
 }
 
@@ -6702,6 +6720,25 @@ impl KernelLabApp {
         };
     }
 
+    /// The bodies a Boolean has spent: the tool of every active, committed,
+    /// unsuppressed Boolean that did not keep it. Spent material is not a
+    /// body — nothing lists it, counts it or can show it — though its record
+    /// stays in the document for the history's sake and it comes back if
+    /// the Boolean is undone, suppressed or scrubbed away. An extrusion cut
+    /// from an origin-plane sketch is a sweep folded in by such a Boolean,
+    /// and used to leave its tool behind as a hidden "Body 2".
+    fn consumed_body_ids(&self) -> Vec<BodyId> {
+        self.document
+            .active_features()
+            .iter()
+            .filter(|feature| !feature.state.suppressed && feature.committed.is_some())
+            .filter_map(|feature| match &feature.action {
+                ReplayAction::Boolean(recipe) if !recipe.keep_tool => Some(recipe.tool),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn restore_runtime_from_document(&mut self) {
         self.sync_feature_reports_from_document();
         let previous_active = self.active_body_id();
@@ -6718,9 +6755,13 @@ impl KernelLabApp {
                         )
                     })
             });
+        let consumed = self.consumed_body_ids();
         let mut bodies = Vec::new();
         for record in self.document.bodies() {
             if bootstrap_replaced && Some(record.id) == self.bootstrap_body {
+                continue;
+            }
+            if consumed.contains(&record.id) {
                 continue;
             }
             let Some(snapshot) = record.committed_snapshot else {
@@ -6758,12 +6799,28 @@ impl KernelLabApp {
             });
         }
         self.bodies = bodies;
+        // A spent body keeps its number: the next body is numbered past
+        // every record in the document, listed or not.
+        let recorded = self
+            .document
+            .bodies()
+            .iter()
+            .filter_map(|record| {
+                record
+                    .label
+                    .split_whitespace()
+                    .last()
+                    .and_then(|value| value.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0);
         self.next_body_ordinal = self
             .bodies
             .iter()
             .map(|body| body.ordinal)
             .max()
             .unwrap_or(0)
+            .max(recorded)
             .saturating_add(1);
         let active_index = previous_active
             .and_then(|id| self.bodies.iter().position(|body| body.id == id))
@@ -8830,7 +8887,21 @@ impl KernelLabApp {
         };
         self.extruded_sketch_revision = None;
         self.selected_faces.clear();
-        self.face_sketch_context = None;
+        self.face_sketch_context = match &self.sketch_support {
+            SketchSupport::Origin { plane } => {
+                self.plane_sketch_context(sketch_plane_frame(*plane), None, None)
+            }
+            SketchSupport::ConstructionPlane { id, frame } => {
+                let outline = id.and_then(|id| {
+                    self.construction_planes
+                        .iter()
+                        .find(|plane| plane.id == id)
+                        .map(|plane| (plane.half_u, plane.half_v))
+                });
+                self.plane_sketch_context(**frame, outline, None)
+            }
+            SketchSupport::PlanarFace { .. } => None,
+        };
         // Activating a sketch says *which* sketch, not *which workspace*. It
         // used to say both, so selecting the sketch you were drawing threw you
         // out into the model view, and the explicit edit action below had to
@@ -8870,7 +8941,8 @@ impl KernelLabApp {
         self.sketch_support = SketchSupport::Origin {
             plane: self.selected_origin_plane,
         };
-        self.face_sketch_context = None;
+        self.face_sketch_context =
+            self.plane_sketch_context(sketch_plane_frame(self.selected_origin_plane), None, None);
         self.active_sketch_index = None;
         self.sketch_revision = 0;
         self.sketch_finished = false;
@@ -9881,6 +9953,43 @@ impl KernelLabApp {
         self.open_construction_plane_sketch(id);
     }
 
+    /// What the canvas shows behind a sketch on a plane: every visible body,
+    /// placed where the document puts it, seen from the plane's normal side.
+    /// `outline` is the plane's own card, drawn as the support; `fit_entity`
+    /// names the plane so the canvas fits itself to it once, and `None`
+    /// leaves the canvas where it is.
+    fn plane_sketch_context(
+        &self,
+        frame: PlanarFrame3,
+        outline: Option<(f64, f64)>,
+        fit_entity: Option<u64>,
+    ) -> Option<FaceSketchDisplayContext> {
+        let visible = || self.bodies.iter().filter(|body| body.visible);
+        let fit_key = fit_entity.map(|entity| {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for body in visible() {
+                body.id.get().hash(&mut hasher);
+                body.body.snapshot.id().to_string().hash(&mut hasher);
+            }
+            let word = hasher.finish().to_le_bytes();
+            let mut digest = [0_u8; 32];
+            for (index, byte) in digest.iter_mut().enumerate() {
+                *byte = word[index % word.len()];
+            }
+            SketchContextFitKey::new(digest, entity)
+        });
+        let bodies = visible().map(|body| {
+            (
+                &body.body.scene,
+                self.occurrence_transform_for_body(body.id),
+            )
+        });
+        let mut context = project_plane_sketch_context(bodies, frame, outline, fit_key)?;
+        context.update_filtered_geometry(self.project_3d_body_context, self.project_3d_body_depth);
+        Some(context)
+    }
+
     /// Opens a sketch on a construction plane, once the camera is looking at
     /// it.
     fn open_construction_plane_sketch(&mut self, id: u64) {
@@ -9899,7 +10008,8 @@ impl KernelLabApp {
             id: Some(id),
             frame: Box::new(plane.frame),
         };
-        self.face_sketch_context = None;
+        self.face_sketch_context =
+            self.plane_sketch_context(plane.frame, Some((plane.half_u, plane.half_v)), Some(id));
         self.active_sketch_index = None;
         self.sketch_revision = 0;
         self.sketch_finished = false;
@@ -10046,7 +10156,7 @@ impl KernelLabApp {
         }
         let _ = self.sketch.set_plane(plane);
         self.sketch_support = SketchSupport::Origin { plane };
-        self.face_sketch_context = None;
+        self.face_sketch_context = self.plane_sketch_context(sketch_plane_frame(plane), None, None);
         self.extrusion_mode = ExtrusionMode::NewBody;
         self.extrusion_mode_explicit = false;
         self.workbench_mode = WorkbenchMode::Sketch;
@@ -10268,9 +10378,10 @@ impl KernelLabApp {
         let display_plane = sketch_plane_for_frame(support.frame);
         self.sketch = SketchCanvasState::new(display_plane);
         self.active_sketch_tool = ToolVariant::Select;
-        if let (Some(context), Some(view)) = (&self.face_sketch_context, fitted_view) {
-            self.sketch
-                .apply_prepared_context_view(view, context.fit_key);
+        if let (Some(context), Some(view)) = (&self.face_sketch_context, fitted_view)
+            && let Some(key) = context.fit_key
+        {
+            self.sketch.apply_prepared_context_view(view, key);
         }
         self.sketch_support = SketchSupport::PlanarFace {
             body,
@@ -10964,6 +11075,11 @@ impl KernelLabApp {
             return;
         }
         let before = self.document.history_position();
+        let volume_before = self
+            .bodies
+            .iter()
+            .find(|body| body.id == target)
+            .map(|body| body.body.snapshot.measures().volume);
         self.active_body_ordinal = self
             .bodies
             .iter()
@@ -10976,10 +11092,28 @@ impl KernelLabApp {
             // the status line.
             return;
         }
-        self.document_status = Some(match operation {
-            BooleanOperation::Union => "Extrusion added to the body".to_owned(),
-            BooleanOperation::Difference => "Extrusion cut from the body".to_owned(),
-            BooleanOperation::Intersection => "Extrusion intersected with the body".to_owned(),
+        let volume_after = self
+            .bodies
+            .iter()
+            .find(|body| body.id == target)
+            .map(|body| body.body.snapshot.measures().volume);
+        let unchanged = matches!(
+            (volume_before, volume_after),
+            (Some(before), Some(after)) if (after - before).abs() <= 1.0e-9 * before.abs().max(1.0)
+        );
+        self.document_status = Some(match (operation, unchanged) {
+            (BooleanOperation::Union, false) => "Extrusion added to the body".to_owned(),
+            (BooleanOperation::Difference, false) => "Extrusion cut from the body".to_owned(),
+            (BooleanOperation::Intersection, false) => {
+                "Extrusion intersected with the body".to_owned()
+            }
+            (BooleanOperation::Difference, true) => {
+                "The extrusion missed the body: nothing was cut · check its direction and distance"
+                    .to_owned()
+            }
+            (BooleanOperation::Union | BooleanOperation::Intersection, true) => {
+                "The extrusion did not change the body".to_owned()
+            }
         });
     }
 
@@ -14514,11 +14648,28 @@ impl KernelLabApp {
             body.last_feature = last_feature;
             body.kind = ModelBodyKind::Boolean;
         }
+        // The result is archived like every other commit's, so the history
+        // cursor can leave the Boolean and come back to it.
+        if !self
+            .body_archive
+            .iter()
+            .any(|entry| entry.body.snapshot.id() == current.snapshot.id())
+        {
+            self.body_archive.push(ArchivedBody {
+                body: current.clone(),
+                kind: ModelBodyKind::Boolean,
+            });
+        }
         if !keep_tools {
-            for tool in tools {
-                if let Some(body) = self.bodies.iter_mut().find(|body| body.id == *tool) {
-                    body.visible = false;
-                }
+            // The tool is spent: it leaves the body list rather than
+            // lingering as a hidden body, and its number stays taken.
+            self.bodies.retain(|body| !tools.contains(&body.id));
+            if self.active_body_id().is_none() {
+                self.active_body_ordinal = self
+                    .bodies
+                    .iter()
+                    .find(|body| body.id == target)
+                    .map_or(self.active_body_ordinal, |body| body.ordinal);
             }
         }
         if self.active_body_id() == Some(target) {
@@ -26289,6 +26440,13 @@ fn classify_selected_planar_profile(
     SketchExtrusionEligibility::Ready
 }
 
+/// Whether a straight-sided profile on a face is one the kernel can build a
+/// feature from: it must reach the face's material somewhere. A profile that
+/// crosses the face's edge or a hole's rim is not refused here — half a
+/// rectangle over the edge is an everyday boss or notch, and the kernel
+/// reformulates it exactly as a Boolean with the whole solid — only one that
+/// lies wholly off the face or wholly inside a hole, which no feature could
+/// come from.
 fn classify_face_profile_domain(
     vertices: &[SketchPoint],
     boundary: &[ProtocolPoint2],
@@ -26303,12 +26461,14 @@ fn classify_face_profile_domain(
     {
         return SketchExtrusionEligibility::FaceRectangleRequired;
     }
-    const MARGIN: f64 = 1.0e-5;
     let profile = vertices
         .iter()
         .map(|point| ProtocolPoint2::new(point.u, point.v))
         .collect::<Vec<_>>();
-    let intersects_material = profile
+    // A vertex or an edge's midpoint on the material, or the material's own
+    // outline caught inside the profile: any of these is a profile that
+    // touches the face.
+    let reaches_material = profile
         .iter()
         .copied()
         .any(|point| point_in_face_material_2d(point, boundary, inner_boundaries))
@@ -26320,45 +26480,16 @@ fn classify_face_profile_domain(
                 boundary,
                 inner_boundaries,
             )
-        });
-    if profile.iter().any(|point| {
-        !point_strictly_inside_loop(*point, boundary, MARGIN)
-            || inner_boundaries.iter().any(|inner| {
-                point_in_loop(*point, inner) || point_loop_distance(*point, inner) <= MARGIN
-            })
-    }) {
-        return if intersects_material {
-            SketchExtrusionEligibility::BooleanUnionRequired
-        } else {
-            SketchExtrusionEligibility::ProfileOutsideSupport
-        };
+        })
+        || boundary
+            .iter()
+            .chain(inner_boundaries.iter().flatten())
+            .any(|point| point_in_loop(*point, &profile));
+    if reaches_material {
+        SketchExtrusionEligibility::Ready
+    } else {
+        SketchExtrusionEligibility::ProfileOutsideSupport
     }
-    for index in 0..profile.len() {
-        let edge = [profile[index], profile[(index + 1) % profile.len()]];
-        if segment_loop_distance(edge, boundary) <= MARGIN
-            || inner_boundaries
-                .iter()
-                .any(|inner| segment_loop_distance(edge, inner) <= MARGIN)
-        {
-            return if intersects_material {
-                SketchExtrusionEligibility::BooleanUnionRequired
-            } else {
-                SketchExtrusionEligibility::ProfileOutsideSupport
-            };
-        }
-    }
-    if inner_boundaries.iter().any(|inner| {
-        inner
-            .first()
-            .is_some_and(|point| point_in_loop(*point, &profile))
-    }) {
-        return if intersects_material {
-            SketchExtrusionEligibility::BooleanUnionRequired
-        } else {
-            SketchExtrusionEligibility::ProfileOutsideSupport
-        };
-    }
-    SketchExtrusionEligibility::Ready
 }
 
 fn point_in_face_material_2d(
@@ -26372,6 +26503,8 @@ fn point_in_face_material_2d(
             .all(|inner| !point_in_loop(point, inner))
 }
 
+/// As [`classify_face_profile_domain`], for a whole circle: it is refused
+/// only when it lies wholly off the face or wholly inside a hole.
 fn classify_face_circle_domain(
     center: SketchPoint,
     rim: SketchPoint,
@@ -26388,29 +26521,35 @@ fn classify_face_circle_domain(
         return SketchExtrusionEligibility::FaceRectangleRequired;
     }
     const MARGIN: f64 = 1.0e-5;
-    let center = ProtocolPoint2::new(center.u, center.v);
-    let radius = rim
-        .distance_squared(SketchPoint::new(center.x, center.y))
-        .sqrt();
-    if !radius.is_finite()
-        || radius <= MARGIN
-        || !point_in_loop(center, boundary)
-        || point_loop_distance(center, boundary) <= radius + MARGIN
-        || inner_boundaries.iter().any(|inner| {
-            point_in_loop(center, inner) || point_loop_distance(center, inner) <= radius + MARGIN
-        })
-    {
+    let radius = rim.distance_squared(center).sqrt();
+    if !radius.is_finite() || radius <= MARGIN {
         return SketchExtrusionEligibility::ProfileOutsideSupport;
     }
-    SketchExtrusionEligibility::Ready
-}
-
-fn point_strictly_inside_loop(
-    point: ProtocolPoint2,
-    loop_points: &[ProtocolPoint2],
-    margin: f64,
-) -> bool {
-    point_in_loop(point, loop_points) && point_loop_distance(point, loop_points) > margin
+    // The centre, thirty-two points round the rim, or a point of the face's
+    // outline inside the circle: any on the material is a circle that
+    // touches the face.
+    let centre = ProtocolPoint2::new(center.u, center.v);
+    let reaches_material = point_in_face_material_2d(centre, boundary, inner_boundaries)
+        || (0..32).any(|step| {
+            let angle = f64::from(step) * std::f64::consts::TAU / 32.0;
+            point_in_face_material_2d(
+                ProtocolPoint2::new(
+                    radius.mul_add(angle.cos(), centre.x),
+                    radius.mul_add(angle.sin(), centre.y),
+                ),
+                boundary,
+                inner_boundaries,
+            )
+        })
+        || boundary
+            .iter()
+            .chain(inner_boundaries.iter().flatten())
+            .any(|point| (point.x - centre.x).hypot(point.y - centre.y) < radius - MARGIN);
+    if reaches_material {
+        SketchExtrusionEligibility::Ready
+    } else {
+        SketchExtrusionEligibility::ProfileOutsideSupport
+    }
 }
 
 fn point_in_loop(point: ProtocolPoint2, loop_points: &[ProtocolPoint2]) -> bool {
@@ -26426,91 +26565,6 @@ fn point_in_loop(point: ProtocolPoint2, loop_points: &[ProtocolPoint2]) -> bool 
         }
     }
     inside
-}
-
-fn point_loop_distance(point: ProtocolPoint2, loop_points: &[ProtocolPoint2]) -> f64 {
-    (0..loop_points.len())
-        .map(|index| {
-            point_segment_distance_2d(
-                point,
-                loop_points[index],
-                loop_points[(index + 1) % loop_points.len()],
-            )
-        })
-        .fold(f64::INFINITY, f64::min)
-}
-
-fn segment_loop_distance(segment: [ProtocolPoint2; 2], loop_points: &[ProtocolPoint2]) -> f64 {
-    (0..loop_points.len())
-        .map(|index| {
-            segment_distance_2d(
-                segment,
-                [
-                    loop_points[index],
-                    loop_points[(index + 1) % loop_points.len()],
-                ],
-            )
-        })
-        .fold(f64::INFINITY, f64::min)
-}
-
-fn segment_distance_2d(first: [ProtocolPoint2; 2], second: [ProtocolPoint2; 2]) -> f64 {
-    let orientations = [
-        orient2d(
-            GeometryPoint2::new(first[0].x, first[0].y),
-            GeometryPoint2::new(first[1].x, first[1].y),
-            GeometryPoint2::new(second[0].x, second[0].y),
-        ),
-        orient2d(
-            GeometryPoint2::new(first[0].x, first[0].y),
-            GeometryPoint2::new(first[1].x, first[1].y),
-            GeometryPoint2::new(second[1].x, second[1].y),
-        ),
-        orient2d(
-            GeometryPoint2::new(second[0].x, second[0].y),
-            GeometryPoint2::new(second[1].x, second[1].y),
-            GeometryPoint2::new(first[0].x, first[0].y),
-        ),
-        orient2d(
-            GeometryPoint2::new(second[0].x, second[0].y),
-            GeometryPoint2::new(second[1].x, second[1].y),
-            GeometryPoint2::new(first[1].x, first[1].y),
-        ),
-    ];
-    let opposite = |left: Orientation2, right: Orientation2| {
-        matches!(
-            (left, right),
-            (Orientation2::Clockwise, Orientation2::CounterClockwise)
-                | (Orientation2::CounterClockwise, Orientation2::Clockwise)
-        )
-    };
-    if opposite(orientations[0], orientations[1]) && opposite(orientations[2], orientations[3]) {
-        return 0.0;
-    }
-    [
-        point_segment_distance_2d(first[0], second[0], second[1]),
-        point_segment_distance_2d(first[1], second[0], second[1]),
-        point_segment_distance_2d(second[0], first[0], first[1]),
-        point_segment_distance_2d(second[1], first[0], first[1]),
-    ]
-    .into_iter()
-    .fold(f64::INFINITY, f64::min)
-}
-
-fn point_segment_distance_2d(
-    point: ProtocolPoint2,
-    start: ProtocolPoint2,
-    end: ProtocolPoint2,
-) -> f64 {
-    let delta = ProtocolPoint2::new(end.x - start.x, end.y - start.y);
-    let length_squared = delta.x.mul_add(delta.x, delta.y * delta.y);
-    if !length_squared.is_finite() || length_squared <= 0.0 {
-        return f64::INFINITY;
-    }
-    let projection =
-        ((point.x - start.x) * delta.x + (point.y - start.y) * delta.y) / length_squared;
-    let parameter = projection.clamp(0.0, 1.0);
-    (point.x - (start.x + parameter * delta.x)).hypot(point.y - (start.y + parameter * delta.y))
 }
 
 fn workbench_extrusion_error(
@@ -26763,76 +26817,11 @@ fn project_face_sketch_context(
         face_winding += sketch_triangle_signed_area(vertices);
     }
     let outward = if face_winding < 0.0 { -1.0 } else { 1.0 };
-    let projected_triangles = scene
-        .triangles
-        .iter()
-        .filter_map(|triangle| {
-            let projected = triangle
-                .vertices
-                .map(|point| projection.project(point))
-                .into_iter()
-                .collect::<Option<Vec<_>>>()?;
-            let vertices: [SketchPoint; 3] = projected
-                .iter()
-                .map(|(point, _)| *point)
-                .collect::<Vec<_>>()
-                .try_into()
-                .ok()?;
-            let signed_area = sketch_triangle_signed_area(vertices) * outward;
-            if !signed_area.is_finite() || signed_area <= 0.0 {
-                return None;
-            }
-            let vertex_depths: [f64; 3] = projected
-                .iter()
-                .map(|(_, depth)| *depth)
-                .collect::<Vec<_>>()
-                .try_into()
-                .ok()?;
-            let depth = vertex_depths.iter().sum::<f64>() / 3.0 * outward;
-            // Shade from the true 3D attitude of the facet: a face parallel
-            // to the sketch plane is brightest, one sloping away is darker.
-            // Walls at right angles have no projected area and never arrive.
-            let [a, b, c] = triangle.vertices;
-            let facet_normal = normalized_vector(cross_vector(
-                Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z),
-                Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z),
-            ));
-            let attitude = facet_normal
-                .map(|normal| dot_vector(normal, projection.normal).abs())
-                .unwrap_or(1.0);
-            let shade = (0.55 + 0.45 * attitude) as f32;
-            Some((
-                depth,
-                vertex_depths,
-                SketchContextTriangle::new(vertices).with_shade(shade),
-            ))
-        })
-        .collect::<Vec<_>>();
+    let (projected_triangles, raw_edges) =
+        project_scene_into_sketch(scene, &projection, outward, |point| point);
     let raw_triangles: Vec<(f64, SketchContextTriangle)> = projected_triangles
         .iter()
         .map(|(depth, _, triangle)| (*depth, *triangle))
-        .collect();
-
-    // Creases only: a bore's facet seams and a fillet's tangent rails are not
-    // lines the user should see through the face.
-    let raw_edges: Vec<(f64, SketchContextEdge)> = scene
-        .edges
-        .iter()
-        .filter(|edge| !edge.is_smooth && !edge.is_tangent)
-        .filter_map(|edge| {
-            let endpoints = edge.endpoints.map(|point| projection.project(point));
-            let endpoints = [endpoints[0]?, endpoints[1]?];
-            let edge_depth = (endpoints[0].1 + endpoints[1].1) * 0.5 * outward;
-            projected_triangles
-                .iter()
-                .any(|(_, depths, triangle)| {
-                    projected_edge_matches_triangle(endpoints, triangle.vertices, *depths)
-                })
-                .then_some((
-                    edge_depth,
-                    SketchContextEdge::new([endpoints[0].0, endpoints[1].0]),
-                ))
-        })
         .collect();
 
     let triangles = raw_triangles.iter().map(|(_, tri)| *tri).collect();
@@ -26864,10 +26853,10 @@ fn project_face_sketch_context(
         .collect::<Vec<_>>();
 
     (!boundary.is_empty()).then_some(FaceSketchDisplayContext {
-        fit_key: SketchContextFitKey::new(
+        fit_key: Some(SketchContextFitKey::new(
             *support.support_digest.as_bytes(),
             support.face.entity.0,
-        ),
+        )),
         axis_labels: [
             dominant_axis_label(support.frame.u).unwrap_or("U"),
             dominant_axis_label(support.frame.v).unwrap_or("V"),
@@ -26879,7 +26868,142 @@ fn project_face_sketch_context(
         boundary,
         inner_boundaries,
         snap_curves,
+        two_sided: false,
     })
+}
+
+/// The bodies projected onto a construction or origin plane, for the canvas
+/// to draw behind a sketch on that plane. A plane has no material side, so
+/// the sketch looks along the frame's own normal and everything on either
+/// side of the plane is in view. `outline` is the plane's card, half-extents
+/// in the frame, drawn as the support and centred by the first fit. `None`
+/// when no body projects at all.
+fn project_plane_sketch_context<'a>(
+    bodies: impl IntoIterator<Item = (&'a DebugScene, viewport::RigidOccurrenceTransform)>,
+    frame: PlanarFrame3,
+    outline: Option<(f64, f64)>,
+    fit_key: Option<SketchContextFitKey>,
+) -> Option<FaceSketchDisplayContext> {
+    let projection = FaceSketchProjection::from_frame(frame)?;
+    let mut raw_triangles = Vec::new();
+    let mut raw_edges = Vec::new();
+    for (scene, transform) in bodies {
+        let (triangles, edges) = project_scene_into_sketch(scene, &projection, 1.0, |point| {
+            transform.transform_point(point)
+        });
+        raw_triangles.extend(
+            triangles
+                .into_iter()
+                .map(|(depth, _, triangle)| (depth, triangle)),
+        );
+        raw_edges.extend(edges);
+    }
+    if raw_triangles.is_empty() && raw_edges.is_empty() {
+        return None;
+    }
+    let boundary = outline.map_or_else(Vec::new, |(half_u, half_v)| {
+        [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .map(|(su, sv): (f64, f64)| SketchPoint::new(su * half_u, sv * half_v))
+            .to_vec()
+    });
+    Some(FaceSketchDisplayContext {
+        fit_key,
+        axis_labels: [
+            dominant_axis_label(frame.u).unwrap_or("U"),
+            dominant_axis_label(frame.v).unwrap_or("V"),
+        ],
+        raw_triangles,
+        raw_edges,
+        triangles: Vec::new(),
+        edges: Vec::new(),
+        boundary,
+        inner_boundaries: Vec::new(),
+        snap_curves: Vec::new(),
+        two_sided: true,
+    })
+}
+
+type ProjectedSketchTriangles = Vec<(f64, [f64; 3], SketchContextTriangle)>;
+
+/// Every triangle of `scene` that faces the sketch, with its mean and vertex
+/// depths, and every crease edge that lies on one of them. `outward` is `1`
+/// when the sketch looks along the projection's normal and `-1` when it
+/// looks against it; `place` moves the scene to where the document puts the
+/// body before projecting.
+fn project_scene_into_sketch(
+    scene: &DebugScene,
+    projection: &FaceSketchProjection,
+    outward: f64,
+    place: impl Fn(Point3) -> Point3,
+) -> (ProjectedSketchTriangles, Vec<(f64, SketchContextEdge)>) {
+    let projected_triangles = scene
+        .triangles
+        .iter()
+        .filter_map(|triangle| {
+            let placed = triangle.vertices.map(&place);
+            let projected = placed
+                .map(|point| projection.project(point))
+                .into_iter()
+                .collect::<Option<Vec<_>>>()?;
+            let vertices: [SketchPoint; 3] = projected
+                .iter()
+                .map(|(point, _)| *point)
+                .collect::<Vec<_>>()
+                .try_into()
+                .ok()?;
+            let signed_area = sketch_triangle_signed_area(vertices) * outward;
+            if !signed_area.is_finite() || signed_area <= 0.0 {
+                return None;
+            }
+            let vertex_depths: [f64; 3] = projected
+                .iter()
+                .map(|(_, depth)| *depth)
+                .collect::<Vec<_>>()
+                .try_into()
+                .ok()?;
+            let depth = vertex_depths.iter().sum::<f64>() / 3.0 * outward;
+            // Shade from the true 3D attitude of the facet: a face parallel
+            // to the sketch plane is brightest, one sloping away is darker.
+            // Walls at right angles have no projected area and never arrive.
+            let [a, b, c] = placed;
+            let facet_normal = normalized_vector(cross_vector(
+                Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z),
+                Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z),
+            ));
+            let attitude = facet_normal
+                .map(|normal| dot_vector(normal, projection.normal).abs())
+                .unwrap_or(1.0);
+            let shade = (0.55 + 0.45 * attitude) as f32;
+            Some((
+                depth,
+                vertex_depths,
+                SketchContextTriangle::new(vertices).with_shade(shade),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    // Creases only: a bore's facet seams and a fillet's tangent rails are not
+    // lines the user should see through the face.
+    let raw_edges: Vec<(f64, SketchContextEdge)> = scene
+        .edges
+        .iter()
+        .filter(|edge| !edge.is_smooth && !edge.is_tangent)
+        .filter_map(|edge| {
+            let endpoints = edge.endpoints.map(|point| projection.project(place(point)));
+            let endpoints = [endpoints[0]?, endpoints[1]?];
+            let edge_depth = (endpoints[0].1 + endpoints[1].1) * 0.5 * outward;
+            projected_triangles
+                .iter()
+                .any(|(_, depths, triangle)| {
+                    projected_edge_matches_triangle(endpoints, triangle.vertices, *depths)
+                })
+                .then_some((
+                    edge_depth,
+                    SketchContextEdge::new([endpoints[0].0, endpoints[1].0]),
+                ))
+        })
+        .collect();
+    (projected_triangles, raw_edges)
 }
 
 /// Restates one exact face-boundary curve in the sketch canvas's vocabulary.
@@ -28536,6 +28660,49 @@ mod extrusion_workbench_tests {
         app
     }
 
+    /// A rectangle drawn half off the face is an everyday boss or notch. The
+    /// preflight used to refuse it as a Boolean union "not implemented yet"
+    /// while the kernel had long built it; now it is ready, stages, and
+    /// commits, as a boss over the edge and as a notch part-way down.
+    #[test]
+    fn a_rectangle_hanging_off_the_face_extrudes_as_a_boss_and_a_notch() {
+        for (mode, distance, expected) in [
+            (ExtrusionMode::Add, 1.0, 24.0 + 1.0),
+            (ExtrusionMode::Cut, -0.5, 24.0 - 0.25),
+        ] {
+            let mut app = finished_face_rectangle_app(mode);
+            // The face is 2 × 3 about its own centre: a unit square from
+            // u = 0.5 hangs half over the u = 1 edge.
+            replace_finished_face_geometry(
+                &mut app,
+                [SketchGeometry::rectangle(point(0.5, -0.5), point(1.5, 0.5))],
+                mode,
+                distance,
+            );
+            assert_eq!(
+                app.sketch_extrusion_eligibility(),
+                SketchExtrusionEligibility::Ready,
+                "{mode:?}"
+            );
+            assert!(
+                app.stage_sketch_extrusion(),
+                "{mode:?}: {:?}",
+                app.document_status
+            );
+            assert!(
+                app.confirm_pending_operation(),
+                "{mode:?}: {:?}",
+                app.document_status
+            );
+            assert_eq!(app.last_error_code(), None, "{mode:?}");
+            let volume = app.displayed_measures().expect("a body").volume;
+            assert!(
+                (volume - expected).abs() < 1.0e-9,
+                "{mode:?}: {volume} vs {expected}"
+            );
+        }
+    }
+
     fn replace_finished_face_geometry(
         app: &mut KernelLabApp,
         geometries: impl IntoIterator<Item = SketchGeometry>,
@@ -28716,6 +28883,9 @@ mod extrusion_workbench_tests {
             ProtocolPoint2::new(0.5, 0.5),
             ProtocolPoint2::new(0.5, -0.5),
         ];
+        let classify = |profile: &[SketchPoint]| {
+            classify_face_profile_domain(profile, &outer, std::slice::from_ref(&hole))
+        };
         let material_profile = [
             point(1.0, -0.5),
             point(2.0, -0.5),
@@ -28723,10 +28893,12 @@ mod extrusion_workbench_tests {
             point(1.0, 0.5),
         ];
         assert_eq!(
-            classify_face_profile_domain(&material_profile, &outer, std::slice::from_ref(&hole)),
+            classify(&material_profile),
             SketchExtrusionEligibility::Ready
         );
 
+        // Wholly inside the hole, or wholly off the face: no feature could
+        // come from it.
         let inside_hole = [
             point(-0.25, -0.25),
             point(0.25, -0.25),
@@ -28734,21 +28906,41 @@ mod extrusion_workbench_tests {
             point(-0.25, 0.25),
         ];
         assert_eq!(
-            classify_face_profile_domain(&inside_hole, &outer, std::slice::from_ref(&hole)),
+            classify(&inside_hole),
+            SketchExtrusionEligibility::ProfileOutsideSupport
+        );
+        let off_the_face = [
+            point(4.0, -1.0),
+            point(6.0, -1.0),
+            point(6.0, 1.0),
+            point(4.0, 1.0),
+        ];
+        assert_eq!(
+            classify(&off_the_face),
             SketchExtrusionEligibility::ProfileOutsideSupport
         );
 
+        // Crossing the face's edge, crossing a hole's rim, enclosing a hole,
+        // or enclosing the whole face: the kernel builds each as a Boolean
+        // with the solid, so each is ready.
+        let half_over_the_edge = [
+            point(2.0, -1.0),
+            point(4.0, -1.0),
+            point(4.0, 1.0),
+            point(2.0, 1.0),
+        ];
+        assert_eq!(
+            classify(&half_over_the_edge),
+            SketchExtrusionEligibility::Ready,
+            "a rectangle hanging off the face is a boss or a notch"
+        );
         let encloses_hole = [
             point(-1.0, -1.0),
             point(1.0, -1.0),
             point(1.0, 1.0),
             point(-1.0, 1.0),
         ];
-        assert_eq!(
-            classify_face_profile_domain(&encloses_hole, &outer, std::slice::from_ref(&hole),),
-            SketchExtrusionEligibility::BooleanUnionRequired
-        );
-
+        assert_eq!(classify(&encloses_hole), SketchExtrusionEligibility::Ready);
         let spoke_crossing_the_void = [
             point(0.0, -0.2),
             point(2.0, -0.2),
@@ -28756,13 +28948,50 @@ mod extrusion_workbench_tests {
             point(0.0, 0.2),
         ];
         assert_eq!(
-            classify_face_profile_domain(
-                &spoke_crossing_the_void,
+            classify(&spoke_crossing_the_void),
+            SketchExtrusionEligibility::Ready,
+            "a spoke that reaches from a face void into material is a union bridge"
+        );
+        let encloses_the_face = [
+            point(-5.0, -5.0),
+            point(5.0, -5.0),
+            point(5.0, 5.0),
+            point(-5.0, 5.0),
+        ];
+        assert_eq!(
+            classify(&encloses_the_face),
+            SketchExtrusionEligibility::Ready
+        );
+
+        // Circles by the same rule.
+        let circle = |centre: (f64, f64), radius: f64| {
+            classify_face_circle_domain(
+                point(centre.0, centre.1),
+                point(centre.0 + radius, centre.1),
                 &outer,
                 std::slice::from_ref(&hole),
-            ),
-            SketchExtrusionEligibility::BooleanUnionRequired,
-            "a spoke that reaches from a face void into material is a union bridge, not an invalid closed profile"
+            )
+        };
+        assert_eq!(circle((2.0, 0.0), 0.5), SketchExtrusionEligibility::Ready);
+        assert_eq!(
+            circle((3.0, 0.0), 1.0),
+            SketchExtrusionEligibility::Ready,
+            "half a circle over the edge"
+        );
+        assert_eq!(
+            circle((0.0, 0.0), 1.0),
+            SketchExtrusionEligibility::Ready,
+            "a ring round the hole"
+        );
+        assert_eq!(
+            circle((0.0, 0.0), 0.25),
+            SketchExtrusionEligibility::ProfileOutsideSupport,
+            "wholly inside the hole"
+        );
+        assert_eq!(
+            circle((6.0, 0.0), 1.0),
+            SketchExtrusionEligibility::ProfileOutsideSupport,
+            "wholly off the face"
         );
     }
 
@@ -31497,15 +31726,14 @@ mod extrusion_workbench_tests {
             "each tool is its own two-body recipe so replay can reproduce it"
         );
         assert!(app.displayed_measures().expect("result measures").volume > before);
-        // Consumed by default: neither tool survives as a visible body.
+        // Consumed by default: neither tool survives as a body at all; the
+        // document keeps their records for the history.
         for tool in [first, second] {
             assert!(
-                !app.bodies
-                    .iter()
-                    .find(|body| body.id == tool)
-                    .expect("tool body")
-                    .visible
+                !app.bodies.iter().any(|body| body.id == tool),
+                "a spent tool leaves the body list"
             );
+            assert!(app.document.bodies().iter().any(|record| record.id == tool));
         }
         assert_eq!(app.active_body_id(), Some(target));
     }
@@ -31696,11 +31924,8 @@ mod extrusion_workbench_tests {
             ReplayAction::Boolean(_)
         ));
         assert!(
-            !app.bodies
-                .iter()
-                .find(|body| body.id == tool_id)
-                .unwrap()
-                .visible
+            !app.bodies.iter().any(|body| body.id == tool_id),
+            "the spent tool is no body"
         );
         assert!(app.displayed_measures().unwrap().volume > 24.0);
 
@@ -34989,7 +35214,7 @@ mod face_sketch_context_layers {
             ])
         };
         FaceSketchDisplayContext {
-            fit_key: SketchContextFitKey::new([0; 32], 1),
+            fit_key: Some(SketchContextFitKey::new([0; 32], 1)),
             axis_labels: ["U", "V"],
             // A raised boss, the face itself, a shallow pocket floor, and a
             // deep bore floor.
@@ -35005,6 +35230,35 @@ mod face_sketch_context_layers {
             boundary: Vec::new(),
             inner_boundaries: Vec::new(),
             snap_curves: Vec::new(),
+            two_sided: false,
+        }
+    }
+
+    /// A plane context has no material side: every triangle and edge is the
+    /// body layer whatever its depth, whether or not the x-ray is on.
+    #[test]
+    fn a_two_sided_context_shows_both_sides_as_the_body() {
+        let mut context = context();
+        context.two_sided = true;
+        for (project_below, max_depth) in [(false, 50.0), (true, 50.0), (true, 1.0)] {
+            context.update_filtered_geometry(project_below, max_depth);
+            assert_eq!(context.triangles.len(), 4);
+            assert_eq!(context.edges.len(), 3);
+            assert!(
+                context
+                    .triangles
+                    .iter()
+                    .all(|triangle| triangle.layer == SketchContextLayer::Body)
+            );
+            assert!(
+                context
+                    .edges
+                    .iter()
+                    .all(|edge| edge.layer == SketchContextLayer::Body)
+            );
+            // Painter order: the deep bore floor first, the boss last.
+            assert_eq!(context.triangles[0].vertices[0].u, 30.0);
+            assert_eq!(context.triangles[3].vertices[0].u, 0.0);
         }
     }
 
@@ -35848,6 +36102,162 @@ mod construction_plane_tests {
             app.document.history_position(),
             "the edit returns the history to its end"
         );
+    }
+
+    /// A sketch on a plane keeps the bodies in view: the canvas draws them
+    /// behind the sketch as it does for a face, on either side of the plane,
+    /// with the plane's own card as the support. A body is never hidden by
+    /// sketching, whichever plane the sketch is on.
+    #[test]
+    fn the_bodies_stay_in_view_behind_a_sketch_on_a_plane() {
+        let mut app = KernelLabApp::default();
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (0.0, 0.0), (4.0, 4.0));
+        app.set_extrusion_distance_intent(6.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.enter_model_mode();
+
+        // A construction plane above the body: the whole body lies behind
+        // the plane and is still projected.
+        let plane = origin_plane(&mut app, SketchPlane::XY, 10.0);
+        app.selected_construction_plane = Some(plane.id);
+        app.begin_construction_plane_sketch(plane.id);
+        if let Some(PendingPlaneSketch::Construction(id)) = app.pending_plane_sketch.take() {
+            app.open_construction_plane_sketch(id);
+        }
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        let context = app
+            .face_sketch_context
+            .as_ref()
+            .expect("the body is projected behind the plane sketch");
+        assert!(!context.triangles.is_empty());
+        assert!(!context.edges.is_empty());
+        assert!(
+            context.raw_triangles.iter().all(|(depth, _)| *depth < 0.0),
+            "the body is entirely below the plane"
+        );
+        assert_eq!(context.boundary.len(), 4, "the plane's card is the support");
+        assert!(
+            context.fit_key.is_some(),
+            "the canvas fits itself to the plane once"
+        );
+        assert!(app.bodies.iter().all(|body| body.visible));
+
+        // Finishing leaves the body where it was, visible.
+        draw_rectangle(&mut app, (1.0, 1.0), (2.0, 2.0));
+        app.enter_model_mode();
+        assert_eq!(app.workbench_mode, WorkbenchMode::Model);
+        assert!(app.bodies.iter().all(|body| body.visible));
+
+        // A sketch on an origin plane with a body in the document shows the
+        // body too, without moving the canvas.
+        app.begin_new_origin_sketch();
+        let context = app
+            .face_sketch_context
+            .as_ref()
+            .expect("the body is projected behind the origin-plane sketch");
+        assert!(!context.triangles.is_empty());
+        assert!(context.fit_key.is_none());
+        assert!(context.boundary.is_empty());
+        assert!(app.bodies.iter().all(|body| body.visible));
+
+        // And a body the user hid stays hidden: it is not projected.
+        app.enter_model_mode();
+        app.set_body_visibility(0, false);
+        app.begin_new_origin_sketch();
+        assert!(app.face_sketch_context.is_none());
+    }
+
+    /// A cut from an origin-plane sketch is a sweep folded into the body by
+    /// a Boolean. The swept tool is spent by it: it used to linger as a
+    /// hidden "Body 2" the Browser listed and a click could show, standing
+    /// where the cut was. Now it leaves the body list, its number stays
+    /// taken, and it comes back only where the history stands before the
+    /// Boolean.
+    #[test]
+    fn a_cut_from_an_origin_sketch_leaves_no_tool_body_behind() {
+        let mut app = KernelLabApp::default();
+        app.begin_new_origin_sketch();
+        app.sketch
+            .stage_geometry(SketchGeometry::circle(point(0.0, 0.0), point(10.0, 0.0)))
+            .expect("circle stages");
+        app.sketch.commit_pending().expect("circle commits");
+        app.sketch_revision = app.sketch_revision.saturating_add(1);
+        app.feature_preview
+            .commit_sketch_revision(app.sketch_revision);
+        app.set_extrusion_distance_intent(20.0);
+        assert!(app.stage_sketch_extrusion(), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.enter_model_mode();
+        assert_eq!(app.bodies.len(), 1);
+        let cylinder = std::f64::consts::PI * 100.0 * 20.0;
+        let records = app.document.bodies().len();
+
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (-3.0, -3.0), (3.0, 3.0));
+        app.select_extrusion_mode(ExtrusionMode::Cut);
+        app.set_extrusion_distance_intent(20.0);
+        assert!(app.stage_sketch_extrusion(), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(
+            app.document_status.as_deref(),
+            Some("Extrusion cut from the body")
+        );
+        assert_eq!(app.bodies.len(), 1, "the tool is spent, not hidden");
+        assert_eq!(app.body_count(), 1);
+        assert!(app.bodies[0].visible);
+        let volume = app.displayed_measures().expect("the cylinder").volume;
+        assert!((volume - (cylinder - 720.0)).abs() < 1.0e-6, "{volume}");
+        assert_eq!(
+            app.document.bodies().len(),
+            records + 1,
+            "the document keeps the tool's record for its history"
+        );
+        let cut_position = app.document.history_position();
+
+        // Before the Boolean, the sweep is a body of its own again (hidden,
+        // as the document records a spent tool; the eye brings it back).
+        assert!(app.move_history_cursor(cut_position - 1));
+        assert_eq!(app.bodies.len(), 2);
+        assert!(app.move_history_cursor(cut_position));
+        assert_eq!(app.bodies.len(), 1);
+
+        // The next body is numbered past the spent one.
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (20.0, 20.0), (24.0, 24.0));
+        app.select_extrusion_mode(ExtrusionMode::NewBody);
+        app.set_extrusion_distance_intent(2.0);
+        assert!(app.stage_sketch_extrusion(), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.bodies.len(), 2);
+        assert_eq!(app.bodies[1].ordinal, 3);
+        assert_eq!(
+            app.document
+                .bodies()
+                .last()
+                .map(|record| record.label.as_str()),
+            Some("Body 3")
+        );
+
+        // A cut that runs away from the body says so instead of reporting a
+        // cut, and still spends its tool.
+        app.enter_model_mode();
+        app.activate_body(0);
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (-1.0, -1.0), (1.0, 1.0));
+        app.select_extrusion_mode(ExtrusionMode::Cut);
+        app.set_extrusion_distance_intent(-5.0);
+        assert!(app.stage_sketch_extrusion(), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("The extrusion missed the body")),
+            "{:?}",
+            app.document_status
+        );
+        assert_eq!(app.bodies.len(), 2);
     }
 
     #[test]

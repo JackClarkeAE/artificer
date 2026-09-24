@@ -215,6 +215,21 @@ impl RegionSignature {
     }
 }
 
+/// Cells of one arrangement that are one region of the sketch: those the
+/// strokes alone close round together (see
+/// [`SketchArrangement::groups_by_strokes`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionGroup {
+    /// The member cells, in arrangement order.
+    pub cells: Vec<RegionSignature>,
+    /// Whether the members fill the strokes' region completely: what the
+    /// user drew, with nothing of the host's own face left out of it. A
+    /// rectangle round a hole leaves the hole out, so it is offered rather
+    /// than assumed; a rectangle drawn across the face's edge fills its
+    /// region on both sides, and is what was drawn.
+    pub drawn: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrangementLoop {
     pub half_edges: Vec<usize>,
@@ -353,6 +368,65 @@ impl SketchArrangement {
             }
         }
         None
+    }
+
+    /// Groups this arrangement's cells by the regions of `strokes`, the
+    /// arrangement of the same sketch without its support curves. A stroke
+    /// drawn across the face's edge, or over a hole's rim, is split there
+    /// into a cell on either side; both lie in one region of `strokes`, and
+    /// that region is what the user drew. A cell outside every region of
+    /// `strokes` — the face around what was drawn, or the rest of a hole a
+    /// stroke pokes into — is a group of its own. Groups come in the order
+    /// of their first cell.
+    #[must_use]
+    pub fn groups_by_strokes(
+        &self,
+        strokes: &Self,
+        precision: &PrecisionPolicy,
+    ) -> Vec<RegionGroup> {
+        let mut groups: Vec<(Option<RegionSignature>, Vec<usize>)> = Vec::new();
+        for (index, cell) in self.cells.iter().enumerate() {
+            let region = self
+                .cell_interior_sample(cell, precision)
+                .and_then(|sample| strokes.cell_at_point(sample, precision))
+                .map(|region| region.signature.clone());
+            match region {
+                Some(region) => {
+                    if let Some((_, members)) = groups
+                        .iter_mut()
+                        .find(|(key, _)| key.as_ref() == Some(&region))
+                    {
+                        members.push(index);
+                    } else {
+                        groups.push((Some(region), vec![index]));
+                    }
+                }
+                None => groups.push((None, vec![index])),
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(region, members)| {
+                let drawn = region
+                    .as_ref()
+                    .and_then(|region| strokes.cell(region))
+                    .is_some_and(|region| {
+                        let covered = members
+                            .iter()
+                            .map(|index| self.cells[*index].signed_area.abs())
+                            .sum::<f64>();
+                        let area = region.signed_area.abs();
+                        (covered - area).abs() <= 1.0e-9 * area.max(1.0)
+                    });
+                RegionGroup {
+                    cells: members
+                        .into_iter()
+                        .map(|index| self.cells[index].signature.clone())
+                        .collect(),
+                    drawn,
+                }
+            })
+            .collect()
     }
 
     /// Resolves the minimal bounded cell containing a sketch-plane point.

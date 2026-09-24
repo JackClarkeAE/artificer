@@ -192,10 +192,20 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                 }
                 let (u_low, u_high, low, high) = parameter_bounds(topology, &face.value)?;
                 let base = (cylinder.origin - center).dot(axis);
+                // A carrier whose axis runs against the section's measures
+                // its height the other way: a drilled bore starts at the
+                // face it was drilled from and runs down. Read as if it ran
+                // up, its wall stood above the body and the section would
+                // not chain.
+                let sense: f64 = if cylinder.axis.dot(axis) < 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                };
                 (
                     Segment::Line {
-                        start: Point2::new(cylinder.radius, base + low),
-                        end: Point2::new(cylinder.radius, base + high),
+                        start: Point2::new(cylinder.radius, sense.mul_add(low, base)),
+                        end: Point2::new(cylinder.radius, sense.mul_add(high, base)),
                     },
                     face.value.role,
                     2,
@@ -210,10 +220,13 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                 }
                 let (u_low, u_high, low, high) = parameter_bounds(topology, &face.value)?;
                 let base = (cone.origin - center).dot(axis);
+                // As for a cylinder: a cone running against the section's
+                // axis measures its height the other way.
+                let sense: f64 = if cone.axis.dot(axis) < 0.0 { -1.0 } else { 1.0 };
                 (
                     Segment::Line {
-                        start: Point2::new(cone.ring_radius(low), base + low),
-                        end: Point2::new(cone.ring_radius(high), base + high),
+                        start: Point2::new(cone.ring_radius(low), sense.mul_add(low, base)),
+                        end: Point2::new(cone.ring_radius(high), sense.mul_add(high, base)),
                     },
                     face.value.role,
                     2,
