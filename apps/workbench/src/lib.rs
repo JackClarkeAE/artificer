@@ -2618,7 +2618,9 @@ struct HydratedWorkbenchRuntime {
 /// bound to `SketchSupport` and the immutable committed snapshot.
 #[derive(Clone, Debug)]
 struct FaceSketchDisplayContext {
-    fit_key: SketchContextFitKey,
+    /// Fits the canvas to the projection once; `None` leaves the canvas
+    /// where it is.
+    fit_key: Option<SketchContextFitKey>,
     axis_labels: [&'static str; 2],
     raw_triangles: Vec<(f64, SketchContextTriangle)>,
     raw_edges: Vec<(f64, SketchContextEdge)>,
@@ -2629,6 +2631,9 @@ struct FaceSketchDisplayContext {
     /// The support face's exact boundary curves, offered to sketch snapping.
     /// Unlike `edges`, these are analytic and never a chord approximation.
     snap_curves: Vec<SketchContextCurve>,
+    /// A construction or origin plane has no material side: whatever stands
+    /// on either side of it is in view, so nothing is an x-ray layer.
+    two_sided: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2652,6 +2657,22 @@ impl FaceSketchDisplayContext {
         // Depth is signed along the outward face normal: zero on the face,
         // positive for material raised from it, negative below it.
         const SURFACE_TOLERANCE: f64 = 1.0e-4;
+        if self.two_sided {
+            // Seen through a plane, a body behind it is as plain as one in
+            // front: painter order, deepest first.
+            let mut body = self.raw_triangles.clone();
+            body.sort_by(|left, right| left.0.total_cmp(&right.0));
+            self.triangles = body
+                .into_iter()
+                .map(|(_, triangle)| triangle.with_layer(SketchContextLayer::Body))
+                .collect();
+            self.edges = self
+                .raw_edges
+                .iter()
+                .map(|(_, edge)| edge.with_layer(SketchContextLayer::Body))
+                .collect();
+            return;
+        }
         let depth_shade = |depth: f64| -> f32 {
             if max_depth <= SURFACE_TOLERANCE {
                 return 0.0;
@@ -2707,11 +2728,15 @@ impl FaceSketchDisplayContext {
     }
 
     fn viewport_context(&self) -> SketchViewportContext<'_> {
-        SketchViewportContext::new(&self.triangles, &self.edges)
-            .with_selected_face(&self.boundary, self.fit_key)
+        let mut context = SketchViewportContext::new(&self.triangles, &self.edges)
             .with_selected_face_inner_boundaries(&self.inner_boundaries)
             .with_snap_curves(&self.snap_curves)
-            .with_axis_labels(self.axis_labels)
+            .with_axis_labels(self.axis_labels);
+        match self.fit_key {
+            Some(key) => context = context.with_selected_face(&self.boundary, key),
+            None => context.selected_face_boundary = &self.boundary,
+        }
+        context
     }
 }
 
@@ -8830,7 +8855,21 @@ impl KernelLabApp {
         };
         self.extruded_sketch_revision = None;
         self.selected_faces.clear();
-        self.face_sketch_context = None;
+        self.face_sketch_context = match &self.sketch_support {
+            SketchSupport::Origin { plane } => {
+                self.plane_sketch_context(sketch_plane_frame(*plane), None, None)
+            }
+            SketchSupport::ConstructionPlane { id, frame } => {
+                let outline = id.and_then(|id| {
+                    self.construction_planes
+                        .iter()
+                        .find(|plane| plane.id == id)
+                        .map(|plane| (plane.half_u, plane.half_v))
+                });
+                self.plane_sketch_context(**frame, outline, None)
+            }
+            SketchSupport::PlanarFace { .. } => None,
+        };
         // Activating a sketch says *which* sketch, not *which workspace*. It
         // used to say both, so selecting the sketch you were drawing threw you
         // out into the model view, and the explicit edit action below had to
@@ -8870,7 +8909,8 @@ impl KernelLabApp {
         self.sketch_support = SketchSupport::Origin {
             plane: self.selected_origin_plane,
         };
-        self.face_sketch_context = None;
+        self.face_sketch_context =
+            self.plane_sketch_context(sketch_plane_frame(self.selected_origin_plane), None, None);
         self.active_sketch_index = None;
         self.sketch_revision = 0;
         self.sketch_finished = false;
@@ -9881,6 +9921,43 @@ impl KernelLabApp {
         self.open_construction_plane_sketch(id);
     }
 
+    /// What the canvas shows behind a sketch on a plane: every visible body,
+    /// placed where the document puts it, seen from the plane's normal side.
+    /// `outline` is the plane's own card, drawn as the support; `fit_entity`
+    /// names the plane so the canvas fits itself to it once, and `None`
+    /// leaves the canvas where it is.
+    fn plane_sketch_context(
+        &self,
+        frame: PlanarFrame3,
+        outline: Option<(f64, f64)>,
+        fit_entity: Option<u64>,
+    ) -> Option<FaceSketchDisplayContext> {
+        let visible = || self.bodies.iter().filter(|body| body.visible);
+        let fit_key = fit_entity.map(|entity| {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for body in visible() {
+                body.id.get().hash(&mut hasher);
+                body.body.snapshot.id().to_string().hash(&mut hasher);
+            }
+            let word = hasher.finish().to_le_bytes();
+            let mut digest = [0_u8; 32];
+            for (index, byte) in digest.iter_mut().enumerate() {
+                *byte = word[index % word.len()];
+            }
+            SketchContextFitKey::new(digest, entity)
+        });
+        let bodies = visible().map(|body| {
+            (
+                &body.body.scene,
+                self.occurrence_transform_for_body(body.id),
+            )
+        });
+        let mut context = project_plane_sketch_context(bodies, frame, outline, fit_key)?;
+        context.update_filtered_geometry(self.project_3d_body_context, self.project_3d_body_depth);
+        Some(context)
+    }
+
     /// Opens a sketch on a construction plane, once the camera is looking at
     /// it.
     fn open_construction_plane_sketch(&mut self, id: u64) {
@@ -9899,7 +9976,8 @@ impl KernelLabApp {
             id: Some(id),
             frame: Box::new(plane.frame),
         };
-        self.face_sketch_context = None;
+        self.face_sketch_context =
+            self.plane_sketch_context(plane.frame, Some((plane.half_u, plane.half_v)), Some(id));
         self.active_sketch_index = None;
         self.sketch_revision = 0;
         self.sketch_finished = false;
@@ -10046,7 +10124,7 @@ impl KernelLabApp {
         }
         let _ = self.sketch.set_plane(plane);
         self.sketch_support = SketchSupport::Origin { plane };
-        self.face_sketch_context = None;
+        self.face_sketch_context = self.plane_sketch_context(sketch_plane_frame(plane), None, None);
         self.extrusion_mode = ExtrusionMode::NewBody;
         self.extrusion_mode_explicit = false;
         self.workbench_mode = WorkbenchMode::Sketch;
@@ -10268,9 +10346,10 @@ impl KernelLabApp {
         let display_plane = sketch_plane_for_frame(support.frame);
         self.sketch = SketchCanvasState::new(display_plane);
         self.active_sketch_tool = ToolVariant::Select;
-        if let (Some(context), Some(view)) = (&self.face_sketch_context, fitted_view) {
-            self.sketch
-                .apply_prepared_context_view(view, context.fit_key);
+        if let (Some(context), Some(view)) = (&self.face_sketch_context, fitted_view)
+            && let Some(key) = context.fit_key
+        {
+            self.sketch.apply_prepared_context_view(view, key);
         }
         self.sketch_support = SketchSupport::PlanarFace {
             body,
@@ -26763,76 +26842,11 @@ fn project_face_sketch_context(
         face_winding += sketch_triangle_signed_area(vertices);
     }
     let outward = if face_winding < 0.0 { -1.0 } else { 1.0 };
-    let projected_triangles = scene
-        .triangles
-        .iter()
-        .filter_map(|triangle| {
-            let projected = triangle
-                .vertices
-                .map(|point| projection.project(point))
-                .into_iter()
-                .collect::<Option<Vec<_>>>()?;
-            let vertices: [SketchPoint; 3] = projected
-                .iter()
-                .map(|(point, _)| *point)
-                .collect::<Vec<_>>()
-                .try_into()
-                .ok()?;
-            let signed_area = sketch_triangle_signed_area(vertices) * outward;
-            if !signed_area.is_finite() || signed_area <= 0.0 {
-                return None;
-            }
-            let vertex_depths: [f64; 3] = projected
-                .iter()
-                .map(|(_, depth)| *depth)
-                .collect::<Vec<_>>()
-                .try_into()
-                .ok()?;
-            let depth = vertex_depths.iter().sum::<f64>() / 3.0 * outward;
-            // Shade from the true 3D attitude of the facet: a face parallel
-            // to the sketch plane is brightest, one sloping away is darker.
-            // Walls at right angles have no projected area and never arrive.
-            let [a, b, c] = triangle.vertices;
-            let facet_normal = normalized_vector(cross_vector(
-                Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z),
-                Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z),
-            ));
-            let attitude = facet_normal
-                .map(|normal| dot_vector(normal, projection.normal).abs())
-                .unwrap_or(1.0);
-            let shade = (0.55 + 0.45 * attitude) as f32;
-            Some((
-                depth,
-                vertex_depths,
-                SketchContextTriangle::new(vertices).with_shade(shade),
-            ))
-        })
-        .collect::<Vec<_>>();
+    let (projected_triangles, raw_edges) =
+        project_scene_into_sketch(scene, &projection, outward, |point| point);
     let raw_triangles: Vec<(f64, SketchContextTriangle)> = projected_triangles
         .iter()
         .map(|(depth, _, triangle)| (*depth, *triangle))
-        .collect();
-
-    // Creases only: a bore's facet seams and a fillet's tangent rails are not
-    // lines the user should see through the face.
-    let raw_edges: Vec<(f64, SketchContextEdge)> = scene
-        .edges
-        .iter()
-        .filter(|edge| !edge.is_smooth && !edge.is_tangent)
-        .filter_map(|edge| {
-            let endpoints = edge.endpoints.map(|point| projection.project(point));
-            let endpoints = [endpoints[0]?, endpoints[1]?];
-            let edge_depth = (endpoints[0].1 + endpoints[1].1) * 0.5 * outward;
-            projected_triangles
-                .iter()
-                .any(|(_, depths, triangle)| {
-                    projected_edge_matches_triangle(endpoints, triangle.vertices, *depths)
-                })
-                .then_some((
-                    edge_depth,
-                    SketchContextEdge::new([endpoints[0].0, endpoints[1].0]),
-                ))
-        })
         .collect();
 
     let triangles = raw_triangles.iter().map(|(_, tri)| *tri).collect();
@@ -26864,10 +26878,10 @@ fn project_face_sketch_context(
         .collect::<Vec<_>>();
 
     (!boundary.is_empty()).then_some(FaceSketchDisplayContext {
-        fit_key: SketchContextFitKey::new(
+        fit_key: Some(SketchContextFitKey::new(
             *support.support_digest.as_bytes(),
             support.face.entity.0,
-        ),
+        )),
         axis_labels: [
             dominant_axis_label(support.frame.u).unwrap_or("U"),
             dominant_axis_label(support.frame.v).unwrap_or("V"),
@@ -26879,7 +26893,142 @@ fn project_face_sketch_context(
         boundary,
         inner_boundaries,
         snap_curves,
+        two_sided: false,
     })
+}
+
+/// The bodies projected onto a construction or origin plane, for the canvas
+/// to draw behind a sketch on that plane. A plane has no material side, so
+/// the sketch looks along the frame's own normal and everything on either
+/// side of the plane is in view. `outline` is the plane's card, half-extents
+/// in the frame, drawn as the support and centred by the first fit. `None`
+/// when no body projects at all.
+fn project_plane_sketch_context<'a>(
+    bodies: impl IntoIterator<Item = (&'a DebugScene, viewport::RigidOccurrenceTransform)>,
+    frame: PlanarFrame3,
+    outline: Option<(f64, f64)>,
+    fit_key: Option<SketchContextFitKey>,
+) -> Option<FaceSketchDisplayContext> {
+    let projection = FaceSketchProjection::from_frame(frame)?;
+    let mut raw_triangles = Vec::new();
+    let mut raw_edges = Vec::new();
+    for (scene, transform) in bodies {
+        let (triangles, edges) = project_scene_into_sketch(scene, &projection, 1.0, |point| {
+            transform.transform_point(point)
+        });
+        raw_triangles.extend(
+            triangles
+                .into_iter()
+                .map(|(depth, _, triangle)| (depth, triangle)),
+        );
+        raw_edges.extend(edges);
+    }
+    if raw_triangles.is_empty() && raw_edges.is_empty() {
+        return None;
+    }
+    let boundary = outline.map_or_else(Vec::new, |(half_u, half_v)| {
+        [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .map(|(su, sv): (f64, f64)| SketchPoint::new(su * half_u, sv * half_v))
+            .to_vec()
+    });
+    Some(FaceSketchDisplayContext {
+        fit_key,
+        axis_labels: [
+            dominant_axis_label(frame.u).unwrap_or("U"),
+            dominant_axis_label(frame.v).unwrap_or("V"),
+        ],
+        raw_triangles,
+        raw_edges,
+        triangles: Vec::new(),
+        edges: Vec::new(),
+        boundary,
+        inner_boundaries: Vec::new(),
+        snap_curves: Vec::new(),
+        two_sided: true,
+    })
+}
+
+type ProjectedSketchTriangles = Vec<(f64, [f64; 3], SketchContextTriangle)>;
+
+/// Every triangle of `scene` that faces the sketch, with its mean and vertex
+/// depths, and every crease edge that lies on one of them. `outward` is `1`
+/// when the sketch looks along the projection's normal and `-1` when it
+/// looks against it; `place` moves the scene to where the document puts the
+/// body before projecting.
+fn project_scene_into_sketch(
+    scene: &DebugScene,
+    projection: &FaceSketchProjection,
+    outward: f64,
+    place: impl Fn(Point3) -> Point3,
+) -> (ProjectedSketchTriangles, Vec<(f64, SketchContextEdge)>) {
+    let projected_triangles = scene
+        .triangles
+        .iter()
+        .filter_map(|triangle| {
+            let placed = triangle.vertices.map(&place);
+            let projected = placed
+                .map(|point| projection.project(point))
+                .into_iter()
+                .collect::<Option<Vec<_>>>()?;
+            let vertices: [SketchPoint; 3] = projected
+                .iter()
+                .map(|(point, _)| *point)
+                .collect::<Vec<_>>()
+                .try_into()
+                .ok()?;
+            let signed_area = sketch_triangle_signed_area(vertices) * outward;
+            if !signed_area.is_finite() || signed_area <= 0.0 {
+                return None;
+            }
+            let vertex_depths: [f64; 3] = projected
+                .iter()
+                .map(|(_, depth)| *depth)
+                .collect::<Vec<_>>()
+                .try_into()
+                .ok()?;
+            let depth = vertex_depths.iter().sum::<f64>() / 3.0 * outward;
+            // Shade from the true 3D attitude of the facet: a face parallel
+            // to the sketch plane is brightest, one sloping away is darker.
+            // Walls at right angles have no projected area and never arrive.
+            let [a, b, c] = placed;
+            let facet_normal = normalized_vector(cross_vector(
+                Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z),
+                Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z),
+            ));
+            let attitude = facet_normal
+                .map(|normal| dot_vector(normal, projection.normal).abs())
+                .unwrap_or(1.0);
+            let shade = (0.55 + 0.45 * attitude) as f32;
+            Some((
+                depth,
+                vertex_depths,
+                SketchContextTriangle::new(vertices).with_shade(shade),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    // Creases only: a bore's facet seams and a fillet's tangent rails are not
+    // lines the user should see through the face.
+    let raw_edges: Vec<(f64, SketchContextEdge)> = scene
+        .edges
+        .iter()
+        .filter(|edge| !edge.is_smooth && !edge.is_tangent)
+        .filter_map(|edge| {
+            let endpoints = edge.endpoints.map(|point| projection.project(place(point)));
+            let endpoints = [endpoints[0]?, endpoints[1]?];
+            let edge_depth = (endpoints[0].1 + endpoints[1].1) * 0.5 * outward;
+            projected_triangles
+                .iter()
+                .any(|(_, depths, triangle)| {
+                    projected_edge_matches_triangle(endpoints, triangle.vertices, *depths)
+                })
+                .then_some((
+                    edge_depth,
+                    SketchContextEdge::new([endpoints[0].0, endpoints[1].0]),
+                ))
+        })
+        .collect();
+    (projected_triangles, raw_edges)
 }
 
 /// Restates one exact face-boundary curve in the sketch canvas's vocabulary.
@@ -34989,7 +35138,7 @@ mod face_sketch_context_layers {
             ])
         };
         FaceSketchDisplayContext {
-            fit_key: SketchContextFitKey::new([0; 32], 1),
+            fit_key: Some(SketchContextFitKey::new([0; 32], 1)),
             axis_labels: ["U", "V"],
             // A raised boss, the face itself, a shallow pocket floor, and a
             // deep bore floor.
@@ -35005,6 +35154,35 @@ mod face_sketch_context_layers {
             boundary: Vec::new(),
             inner_boundaries: Vec::new(),
             snap_curves: Vec::new(),
+            two_sided: false,
+        }
+    }
+
+    /// A plane context has no material side: every triangle and edge is the
+    /// body layer whatever its depth, whether or not the x-ray is on.
+    #[test]
+    fn a_two_sided_context_shows_both_sides_as_the_body() {
+        let mut context = context();
+        context.two_sided = true;
+        for (project_below, max_depth) in [(false, 50.0), (true, 50.0), (true, 1.0)] {
+            context.update_filtered_geometry(project_below, max_depth);
+            assert_eq!(context.triangles.len(), 4);
+            assert_eq!(context.edges.len(), 3);
+            assert!(
+                context
+                    .triangles
+                    .iter()
+                    .all(|triangle| triangle.layer == SketchContextLayer::Body)
+            );
+            assert!(
+                context
+                    .edges
+                    .iter()
+                    .all(|edge| edge.layer == SketchContextLayer::Body)
+            );
+            // Painter order: the deep bore floor first, the boss last.
+            assert_eq!(context.triangles[0].vertices[0].u, 30.0);
+            assert_eq!(context.triangles[3].vertices[0].u, 0.0);
         }
     }
 
@@ -35848,6 +36026,71 @@ mod construction_plane_tests {
             app.document.history_position(),
             "the edit returns the history to its end"
         );
+    }
+
+    /// A sketch on a plane keeps the bodies in view: the canvas draws them
+    /// behind the sketch as it does for a face, on either side of the plane,
+    /// with the plane's own card as the support. A body is never hidden by
+    /// sketching, whichever plane the sketch is on.
+    #[test]
+    fn the_bodies_stay_in_view_behind_a_sketch_on_a_plane() {
+        let mut app = KernelLabApp::default();
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (0.0, 0.0), (4.0, 4.0));
+        app.set_extrusion_distance_intent(6.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.enter_model_mode();
+
+        // A construction plane above the body: the whole body lies behind
+        // the plane and is still projected.
+        let plane = origin_plane(&mut app, SketchPlane::XY, 10.0);
+        app.selected_construction_plane = Some(plane.id);
+        app.begin_construction_plane_sketch(plane.id);
+        if let Some(PendingPlaneSketch::Construction(id)) = app.pending_plane_sketch.take() {
+            app.open_construction_plane_sketch(id);
+        }
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        let context = app
+            .face_sketch_context
+            .as_ref()
+            .expect("the body is projected behind the plane sketch");
+        assert!(!context.triangles.is_empty());
+        assert!(!context.edges.is_empty());
+        assert!(
+            context.raw_triangles.iter().all(|(depth, _)| *depth < 0.0),
+            "the body is entirely below the plane"
+        );
+        assert_eq!(context.boundary.len(), 4, "the plane's card is the support");
+        assert!(
+            context.fit_key.is_some(),
+            "the canvas fits itself to the plane once"
+        );
+        assert!(app.bodies.iter().all(|body| body.visible));
+
+        // Finishing leaves the body where it was, visible.
+        draw_rectangle(&mut app, (1.0, 1.0), (2.0, 2.0));
+        app.enter_model_mode();
+        assert_eq!(app.workbench_mode, WorkbenchMode::Model);
+        assert!(app.bodies.iter().all(|body| body.visible));
+
+        // A sketch on an origin plane with a body in the document shows the
+        // body too, without moving the canvas.
+        app.begin_new_origin_sketch();
+        let context = app
+            .face_sketch_context
+            .as_ref()
+            .expect("the body is projected behind the origin-plane sketch");
+        assert!(!context.triangles.is_empty());
+        assert!(context.fit_key.is_none());
+        assert!(context.boundary.is_empty());
+        assert!(app.bodies.iter().all(|body| body.visible));
+
+        // And a body the user hid stays hidden: it is not projected.
+        app.enter_model_mode();
+        app.set_body_visibility(0, false);
+        app.begin_new_origin_sketch();
+        assert!(app.face_sketch_context.is_none());
     }
 
     #[test]
