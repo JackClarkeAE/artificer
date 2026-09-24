@@ -5,6 +5,7 @@ members = [
     "apps/cli",
     "apps/script-studio",
     "apps/workbench",
+    "crates/cam",
     "crates/catalog",
     "crates/compute",
     "crates/geometry",

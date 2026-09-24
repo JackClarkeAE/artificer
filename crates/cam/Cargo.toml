@@ -1,0 +1,16 @@
+[package]
+name = "artificer-cam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artificer-kernel = { path = "../kernel" }
+artificer-model = { path = "../model" }
+artificer-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

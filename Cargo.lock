@@ -238,6 +238,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "artificer-cam"
+version = "0.99.81"
+dependencies = [
+ "artificer-kernel",
+ "artificer-model",
+ "artificer-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "artificer-catalog"
 version = "0.99.81"
 dependencies = [

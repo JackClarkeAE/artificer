@@ -9,6 +9,7 @@ mod analytic_extrusion;
 pub mod api;
 pub mod brep;
 mod bspline;
+mod cam_queries;
 mod coaxial_boolean;
 mod concave_edge_fill;
 mod concave_rim_blend;
@@ -104,6 +105,7 @@ use crate::topology::{
 };
 use crate::transform::{Similarity, TransformInputError, transform_topology};
 
+pub use crate::cam_queries::{CamQueryError, PrismProfile, TurnedSection};
 pub use crate::describe::{
     EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, RailGeometry, RailKind,
     SurfaceCounts,
