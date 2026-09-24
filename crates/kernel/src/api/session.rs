@@ -241,10 +241,17 @@ impl Session {
                 step_label,
                 outcome.snapshot.id(),
                 outcome.snapshot.counts(),
-                if tier == Tier::Approximate {
-                    " Approximate: the faceted tier built this step."
-                } else {
+                if tier != Tier::Approximate {
                     ""
+                } else if outcome
+                    .report
+                    .rung
+                    .as_deref()
+                    .is_some_and(|rung| rung.ends_with("/approximate"))
+                {
+                    " Approximate: an approximated surface built this step."
+                } else {
+                    " Approximate: the faceted tier built this step."
                 }
             ),
         };
@@ -2055,11 +2062,16 @@ fn sketch_chain(entities: &[SketchEntity]) -> Result<Vec<PlanarCurve2>, ApiError
                 ),
                 direction: ArcDirection::CounterClockwise,
             }),
+            // A closed spline is a chain of its own; an open one joins the
+            // lines and arcs it meets end to end.
             SketchEntity::Spline { .. } | SketchEntity::ControlSpline { .. } => {
-                return Err(ApiError::new(
-                    ApiErrorCode::InvalidInput,
-                    "A surface is swept from lines and arcs; a spline in the chain would sweep a B-spline sheet, which this release does not build",
-                ));
+                if let Some((curve, is_closed)) = entity_spline(entity)? {
+                    if is_closed {
+                        closed.push(vec![curve]);
+                    } else {
+                        open.push(curve);
+                    }
+                }
             }
         }
     }
@@ -2069,7 +2081,7 @@ fn sketch_chain(entities: &[SketchEntity]) -> Result<Vec<PlanarCurve2>, ApiError
         _ => {
             return Err(ApiError::new(
                 ApiErrorCode::InvalidInput,
-                "A surface is swept from one chain: lines and arcs joined end to end, or one circle or rectangle on its own",
+                "A surface is swept from one chain: lines, arcs and splines joined end to end, or one circle, rectangle or closed spline on its own",
             ));
         }
     }
@@ -2106,6 +2118,42 @@ fn sketch_chain(entities: &[SketchEntity]) -> Result<Vec<PlanarCurve2>, ApiError
                     ArcDirection::Clockwise => ArcDirection::CounterClockwise,
                 },
             },
+            // The same locus walked the other way: the control points in
+            // reverse, on the knots reflected in the middle of the domain,
+            // with the ends kept exact.
+            PlanarCurve2::Bspline {
+                degree,
+                control_points,
+                knots,
+                weights,
+            } => {
+                let (first, last) = (
+                    knots.first().copied().unwrap_or(0.0),
+                    knots.last().copied().unwrap_or(1.0),
+                );
+                let count = knots.len();
+                PlanarCurve2::Bspline {
+                    degree: *degree,
+                    control_points: control_points.iter().rev().copied().collect(),
+                    knots: knots
+                        .iter()
+                        .rev()
+                        .enumerate()
+                        .map(|(index, knot)| {
+                            if index <= *degree {
+                                first
+                            } else if index + degree + 1 >= count {
+                                last
+                            } else {
+                                first + last - knot
+                            }
+                        })
+                        .collect(),
+                    weights: weights
+                        .as_ref()
+                        .map(|weights| weights.iter().rev().copied().collect()),
+                }
+            }
             other => other.clone(),
         }
     };

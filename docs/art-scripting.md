@@ -634,6 +634,97 @@ let joined = union(target: plate, tool: boss, label: "joined");
 Both arguments are steps (bound names or their labels). The result becomes
 the current body.
 
+### Sheets: `surface_extrude`, `surface_revolve`, `patch`, `stitch`, `thicken`, `trim`
+
+A sheet body is a surface with no inside: faces on the same exact carriers
+a solid has, sharing edges where they meet, with a boundary where they do
+not (ADR 0056, Track S). It has an area and no volume, and the report
+validates it under the `sheet` profile. Sheets are how a part is built
+from its skin: sweep the walls, trim them, stitch them closed, or thicken
+one into a solid.
+
+```art
+let s = sketch(on: "XY", entities: [circle(radius: 10)], label: "s");
+let wall = surface_extrude(sketch: s, distance: 20, label: "wall");     // a cylinder sheet
+let cut = trim(plane: plane(from: "XY", offset: 5), label: "cut");      // keep z ≥ 5
+let tube = thicken(thickness: 2, label: "tube");                        // now a solid
+
+let r = sketch(on: "XZ", entities: [line(start: [5, 0], end: [10, 8])], label: "r");
+let cone = surface_revolve(sketch: r, axis: [0, 0, 1], label: "cone");  // a cone sheet
+
+let b = sketch(on: "XY", entities: [rect(origin: [0, 0], width: 10, height: 10)], label: "b");
+let bottom = patch(sketch: b, label: "bottom");
+let t = sketch(on: plane(from: "XY", offset: 10), entities: [rect(origin: [0, 0], width: 10, height: 10)], label: "t");
+let top = patch(sketch: t, label: "top");
+let sides = surface_extrude(sketch: b, distance: 10, label: "sides");
+let cube = stitch(sheets: [bottom, sides, top], label: "cube");          // closes: a solid
+```
+
+| Call | Arguments | What it builds |
+|---|---|---|
+| `surface_extrude` | `sketch`, `distance` | The walls the sketch's chain sweeps along the sketch plane's normal, with no caps: a plane per line, a cylinder per arc, a B-spline surface per spline, each exact. The chain is the sketch's lines, arcs and splines joined end to end, open or closed, or one circle, rectangle or closed spline. A negative distance sweeps the other way. New body. |
+| `surface_revolve` | `sketch`, `axis`, `axis_origin`, `angle` | The bands the chain sweeps about the axis, as for `revolve`: cylinders, cones and planar annuli from lines, tori and spheres from arcs, with no wedge faces closing a partial turn. The chain may touch the axis at its ends (a disk, a pole) but not between them. New body. |
+| `patch` | `sketch`, `regions` | One planar face per region of the sketch, holes included, facing the way the sketch does. New body. |
+| `stitch` | `sheets` | Several sheet steps welded along their boundaries into one body. Faces drawn facing opposite ways are turned to agree. When every boundary edge pairs the result is a solid (`stitch/solid`), turned to face outward; otherwise a sheet (`stitch/sheet`) with the edges that did not pair as its boundary. |
+| `thicken` | `thickness` | The current sheet made into a solid between it and its offset: positive along the sheet's normal, negative against it. Planes, cylinders, cones, spheres and tori offset exactly, with planar, cylindrical and conical walls along the boundary (`thicken/exact`). A B-spline face is offset by approximation (`thicken/approximate`, below). A closed sheet (a sphere) becomes a solid with a void. |
+| `trim` | `plane` | The current sheet cut by a plane, keeping the side the plane faces (`u × v` of a `plane(...)`, `+Z` for `"XY"`). The section is imprinted on every face and the faces split along it. |
+
+**Which way a sheet faces.** A surface extrusion faces to the right of
+its chain as drawn, seen from the side the sketch faces, so a
+counter-clockwise circle or rectangle faces outward; a revolve faces as
+the solid revolve's bands do, away from the left of the chain; a patch
+faces the way its sketch does. `thicken` reads that side; `stitch` does
+not, since it turns sheets to agree with their neighbours.
+
+**A spline sheet's offset is approximate.** A B-spline surface has no
+exact offset. `thicken` offsets one by the B-spline surface on its own
+basis that passes through the true offset at the net's Greville
+abscissae, on a net refined by halving its spans until the offset lies
+within the approximation budget of the true offset or the net is as fine
+as the kernel goes, and measures how far it strays on a grid over every
+span. The step takes the rung `thicken/approximate`,
+the body's tier is approximate, and the step carries a
+`SURFACE_OFFSET_APPROXIMATION` warning whose measurement is that
+deviation against the budget. The walls along the spline edges are the
+B-spline surfaces ruled between each edge and its offset, and the volume
+is the exact integral of the approximate faces. The sheet itself stays
+exact: an extruded spline is measured exactly, and only its offset is
+not.
+
+```art
+let s = sketch(on: "XY", entities: [spline(control_points: [[0, 0], [5, 10], [10, 0]], degree: 2)], label: "s");
+let arch = surface_extrude(sketch: s, distance: 20, label: "arch");   // exact, surface/extrude
+let wall = thicken(thickness: 1, label: "wall");                     // thicken/approximate, tier approximate
+```
+
+**The boundary.** A sheet's boundary edges are reported under the role
+`boundary_edge[n]`, so `wall.edges("boundary_edge")` selects them, and the
+viewport draws them as hard edges. A stitch names a gap by measure:
+two boundary edges that line up — the same length within a twentieth,
+ends within a tenth of that length — but do not meet within the model's
+agreement refuse the stitch with `STITCH_GAP_EXCEEDS_TOLERANCE` and the
+gap, rather than leave a seam open by accident. Nothing is moved to close
+a gap; build the sheets so their edges meet.
+
+**What refuses, by name.** A chain that does not join (`SURFACE_CHAIN_DISCONNECTED`)
+or crosses itself (`SURFACE_CHAIN_SELF_INTERSECTS`); a revolve chain that
+holds a spline (`SURFACE_CHAIN_SPLINE_UNSUPPORTED`), reaches both
+sides of its axis, touches it between its ends, or runs along it
+(`SURFACE_REVOLVE_CROSSES_AXIS`, `SURFACE_REVOLVE_PINCHED_ON_AXIS`,
+`SURFACE_REVOLVE_SEGMENT_ON_AXIS`). `thicken` refuses a ruled face
+(`THICKEN_FACE_UNSUPPORTED`), two faces meeting at a crease, whose
+offsets part (`THICKEN_CREASE_UNSUPPORTED`), a thickness that collapses a
+curved face (`THICKEN_OFFSET_DEGENERATE`) and a boundary edge whose wall
+would be a surface it does not build, such as an ellipse from an oblique
+cut (`THICKEN_EDGE_UNSUPPORTED`). `trim` cuts planes and cylinders by any
+plane, and cones, spheres and tori by a plane square to their axis or
+through it; an oblique section of those is a curve the kernel has no
+exact name for (`TRIM_SECTION_UNSUPPORTED`). A cut that leaves nothing is
+`TRIM_RESULT_EMPTY`. Every feature that needs a solid — a drill, a fillet,
+a shell, a Boolean — refuses a sheet with `SHEET_UNSUPPORTED_HERE`;
+`thicken` and `trim` refuse a solid with `SHEET_INPUT_REQUIRED`. A sheet
+may be moved, mirrored and patterned like a solid.
+
 ---
 
 ## 7. Selectors
@@ -959,7 +1050,12 @@ concave fillets between a boss and its plate, text as sketch geometry from a
 script, and threads. A script builds parts; joints and occurrences belong
 to a document, so a mechanism is assembled in the workbench and analysed
 through section 18 rather than written here. `shell` covers prisms and
-solids of revolution — a blended or domed body is refused by name. The
+solids of revolution — a blended or domed body is refused by name. Sheets
+are extruded from lines, arcs and splines and revolved from lines and
+arcs, thicken while their faces meet smoothly, and trim by planes; a
+surface loft or sweep, a revolved spline sheet, an offset of a ruled
+face, an exact offset of a B-spline face, a trim of a B-spline sheet and
+a trim by another sheet are not built. The
 scripting surface follows the kernel API as it grows. Functions cannot
 recurse, and a module's functions share one flat namespace with the
 script's.

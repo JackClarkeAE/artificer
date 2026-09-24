@@ -31,6 +31,7 @@ pub(crate) const PLANAR_PATCH_RUNG: &str = "surface/patch";
 pub(crate) const STITCH_SHEET_RUNG: &str = "stitch/sheet";
 pub(crate) const STITCH_SOLID_RUNG: &str = "stitch/solid";
 pub(crate) const THICKEN_RUNG: &str = "thicken/exact";
+pub(crate) const THICKEN_APPROXIMATE_RUNG: &str = "thicken/approximate";
 pub(crate) const TRIM_RUNG: &str = "trim/plane";
 
 /// Whether a topology is a sheet body: shells with no solid.
@@ -67,15 +68,17 @@ pub(crate) fn boundary_edges(topology: &Topology) -> Vec<EdgeKey> {
 /// sheet's: its area, and no volume.
 pub(crate) fn validate_sheet(topology: &Topology, linear_tolerance: f64) -> ValidationReport {
     let mut report = validator::validate(topology, linear_tolerance);
-    report.diagnostics.retain(|diagnostic| match diagnostic.code {
-        DiagnosticCode::EdgeUseCount => diagnostic.measured != Some(1.0),
-        // A sheet's shells belong to no solid.
-        DiagnosticCode::ShellUseCount => diagnostic.measured != Some(0.0),
-        DiagnosticCode::EulerCharacteristicInvalid | DiagnosticCode::SolidVolumeNonPositive => {
-            false
-        }
-        _ => true,
-    });
+    report
+        .diagnostics
+        .retain(|diagnostic| match diagnostic.code {
+            DiagnosticCode::EdgeUseCount => diagnostic.measured != Some(1.0),
+            // A sheet's shells belong to no solid.
+            DiagnosticCode::ShellUseCount => diagnostic.measured != Some(0.0),
+            DiagnosticCode::EulerCharacteristicInvalid | DiagnosticCode::SolidVolumeNonPositive => {
+                false
+            }
+            _ => true,
+        });
     report.measures = sheet_measures(topology, report.measures.bounds);
     report
 }
@@ -101,8 +104,8 @@ pub(crate) fn sheet_measures(
 
 /// One face's exact area, by the same closed forms the body measures use.
 pub(crate) fn face_area(topology: &Topology, face: &crate::topology::Face) -> Option<f64> {
-    let parameter_area = validator::face_parameter_area_and_moment(topology, face)
-        .map(|(area, _)| area.abs())?;
+    let parameter_area =
+        validator::face_parameter_area_and_moment(topology, face).map(|(area, _)| area.abs())?;
     let jacobian = match face.surface {
         Surface::Plane(plane) => plane.u.cross(plane.v).length(),
         Surface::Cylinder(cylinder) => cylinder.radius * cylinder.axis.length(),
@@ -151,9 +154,8 @@ pub(crate) fn unsupported_here(snapshot: SnapshotId, what: &str) -> KernelError 
 
 /// The refusal for a sheet operation given a body that is not a sheet.
 pub(crate) fn not_a_sheet(snapshot: SnapshotId, what: &str) -> KernelError {
-    let message = format!(
-        "{what} needs a sheet body; the current body is a solid, or there is no body yet"
-    );
+    let message =
+        format!("{what} needs a sheet body; the current body is a solid, or there is no body yet");
     error(
         KernelErrorCode::InvalidInput,
         KernelStage::Preflight,

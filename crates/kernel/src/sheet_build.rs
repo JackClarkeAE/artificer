@@ -2,14 +2,15 @@
 //! revolve and a planar patch.
 //!
 //! Each is the solid builder it mirrors with the caps left off. A surface
-//! extrusion sweeps an open or closed chain of lines and arcs along the
-//! frame's normal into planes and cylinders, exactly as
-//! [`crate::analytic_extrusion::build_analytic_extrusion`] sweeps a loop; a
-//! surface revolve turns a chain about an axis into the bands
-//! [`crate::section_revolve`] builds for a revolve, without the wedge faces
-//! that close a partial turn; a planar patch is the cap face a profile
-//! would have had. Nothing here is a new carrier: every face is one the
-//! solid builders already write, and the validator holds it to the same
+//! extrusion sweeps an open or closed chain of lines, arcs and splines
+//! along the frame's normal into planes, cylinders and B-spline walls,
+//! exactly as [`crate::analytic_extrusion::build_analytic_extrusion`] and
+//! [`crate::spline_profile::build_spline_extrusion`] sweep a loop; a
+//! surface revolve turns a chain of lines and arcs about an axis into the
+//! bands [`crate::section_revolve`] builds for a revolve, without the wedge
+//! faces that close a partial turn; a planar patch is the cap face a
+//! profile would have had. Nothing here is a new carrier: every face is one
+//! the solid builders already write, and the validator holds it to the same
 //! standard, less the closure a sheet does not have.
 
 use std::f64::consts::TAU;
@@ -25,20 +26,37 @@ use crate::analytic_extrusion::{
     push_boundary_edge, push_cap_face, push_edge, push_loop, push_side_face, push_vertex,
     segment_clearance, validate_analytic_profile_extrusion,
 };
+use crate::bspline::{SplineCurve2, SplineCurve3, SplineError, SplineSurface, array3, point2};
 use crate::planar_profile::PlanarProfileInputError;
 use crate::section_revolve::{RzSection, build_turned_sheet};
 use crate::sheet::{self, SheetResult};
+use crate::spline_profile::{ProfilePiece, spline_from_protocol};
 use crate::topology::{
-    Edge, FaceKey, FaceRole, Orientation, Plane, Point2, Record, Shell, Surface, Topology,
+    Curve2, Curve3, Edge, EdgeKey, Face, FaceKey, FaceRole, Orientation, ParameterRange, Plane,
+    Point2, Record, Shell, Surface, Topology,
 };
 use crate::{CancellationToken, ExecutionOutcome, Snapshot, planar_profile_input_error};
 
-/// An open or closed chain of exact segments, joined end to end.
+/// An open or closed chain of exact pieces, joined end to end.
 #[derive(Clone, Debug)]
 pub(crate) struct Chain {
-    pub(crate) segments: Vec<Segment>,
-    /// Whether the last segment ends where the first begins.
+    pub(crate) pieces: Vec<ProfilePiece>,
+    /// Whether the last piece ends where the first begins.
     pub(crate) closed: bool,
+}
+
+impl Chain {
+    /// The chain's pieces as segments, or `None` when a spline is among
+    /// them.
+    fn segments(&self) -> Option<Vec<Segment>> {
+        self.pieces
+            .iter()
+            .map(|piece| match piece {
+                ProfilePiece::Segment(segment) => Some(*segment),
+                ProfilePiece::Spline(_) => None,
+            })
+            .collect()
+    }
 }
 
 /// Why a chain was refused.
@@ -48,7 +66,11 @@ pub(crate) enum ChainError {
     TooLong,
     Disconnected,
     SelfIntersects,
+    /// A spline in a chain the operation sweeps from lines and arcs alone.
     Spline,
+    /// A spline the kernel does not carry: rational, unclamped, of the
+    /// wrong degree.
+    Bspline(SplineError),
     /// A piece the profile parser refused: too small, not finite, a whole
     /// circle among other curves.
     Curve(PlanarProfileInputError),
@@ -84,19 +106,21 @@ impl ChainError {
                 KernelErrorCode::Unsupported,
                 "SURFACE_CHAIN_SPLINE_UNSUPPORTED",
                 format!(
-                    "{what} sweeps lines and arcs; a spline in the chain would sweep a B-spline \
-                     sheet, which this release does not build"
+                    "{what} sweeps lines and arcs; a spline turned about an axis would sweep a \
+                     surface of revolution with a spline generatrix, which this release does \
+                     not build"
                 ),
             ),
+            Self::Bspline(reason) => return crate::bspline_input_error(snapshot, reason),
             Self::Curve(reason) => return planar_profile_input_error(snapshot, reason),
         };
         sheet::refuse(snapshot, code, name, message)
     }
 }
 
-/// Reads a chain of lines and arcs, or one whole circle, as exact segments
-/// joined end to end, and checks that it does not touch itself anywhere but
-/// at the joins.
+/// Reads a chain of lines, arcs and splines, or one whole circle, as exact
+/// pieces joined end to end, and checks that its lines and arcs do not
+/// touch one another anywhere but at the joins.
 pub(crate) fn parse_chain(
     curves: &[PlanarCurve2],
     precision: PrecisionPolicy,
@@ -117,11 +141,13 @@ pub(crate) fn parse_chain(
     {
         // A whole circle is a chain of its own: two semicircles, so the
         // sheet it sweeps has two seams like every other closed carrier.
-        let [PlanarCurve2::Circle {
-            center,
-            radius,
-            direction,
-        }] = curves
+        let [
+            PlanarCurve2::Circle {
+                center,
+                radius,
+                direction,
+            },
+        ] = curves
         else {
             return Err(ChainError::Disconnected);
         };
@@ -138,90 +164,135 @@ pub(crate) fn parse_chain(
         let positive = Point2::new(center.x + radius, center.y);
         let negative = Point2::new(center.x - radius, center.y);
         return Ok(Chain {
-            segments: vec![
-                Segment::Arc {
+            pieces: vec![
+                ProfilePiece::Segment(Segment::Arc {
                     center,
                     start: positive,
                     end: negative,
                     radius: *radius,
                     start_angle: 0.0,
                     sweep: sign * std::f64::consts::PI,
-                },
-                Segment::Arc {
+                }),
+                ProfilePiece::Segment(Segment::Arc {
                     center,
                     start: negative,
                     end: positive,
                     radius: *radius,
                     start_angle: sign * std::f64::consts::PI,
                     sweep: sign * std::f64::consts::PI,
-                },
+                }),
             ],
             closed: true,
         });
     }
-    let mut segments = Vec::with_capacity(curves.len());
+    let mut pieces = Vec::with_capacity(curves.len());
     for curve in curves {
-        segments.push(parse_curve(curve, minimum, agreement).map_err(|reason| match reason {
-            PlanarProfileInputError::SplineCurve => ChainError::Spline,
-            other => ChainError::Curve(other),
-        })?);
+        pieces.push(match curve {
+            PlanarCurve2::Bspline {
+                degree,
+                control_points,
+                knots,
+                weights,
+            } => {
+                let spline =
+                    spline_from_protocol(*degree, control_points, knots, weights.as_deref())
+                        .map_err(ChainError::Bspline)?;
+                let (start, end) = spline.domain();
+                let length = spline.length(start, end);
+                if !length.is_finite() {
+                    return Err(ChainError::Bspline(SplineError::NonFinite));
+                }
+                if length <= minimum {
+                    return Err(ChainError::Curve(PlanarProfileInputError::Extrusion(
+                        crate::extrusion::ExtrusionInputError::FeatureTooSmall,
+                    )));
+                }
+                ProfilePiece::Spline(spline)
+            }
+            other => {
+                ProfilePiece::Segment(parse_curve(other, minimum, agreement).map_err(|reason| {
+                    match reason {
+                        PlanarProfileInputError::SplineCurve => ChainError::Spline,
+                        other => ChainError::Curve(other),
+                    }
+                })?)
+            }
+        });
     }
-    for pair in segments.windows(2) {
+    for pair in pieces.windows(2) {
         if pair[0].end() != pair[1].start() {
             return Err(ChainError::Disconnected);
         }
     }
-    let count = segments.len();
-    let closed = count >= 2 && segments[count - 1].end() == segments[0].start();
+    let count = pieces.len();
+    let closed = count >= 2 && pieces[count - 1].end() == pieces[0].start();
+    // Lines and arcs are held apart from one another as a profile's are; a
+    // spline's clearance is not judged here, so a chain with one may cross
+    // itself, and the sheet with it.
     for first in 0..count {
         for second in first + 1..count {
+            let (ProfilePiece::Segment(a), ProfilePiece::Segment(b)) =
+                (pieces[first], pieces[second])
+            else {
+                continue;
+            };
             let consecutive = second == first + 1;
             let wraps = closed && first == 0 && second + 1 == count;
             let invalid_contact = if consecutive || wraps {
-                let mut allowed = vec![if consecutive {
-                    segments[first].end()
-                } else {
-                    segments[first].start()
-                }];
+                let mut allowed = vec![if consecutive { a.end() } else { a.start() }];
                 if closed && count == 2 {
-                    allowed.push(segments[first].start());
+                    allowed.push(a.start());
                 }
-                adjacent_has_extra_contact(segments[first], segments[second], &allowed, agreement)
+                adjacent_has_extra_contact(a, b, &allowed, agreement)
             } else {
-                segment_clearance(segments[first], segments[second]) <= minimum
+                segment_clearance(a, b) <= minimum
             };
             if invalid_contact {
                 return Err(ChainError::SelfIntersects);
             }
         }
     }
-    if segments
-        .iter()
-        .any(|segment| !segment.length().is_finite())
-    {
+    if pieces.iter().any(|piece| match piece {
+        ProfilePiece::Segment(segment) => !segment.length().is_finite(),
+        ProfilePiece::Spline(_) => false,
+    }) {
         return Err(ChainError::Curve(PlanarProfileInputError::Extrusion(
             crate::extrusion::ExtrusionInputError::NumericallyIndeterminate,
         )));
     }
-    Ok(Chain { segments, closed })
+    Ok(Chain { pieces, closed })
 }
 
-/// The walls a chain sweeps along the frame's normal: one plane per line
-/// and one cylinder per arc, sharing their generators, in one open shell.
+/// A spline piece as a space curve at `height` along the frame's normal:
+/// its control points carried through the frame, as its vertices are, so
+/// the two agree to the bit.
+fn lifted(curve: SplineCurve2, frame: Frame, height: f64) -> Option<SplineCurve3> {
+    curve.mapped(|point| array3(frame.point(point2(point), height)))
+}
+
+/// The walls a chain sweeps along the frame's normal: one plane per line,
+/// one cylinder per arc and one B-spline surface per spline, sharing their
+/// generators, in one open shell.
 pub(crate) fn build_surface_extrusion(frame: Frame, chain: &Chain, distance: f64) -> Topology {
     let mut topology = Topology::default();
     let mut next_id = 1_u64;
-    let count = chain.segments.len();
+    let count = chain.pieces.len();
     let vertex_count = if chain.closed { count } else { count + 1 };
     let station = |index: usize| -> Point2 {
         if index < count {
-            chain.segments[index].start()
+            chain.pieces[index].start()
         } else {
-            chain.segments[count - 1].end()
+            chain.pieces[count - 1].end()
         }
     };
     let bottom: Vec<_> = (0..vertex_count)
-        .map(|index| push_vertex(&mut topology, &mut next_id, frame.point(station(index), 0.0)))
+        .map(|index| {
+            push_vertex(
+                &mut topology,
+                &mut next_id,
+                frame.point(station(index), 0.0),
+            )
+        })
         .collect();
     let top: Vec<_> = (0..vertex_count)
         .map(|index| {
@@ -239,36 +310,66 @@ pub(crate) fn build_surface_extrusion(frame: Frame, chain: &Chain, distance: f64
             index + 1
         }
     };
-    let bottom_edges: Vec<_> = chain
-        .segments
+    // The swept curves of every spline piece, at the frame and at the far
+    // end.
+    let lifts: Vec<Option<(SplineCurve3, SplineCurve3)>> = chain
+        .pieces
         .iter()
-        .enumerate()
-        .map(|(index, segment)| {
-            push_boundary_edge(
-                &mut topology,
-                &mut next_id,
-                [bottom[index], bottom[next(index)]],
-                *segment,
-                frame,
-                0.0,
-            )
+        .map(|piece| match piece {
+            ProfilePiece::Spline(curve) => Some((
+                lifted(*curve, frame, 0.0)?,
+                lifted(*curve, frame, distance)?,
+            )),
+            ProfilePiece::Segment(_) => None,
         })
         .collect();
-    let top_edges: Vec<_> = chain
-        .segments
-        .iter()
-        .enumerate()
-        .map(|(index, segment)| {
-            push_boundary_edge(
-                &mut topology,
-                &mut next_id,
-                [top[index], top[next(index)]],
-                *segment,
-                frame,
-                distance,
-            )
-        })
-        .collect();
+    let mut edges_at = |vertices: &[crate::topology::VertexKey], height: f64, top: bool| {
+        chain
+            .pieces
+            .iter()
+            .enumerate()
+            .map(|(index, piece)| {
+                let ends = [vertices[index], vertices[next(index)]];
+                match (piece, lifts[index]) {
+                    (ProfilePiece::Spline(curve), Some((low, high))) => {
+                        let (start, end) = curve.domain();
+                        push_edge(
+                            &mut topology,
+                            &mut next_id,
+                            Edge {
+                                vertices: ends,
+                                curve: Curve3::Bspline {
+                                    curve: if top { high } else { low },
+                                },
+                                parameter_range: ParameterRange::new(start, end),
+                            },
+                        )
+                    }
+                    (ProfilePiece::Segment(segment), _) => push_boundary_edge(
+                        &mut topology,
+                        &mut next_id,
+                        ends,
+                        *segment,
+                        frame,
+                        height,
+                    ),
+                    // A spline that did not lift was refused as non-finite
+                    // before it got here; the chord keeps the loop closed
+                    // and the validator names the fault.
+                    (ProfilePiece::Spline(_), None) => push_edge(
+                        &mut topology,
+                        &mut next_id,
+                        Edge::line(
+                            ends,
+                            [piece.start(), piece.end()].map(|point| frame.point(point, height)),
+                        ),
+                    ),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let bottom_edges = edges_at(&bottom, 0.0, false);
+    let top_edges = edges_at(&top, distance, true);
     let vertical: Vec<_> = (0..vertex_count)
         .map(|index| {
             let start = topology.vertices[bottom[index].0].value.point;
@@ -280,23 +381,81 @@ pub(crate) fn build_surface_extrusion(frame: Frame, chain: &Chain, distance: f64
             )
         })
         .collect();
-    for (index, segment) in chain.segments.iter().enumerate() {
-        push_side_face(
-            &mut topology,
-            &mut next_id,
-            (frame, distance),
-            *segment,
-            [
-                bottom_edges[index],
-                vertical[next(index)],
-                top_edges[index],
-                vertical[index],
-            ],
-            FaceRole::ExtrusionSide(index as u32),
-        );
+    for (index, piece) in chain.pieces.iter().enumerate() {
+        let edges = [
+            bottom_edges[index],
+            vertical[next(index)],
+            top_edges[index],
+            vertical[index],
+        ];
+        let role = FaceRole::ExtrusionSide(index as u32);
+        match (piece, lifts[index]) {
+            (ProfilePiece::Segment(segment), _) => push_side_face(
+                &mut topology,
+                &mut next_id,
+                (frame, distance),
+                *segment,
+                edges,
+                role,
+            ),
+            (ProfilePiece::Spline(curve), Some((low, high))) => {
+                push_spline_wall(&mut topology, &mut next_id, *curve, low, high, edges, role);
+            }
+            (ProfilePiece::Spline(_), None) => {}
+        }
     }
     push_shell(&mut topology, &mut next_id);
     topology
+}
+
+/// The wall a spline sweeps: the B-spline surface of degree `p` by one
+/// whose rows are the bottom and top edges, walked along the chain and up
+/// the sweep, which is the side the sheet faces.
+fn push_spline_wall(
+    topology: &mut Topology,
+    next_id: &mut u64,
+    curve: SplineCurve2,
+    bottom: SplineCurve3,
+    top: SplineCurve3,
+    edges: [EdgeKey; 4],
+    role: FaceRole,
+) {
+    let Some(surface) = SplineSurface::ruled(bottom, top) else {
+        return;
+    };
+    let (start, end) = curve.domain();
+    let corners = [
+        Point2::new(start, 0.0),
+        Point2::new(end, 0.0),
+        Point2::new(end, 1.0),
+        Point2::new(start, 1.0),
+    ];
+    let loop_key = push_loop(
+        topology,
+        next_id,
+        [
+            (edges[0], Orientation::Forward, [corners[0], corners[1]]),
+            (edges[1], Orientation::Forward, [corners[1], corners[2]]),
+            (edges[2], Orientation::Reverse, [corners[2], corners[3]]),
+            (edges[3], Orientation::Reverse, [corners[3], corners[0]]),
+        ]
+        .into_iter()
+        .map(|(edge, orientation, points)| BoundaryUse {
+            edge,
+            orientation,
+            curve: Curve2::line_segment(points),
+        })
+        .collect(),
+    );
+    topology.faces.push(Record {
+        id: allocate_id(next_id),
+        value: Face {
+            surface: Surface::Bspline(surface),
+            outer_loop: loop_key,
+            inner_loops: Vec::new(),
+            role,
+        },
+    });
 }
 
 /// One planar face per region: the cap a profile extrusion would have had
@@ -430,6 +589,7 @@ impl RevolveChainError {
 fn section_from_chain(
     frame: Frame,
     chain: &Chain,
+    segments: &[Segment],
     axis: PlanarAxis2,
     angle: RevolveAngle,
     precision: PrecisionPolicy,
@@ -458,8 +618,7 @@ fn section_from_chain(
     let mut along = Point2::new(span.x / length, span.y / length);
     let mut radial = Point2::new(along.y, -along.x);
     let distance = |left: Point2, right: Point2| (left.x - right.x).hypot(left.y - right.y);
-    let reach = chain
-        .segments
+    let reach = segments
         .iter()
         .map(|segment| {
             let ends = distance(segment.start(), origin).max(distance(segment.end(), origin));
@@ -479,8 +638,7 @@ fn section_from_chain(
     let radius_of = |point: Point2, radial: Point2| {
         (point.x - origin.x).mul_add(radial.x, (point.y - origin.y) * radial.y)
     };
-    let extent = chain
-        .segments
+    let extent = segments
         .iter()
         .flat_map(|segment| [segment.start(), segment.end()])
         .fold(1.0_f64, |extent, point| {
@@ -489,8 +647,7 @@ fn section_from_chain(
     let on_axis = precision.linear_agreement.max(1.0e-12) * extent;
     let side = |radial: Point2| {
         let toward = radial.y.atan2(radial.x);
-        chain
-            .segments
+        segments
             .iter()
             .flat_map(|segment| {
                 let bulges = match *segment {
@@ -544,8 +701,8 @@ fn section_from_chain(
         )
     };
     let phase = radial.y.atan2(radial.x);
-    let mut section = Vec::with_capacity(chain.segments.len());
-    for segment in &chain.segments {
+    let mut section = Vec::with_capacity(segments.len());
+    for segment in segments {
         let start = to_section(segment.start());
         let end = to_section(segment.end());
         section.push(match *segment {
@@ -703,8 +860,8 @@ pub(crate) fn execute_surface_extrude(
     let chain = parse_chain(chain, precision)
         .map_err(|reason| reason.refuse(input.id, "A surface extrusion"))?;
     let limit = precision.max_abs_coordinate;
-    let out_of_range = chain.segments.iter().any(|segment| {
-        [segment.start(), segment.end()]
+    let out_of_range = chain.pieces.iter().any(|piece| {
+        [piece.start(), piece.end()]
             .into_iter()
             .flat_map(|point| {
                 let low = frame.point(point, 0.0);
@@ -787,9 +944,12 @@ pub(crate) fn execute_surface_revolve(
     require_empty(input)?;
     let precision = request.precision;
     let frame = frame_of(input.id, frame, precision)?;
-    let chain =
-        parse_chain(chain, precision).map_err(|reason| reason.refuse(input.id, "A surface revolve"))?;
-    let (section, sweep) = section_from_chain(frame, &chain, axis, angle, precision)
+    let chain = parse_chain(chain, precision)
+        .map_err(|reason| reason.refuse(input.id, "A surface revolve"))?;
+    let segments = chain
+        .segments()
+        .ok_or_else(|| ChainError::Spline.refuse(input.id, "A surface revolve"))?;
+    let (section, sweep) = section_from_chain(frame, &chain, &segments, axis, angle, precision)
         .map_err(|reason| reason.refuse(input.id))?;
     let topology = build_turned_sheet(&section, sweep);
     sheet::commit(

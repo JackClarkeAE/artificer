@@ -389,6 +389,28 @@ The target is a sheet body as a first-class object, with trim, extend,
 stitch and thicken (M10's shell for arbitrary bodies falls out of the
 last), and free-form editing behind it.
 
+**Status (2026-09-24):** S1 landed, with S3, the first slice of S2 and
+S4 beside it. `ValidationProfile::Sheet`, sheet measures, boundary edges
+in the report (`boundary_edge[n]`), display and STEP export (`OPEN_SHELL`
+under `SHELL_BASED_SURFACE_MODEL`); `SurfaceExtrude` of an open or closed
+chain of lines, arcs and splines (B-spline walls, exact), `SurfaceRevolve`
+of lines and arcs, `PlanarPatch`; `stitch_sheets` welding within the
+agreement and closing into a solid, gaps refused with their measure
+(`STITCH_GAP_EXCEEDS_TOLERANCE`); `ThickenSheet` exact for planes,
+cylinders, cones, spheres and tori with planar, cylindrical and conical
+walls (`thicken/exact`), and approximate for B-spline faces — the
+B-spline surface through the true offset sampled at the Greville
+abscissae of a net refined until within the approximation budget,
+labelled `thicken/approximate` and `Tier::Approximate` with the measured
+deviation in `SURFACE_OFFSET_APPROXIMATION` — creases and ruled
+faces refused; `TrimSheetByPlane` on planes and cylinders at any attitude
+and on cones, spheres and tori square to or through the axis. Scripts
+reach them as `surface_extrude`, `surface_revolve`, `patch`, `stitch`,
+`thicken` and `trim`. Not yet: surface loft and sweep, a revolved spline
+sheet, an offset of a ruled face, a trim of a B-spline sheet, a trim by
+another sheet or a sketch curve, extend and untrim, the workbench's
+Surfaces group. Gates: `crates/kernel/tests/surface_frontier.rs`.
+
 ### S1. Sheet bodies
 
 - `Topology` already carries shells; a sheet is a solid-less open shell.

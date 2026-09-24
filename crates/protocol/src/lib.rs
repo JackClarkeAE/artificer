@@ -2181,17 +2181,17 @@ impl Tier {
 
 impl OperationReport {
     /// Exact unless the faceted tier reported its approximation warning,
-    /// which every approximate rung attaches.
+    /// which every approximate rung attaches, or a surface was offset by
+    /// approximation (`SURFACE_OFFSET_APPROXIMATION`, ADR 0056).
     #[must_use]
     pub fn tier(&self) -> Tier {
-        let approximate = self
-            .warnings
-            .iter()
-            .any(|warning| warning.code.as_str().ends_with("_FACETED_APPROXIMATION"))
-            || self
-                .rung
-                .as_deref()
-                .is_some_and(|rung| rung.ends_with("/faceted"));
+        let approximate = self.warnings.iter().any(|warning| {
+            let code = warning.code.as_str();
+            code.ends_with("_FACETED_APPROXIMATION") || code.ends_with("_OFFSET_APPROXIMATION")
+        }) || self
+            .rung
+            .as_deref()
+            .is_some_and(|rung| rung.ends_with("/faceted") || rung.ends_with("/approximate"));
         if approximate {
             Tier::Approximate
         } else {

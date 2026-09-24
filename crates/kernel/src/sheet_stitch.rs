@@ -35,7 +35,9 @@ use crate::sheet_sew::{assign_shells, face_components};
 use crate::topology::{
     CoedgeKey, EdgeKey, EntityId, Point3, Record, Shell, ShellKey, Solid, Topology, VertexKey,
 };
-use crate::{CancellationToken, ExecutionOutcome, NativeKernel, Snapshot, error, simple_diagnostic};
+use crate::{
+    CancellationToken, ExecutionOutcome, NativeKernel, Snapshot, error, simple_diagnostic,
+};
 
 /// Why a stitch was refused.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,7 +60,10 @@ pub(crate) struct Stitched {
 }
 
 /// Stitches sheets within the precision policy's agreement.
-pub(crate) fn stitch(sheets: Vec<Topology>, precision: PrecisionPolicy) -> Result<Stitched, StitchError> {
+pub(crate) fn stitch(
+    sheets: Vec<Topology>,
+    precision: PrecisionPolicy,
+) -> Result<Stitched, StitchError> {
     let merged = merge_topologies(sheets);
     let scale = merged
         .vertices
@@ -274,7 +279,11 @@ fn orient_consistently(topology: &mut Topology) -> Result<(), StitchError> {
 /// Makes every closed component a solid facing outward.
 fn close_into_solids(topology: &mut Topology, next_id: &mut u64) -> Result<(), StitchError> {
     let components = face_components(topology);
-    let count = components.iter().copied().max().map_or(0, |label| label + 1);
+    let count = components
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, |label| label + 1);
     let mut solids = Vec::with_capacity(count);
     for (shell_index, shell) in topology.shells.clone().iter().enumerate() {
         let encloses = |topology: &Topology| {

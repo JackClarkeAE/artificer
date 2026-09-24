@@ -357,8 +357,12 @@ fn divider(
             }
         }
         Surface::Cylinder(cylinder) => {
-            let (na, m, phi, constant) =
-                revolved(cylinder.origin, cylinder.axis, cylinder.radial_u, cylinder.radial_v);
+            let (na, m, phi, constant) = revolved(
+                cylinder.origin,
+                cylinder.axis,
+                cylinder.radial_u,
+                cylinder.radial_v,
+            );
             if na.abs() <= angular {
                 // Parallel to the axis: two generators.
                 let k = -constant / (cylinder.radius * m);
@@ -532,10 +536,7 @@ fn tool_regions(surface: Surface, cut: &Cut, divider: &Divider, window: [f64; 4]
                 }
                 if (sp < 0.0 && sq > 0.0) || (sp > 0.0 && sq < 0.0) {
                     let t = sp / (sp - sq);
-                    polygon.push(Point2::new(
-                        p.x + (q.x - p.x) * t,
-                        p.y + (q.y - p.y) * t,
-                    ));
+                    polygon.push(Point2::new(p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t));
                 }
             }
             if polygon.len() < 3 {

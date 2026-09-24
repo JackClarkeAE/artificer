@@ -96,9 +96,15 @@ are stable, slash-separated paths:
 | `shell/open-revolve`, `shell/closed-revolve` | A shell of a solid of revolution, offset in its own section; a partial turn's core also loses a prism along the axis that keeps one wall along each closed wedge face. |
 | `shell/faceted` | A shell whose pocket, or whose partial turn's core, the exact rungs could not cut; a partial cone's wedge wall meets its conical core in a hyperbola. A cut core carries `SHELL_FACETED_APPROXIMATION` and the reason, `SHELL_EXACT_ROUTE_DECLINED`. |
 | `transform/similarity` | A rigid transform. |
+| `surface/extrude`, `surface/revolve`, `surface/patch` | A sheet body (ADR 0056, Track S): the walls a chain sweeps along a normal, the bands it sweeps about an axis, or a profile's planar face, each on the carriers the solid builders write and with no caps. |
+| `stitch/sheet`, `stitch/solid` | Sheets welded along their boundaries within the model's agreement: a sheet while any boundary edge is left, a solid once every one pairs. |
+| `thicken/exact` | A sheet made into a solid between it and its offset: planes, cylinders, cones, spheres and tori offset as carriers of the same class, with planar, cylindrical and conical walls along the boundary. |
+| `thicken/approximate` | A sheet with a B-spline face thickened: the face's offset is the B-spline surface through the true offset sampled at the Greville abscissae of the face's refined net, not the exact offset. Carries `SURFACE_OFFSET_APPROXIMATION` with the measured deviation against the approximation budget. |
+| `trim/plane` | A sheet cut by a plane: the section imprinted on every face in its own parameter space and the faces split by the exact profile Boolean. |
 
-A rung ending in `/faceted` is the approximate tier; the step also carries
-a `*_FACETED_APPROXIMATION` warning. Everything else is exact: the body's
+A rung ending in `/faceted` or `/approximate` is the approximate tier;
+the step also carries a `*_FACETED_APPROXIMATION` or
+`*_OFFSET_APPROXIMATION` warning. Everything else is exact: the body's
 faces are analytic carriers, its volume is a closed-form integral, and its
 digest is a function of that geometry alone.
 
@@ -354,6 +360,96 @@ surface vocabulary rather than of the offset. `SHELL_OPEN_REVOLVE_UNSUPPORTED`
 says the wall at an open cap could not be taken away, because that case
 alone rests on the Boolean engine's analytic domain; it carries the
 engine's own diagnostic underneath, and the same body shells closed.
+
+### Sheet bodies
+
+A sheet body (ADR 0056, Track S) is a topology with shells and no solid:
+faces on exact carriers, edges shared where faces meet, and a boundary of
+edges used once. `surface_extrude` (of lines, arcs and splines),
+`surface_revolve` (of lines and arcs) and `patch` build
+one; `stitch` welds several; `thicken` makes one a solid; `trim` cuts one
+by a plane (`surface_extrude`, `surface_revolve`, `planar_patch`,
+`thicken_sheet` and `trim_sheet_by_plane` on the kernel wire, and
+`NativeKernel::stitch_sheets`, which takes several snapshots as a Boolean
+takes two).
+
+A sheet validates under the `sheet` profile: every family the solid
+validator runs, with an edge used once admitted as a boundary edge and
+the closed-shell and solid families — the Euler characteristic and the
+positive volume — set aside, since an open shell satisfies neither. Held
+to the `solid` profile the same body fails, on its boundary edges. Its
+measures are its area, summed from the faces' closed forms, and no
+volume; its digest is the topology's as for a solid. Every boundary edge
+is reported under the role `boundary_edge[n]`, in edge order, and the
+viewport draws an edge with one face as a hard edge. STEP export writes a
+sheet as `OPEN_SHELL`s under a `SHELL_BASED_SURFACE_MODEL` in a
+`MANIFOLD_SURFACE_SHAPE_REPRESENTATION`, every face, edge and vertex
+exactly as a solid's; a file with solids and sheets takes the general
+`SHAPE_REPRESENTATION`.
+
+The tests in `crates/kernel/tests/surface_frontier.rs` hold each
+operation to a closed form: a cylinder sheet of radius `r` and height `h`
+has area `2πrh`; a line from `(r₀, z₀)` to `(r₁, z₁)` revolved is a cone
+sheet of area `π(r₀ + r₁)·slant`; six planar patches stitch into a cube
+of volume `1000` that validates as a solid with eight vertices, twelve
+edges and six faces; a cylinder sheet thickened by `t` outward is a tube
+of volume `π((r + t)² − r²)h`, inward `π(r² − (r − t)²)h`; a sphere sheet
+thickened is a hollow ball of volume `4/3·π((R + t)³ − R³)` with two
+shells; a cone sheet thickened is the section between the line and its
+offset turned, by Pappus; a cylinder sheet trimmed by a plane square to
+its axis at `z = c` keeps `2πr(h − c)`, and by the plane `x + z = 10`
+through its middle keeps half its area, since the kept height
+`10 + 10·cos θ` averages the half height; a sphere sheet trimmed at
+`z = c` keeps Archimedes' zone `2πR(R − c)`; a square patch trimmed by
+`x + y ≥ 10` keeps the triangle of area `50`; the quadratic Bézier arch
+from `(0, 0)` over `(5, 10)` to `(10, 0)` extruded `20` is a B-spline sheet
+of area `20·(5√5 + 5/2·asinh 2)`, its length in closed form.
+
+A B-spline face has no exact offset, and `thicken` says so rather than
+pretend. It offsets the face by the B-spline surface on the face's own
+basis that interpolates the true offset — the surface moved along its
+unit normal — at the Greville abscissae of its net, rows along `u` then
+columns along `v`, each a banded solve; on a net refined by halving its
+knot spans in the direction the normal turns more across a span, until
+the offset lies within the approximation budget of the true offset or
+the net has grown to the most this release allows. The deviation is
+measured on a grid over every span cell and reported: the step takes the
+rung `thicken/approximate`, the tier is approximate, and the
+`SURFACE_OFFSET_APPROXIMATION` warning carries the deviation as its
+measurement against the budget. The face is carried on the refined net
+from then on and its spline edges become the net's own rows, the same
+curves on the same knots, so every edge is the curve its faces hold along
+it to the bit, as the validator asks of a spline (ADR 0050); the edges
+offset to the offset's own rows, and the walls along them are the
+B-spline surfaces ruled between each edge and its offset. The test holds the arch thickened by `d = 1` to the band area
+`d·L ± d²·θ/2` (`θ = 2·atan 2` the arch's turning, minus toward the
+centre of curvature) times the height, within twice the reported
+deviation times the sheet's area, which is what a deviation of that size
+can move the volume by; and holds the two thickenings, toward and away,
+to `2·d·L·h` together.
+
+Refusals are by name and measured where there is a measure. A stitch
+whose boundary edges line up — the same length within a twentieth, ends
+within a tenth of that length — but do not meet within the model's
+agreement is `STITCH_GAP_EXCEEDS_TOLERANCE`, with the gap as the
+diagnostic's measurement against the agreement it had to meet; the cube
+with its top lifted by `0.01` refuses with a gap of `0.01`. Nothing is
+moved to close a gap: the agreement is what the validator holds every
+edge and pcurve to, and a wider weld would only publish a body it
+refuses. Sheets that cannot be turned to agree on a side are
+`STITCH_ORIENTATION_CONFLICT`. `thicken` refuses a ruled face
+(`THICKEN_FACE_UNSUPPORTED`), faces meeting at a crease, whose offsets
+part (`THICKEN_CREASE_UNSUPPORTED`), a thickness that collapses a curved
+face (`THICKEN_OFFSET_DEGENERATE`) and a boundary edge whose wall would
+be a surface it does not build (`THICKEN_EDGE_UNSUPPORTED`). `trim`
+imprints a plane on a plane or a cylinder at any attitude and on a cone,
+a sphere or a torus square to the axis or through it; an oblique section
+of those three is a curve the kernel has no exact name for and is
+`TRIM_SECTION_UNSUPPORTED`; a section that grazes a face's boundary
+within the minimum feature size is `TRIM_SECTION_INDETERMINATE`; a cut
+that leaves nothing is `TRIM_RESULT_EMPTY`. A solid operation given a
+sheet is `SHEET_UNSUPPORTED_HERE`, never a panic; a sheet operation given
+a solid is `SHEET_INPUT_REQUIRED`.
 
 ## 8. Interference studies
 

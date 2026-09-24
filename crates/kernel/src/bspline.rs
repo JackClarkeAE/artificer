@@ -1144,7 +1144,7 @@ pub(crate) fn interpolation_knots(parameters: &[f64], degree: usize) -> Vec<f64>
 /// `parameters`. The ends are the ends of the data exactly — a clamped curve
 /// starts on its first control point — and the interior is one linear solve,
 /// by Gaussian elimination with partial pivoting in a fixed order.
-fn interpolate<const D: usize>(
+pub(crate) fn interpolate<const D: usize>(
     degree: usize,
     knots: &[f64],
     parameters: &[f64],

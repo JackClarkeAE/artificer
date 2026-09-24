@@ -14,8 +14,8 @@ use crate::analytic_boolean::CylinderSectionHarmonic;
 use crate::analytic_extrusion::{Segment, allocate_id};
 use crate::topology::{
     Coedge, CoedgeKey, Curve2, Curve3, Edge, EdgeKey, Face, FaceKey, FaceRole, Loop, LoopKey,
-    Orientation, ParameterRange, Point2, Point3, Record, Shell, Surface, Topology, Vector2,
-    Vertex, VertexKey,
+    Orientation, ParameterRange, Point2, Point3, Record, Shell, Surface, Topology, Vector2, Vertex,
+    VertexKey,
 };
 
 /// One face piece awaiting sewing: a carrier and its boundary loops in the
@@ -189,7 +189,11 @@ pub(crate) fn sew_pieces(
 /// of its faces, in the order the components' first faces come.
 pub(crate) fn assign_shells(topology: &mut Topology, next_id: &mut u64) {
     let components = face_components(topology);
-    let count = components.iter().copied().max().map_or(0, |label| label + 1);
+    let count = components
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, |label| label + 1);
     topology.shells = (0..count)
         .map(|label| Record {
             id: allocate_id(next_id),
@@ -250,7 +254,10 @@ pub(crate) fn face_components(topology: &Topology) -> Vec<usize> {
 
 /// The 3D curve one boundary segment carries on a carrier, over the
 /// parameter the segment's pcurve maps onto it.
-pub(crate) fn segment_curve(surface: Surface, segment: Segment) -> Option<(Curve3, ParameterRange)> {
+pub(crate) fn segment_curve(
+    surface: Surface,
+    segment: Segment,
+) -> Option<(Curve3, ParameterRange)> {
     const STRAIGHT: f64 = 1.0e-12;
     let vertical = |start: Point2, end: Point2| (start.x - end.x).abs() <= STRAIGHT;
     let horizontal = |start: Point2, end: Point2| (start.y - end.y).abs() <= STRAIGHT;
@@ -389,10 +396,7 @@ pub(crate) fn segment_curve(surface: Surface, segment: Segment) -> Option<(Curve
                         v: sphere.radial_v,
                         radius,
                     },
-                    ParameterRange::new(
-                        sphere.angular_sign * start.x,
-                        sphere.angular_sign * end.x,
-                    ),
+                    ParameterRange::new(sphere.angular_sign * start.x, sphere.angular_sign * end.x),
                 ))
             } else if vertical(start, end) {
                 let angle = sphere.angular_sign * start.x;

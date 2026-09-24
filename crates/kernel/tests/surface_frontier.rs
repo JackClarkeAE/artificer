@@ -9,9 +9,9 @@ use std::f64::consts::PI;
 use artificer_kernel::api::session::Session;
 use artificer_kernel::{CancellationToken, ExecutionOutcome, NativeKernel, Snapshot};
 use artificer_protocol::{
-    ArcDirection, CURRENT_PROTOCOL_VERSION, EntityKind, ExecuteRequest, KernelCommand,
-    KernelError, PlanarAxis2, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2,
-    PlanarRegion2, Point2, Point3, PrecisionPolicy, RequestId, RevolveAngle, StitchRequest,
+    ArcDirection, CURRENT_PROTOCOL_VERSION, EntityKind, ExecuteRequest, KernelCommand, KernelError,
+    PlanarAxis2, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2,
+    Point3, PrecisionPolicy, QuantityKind, RequestId, RevolveAngle, StitchRequest, Tier,
     ValidationProfile, Vector3,
 };
 
@@ -87,6 +87,33 @@ fn circle(radius: f64) -> Vec<PlanarCurve2> {
         radius,
         direction: ArcDirection::CounterClockwise,
     }]
+}
+
+/// The quadratic Bézier arch from `(0, 0)` over `(5, 10)` to `(10, 0)`: a
+/// parabola with its apex at `(5, 5)`, whose length and total turning have
+/// closed forms (see [`arch_length`] and [`arch_turning`]).
+fn arch() -> PlanarCurve2 {
+    PlanarCurve2::Bspline {
+        degree: 2,
+        control_points: vec![
+            Point2::new(0.0, 0.0),
+            Point2::new(5.0, 10.0),
+            Point2::new(10.0, 0.0),
+        ],
+        knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        weights: None,
+    }
+}
+
+/// The arch's speed is `10·√(1 + 4(1 − 2t)²)`, so its length is
+/// `5·∫₀² √(1 + s²) ds = 5√5 + (5/2)·asinh 2`.
+fn arch_length() -> f64 {
+    5.0 * 5.0_f64.sqrt() + 2.5 * 2.0_f64.asinh()
+}
+
+/// The arch's tangent turns from `(1, 2)` to `(1, −2)`: through `2·atan 2`.
+fn arch_turning() -> f64 {
+    2.0 * 2.0_f64.atan()
 }
 
 fn polygon(points: &[(f64, f64)]) -> PlanarProfile2 {
@@ -243,6 +270,41 @@ fn a_surface_extrusion_by_a_negative_distance_sweeps_the_other_way() {
 }
 
 #[test]
+fn a_surface_extrusion_of_a_spline_is_a_bspline_sheet_with_area_length_times_height() {
+    let height = 20.0;
+    let sheet = build(KernelCommand::SurfaceExtrude {
+        frame: xy(),
+        chain: vec![arch()],
+        distance: height,
+    });
+    assert_sheet(&sheet);
+    assert_eq!(sheet.snapshot.counts().faces, 1);
+    assert_eq!(boundary_edges(&sheet), 4);
+    assert_close(
+        sheet.snapshot.measures().surface_area,
+        arch_length() * height,
+        "spline sheet area",
+    );
+    assert_eq!(sheet.report.rung.as_deref(), Some("surface/extrude"));
+    assert_eq!(sheet.report.tier(), Tier::Exact);
+    // A spline piece chains with lines like any other.
+    let closed = build(KernelCommand::SurfaceExtrude {
+        frame: xy(),
+        chain: vec![arch(), line((10.0, 0.0), (0.0, 0.0))],
+        distance: height,
+    });
+    assert_sheet(&closed);
+    assert_eq!(closed.snapshot.counts().faces, 2);
+    // Two bottom edges and two top edges; the two generators are shared.
+    assert_eq!(boundary_edges(&closed), 4);
+    assert_close(
+        closed.snapshot.measures().surface_area,
+        (arch_length() + 10.0) * height,
+        "closed spline chain area",
+    );
+}
+
+#[test]
 fn a_surface_revolve_of_a_slanted_line_is_a_cone_sheet_with_the_slant_area() {
     let (r0, z0, r1, z1) = (5.0, 0.0, 10.0, 8.0);
     let sheet = build(KernelCommand::SurfaceRevolve {
@@ -347,7 +409,10 @@ fn a_disconnected_chain_is_refused_by_name() {
         &NativeKernel::empty(),
         KernelCommand::SurfaceExtrude {
             frame: xy(),
-            chain: vec![line((0.0, 0.0), (10.0, 0.0)), line((11.0, 0.0), (11.0, 5.0))],
+            chain: vec![
+                line((0.0, 0.0), (10.0, 0.0)),
+                line((11.0, 0.0), (11.0, 5.0)),
+            ],
             distance: 3.0,
         },
     )
@@ -412,7 +477,11 @@ fn a_thicken_or_trim_of_a_solid_is_refused_by_name() {
         size_y: 10.0,
         size_z: 10.0,
     });
-    let error = execute(&solid.snapshot, KernelCommand::ThickenSheet { thickness: 1.0 }).unwrap_err();
+    let error = execute(
+        &solid.snapshot,
+        KernelCommand::ThickenSheet { thickness: 1.0 },
+    )
+    .unwrap_err();
     assert_eq!(code_of(&error), vec!["SHEET_INPUT_REQUIRED"]);
 }
 
@@ -445,6 +514,56 @@ fn a_moved_sheet_is_still_a_sheet() {
     )
     .unwrap_or_else(|error| panic!("{error:?}"));
     assert_sheet(&mirrored);
+}
+
+#[test]
+fn a_sheets_boundary_edges_are_drawn_as_hard_edges() {
+    let sheet = cylinder_sheet(10.0, 20.0);
+    let scene = NativeKernel::debug_scene(&sheet.snapshot);
+    let boundary: Vec<_> = scene
+        .edges
+        .iter()
+        .filter(|edge| edge.incident_faces[1].is_none())
+        .collect();
+    // Four rim arcs on the boundary, drawn as creases; the two seams
+    // between the halves are smooth.
+    let mut boundary_edges: Vec<_> = boundary.iter().map(|edge| edge.source_edge).collect();
+    boundary_edges.sort_unstable();
+    boundary_edges.dedup();
+    assert_eq!(boundary_edges.len(), 4);
+    assert!(
+        boundary
+            .iter()
+            .all(|edge| !edge.is_smooth && !edge.is_tangent)
+    );
+    let seams: Vec<_> = scene
+        .edges
+        .iter()
+        .filter(|edge| edge.incident_faces[1].is_some())
+        .collect();
+    assert!(!seams.is_empty());
+    assert!(seams.iter().all(|edge| edge.is_smooth));
+}
+
+#[test]
+fn a_patterned_sheet_is_a_sheet_of_several_shells() {
+    let sheet = cylinder_sheet(10.0, 20.0);
+    let row = execute(
+        &sheet.snapshot,
+        KernelCommand::LinearPatternSnapshot {
+            direction: Vector3::new(1.0, 0.0, 0.0),
+            spacing: 30.0,
+            count: 3,
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_sheet(&row);
+    assert_eq!(row.snapshot.counts().shells, 3);
+    assert_close(
+        row.snapshot.measures().surface_area,
+        3.0 * 2.0 * PI * 10.0 * 20.0,
+        "three cylinder sheets",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +606,13 @@ fn six_planar_patches_stitch_into_a_closed_cube() {
     assert_close(cube.snapshot.measures().surface_area, 600.0, "cube area");
     let counts = cube.snapshot.counts();
     assert_eq!(
-        (counts.vertices, counts.edges, counts.faces, counts.shells, counts.solids),
+        (
+            counts.vertices,
+            counts.edges,
+            counts.faces,
+            counts.shells,
+            counts.solids
+        ),
         (8, 12, 6, 1, 1)
     );
     assert_eq!(cube.report.rung.as_deref(), Some("stitch/solid"));
@@ -499,7 +624,11 @@ fn three_patches_stitch_into_an_open_sheet() {
     let sheets: Vec<&Snapshot> = patches.iter().take(3).collect();
     let corner = stitch(&sheets).unwrap_or_else(|error| panic!("{error:?}"));
     assert_sheet(&corner);
-    assert_close(corner.snapshot.measures().surface_area, 300.0, "three faces");
+    assert_close(
+        corner.snapshot.measures().surface_area,
+        300.0,
+        "three faces",
+    );
     assert_eq!(corner.snapshot.counts().shells, 1);
     assert_eq!(corner.report.rung.as_deref(), Some("stitch/sheet"));
     // The side shares one edge with the bottom and one with the top; the
@@ -573,8 +702,11 @@ fn a_cylinder_sheet_and_two_disks_stitch_into_a_cylinder() {
 fn a_cylinder_sheet_thickened_outward_is_a_tube() {
     let (radius, height, wall) = (10.0, 20.0, 2.0);
     let sheet = cylinder_sheet(radius, height);
-    let tube = execute(&sheet.snapshot, KernelCommand::ThickenSheet { thickness: wall })
-        .unwrap_or_else(|error| panic!("{error:?}"));
+    let tube = execute(
+        &sheet.snapshot,
+        KernelCommand::ThickenSheet { thickness: wall },
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
     assert_solid(&tube);
     let outer = radius + wall;
     assert_close(
@@ -596,8 +728,11 @@ fn a_cylinder_sheet_thickened_outward_is_a_tube() {
 fn a_cylinder_sheet_thickened_inward_is_a_tube_inside_it() {
     let (radius, height, wall) = (10.0, 20.0, 2.0);
     let sheet = cylinder_sheet(radius, height);
-    let tube = execute(&sheet.snapshot, KernelCommand::ThickenSheet { thickness: -wall })
-        .unwrap_or_else(|error| panic!("{error:?}"));
+    let tube = execute(
+        &sheet.snapshot,
+        KernelCommand::ThickenSheet { thickness: -wall },
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
     assert_solid(&tube);
     let inner = radius - wall;
     assert_close(
@@ -618,8 +753,11 @@ fn a_sphere_sheet_thickened_is_a_hollow_ball() {
         axis: z_axis(),
         angle: RevolveAngle::FullTurn,
     });
-    let ball = execute(&sheet.snapshot, KernelCommand::ThickenSheet { thickness: wall })
-        .unwrap_or_else(|error| panic!("{error:?}"));
+    let ball = execute(
+        &sheet.snapshot,
+        KernelCommand::ThickenSheet { thickness: wall },
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
     assert_solid(&ball);
     let outer = radius + wall;
     assert_close(
@@ -636,13 +774,84 @@ fn a_sphere_sheet_thickened_is_a_hollow_ball() {
 }
 
 #[test]
+fn a_spline_sheet_thickened_is_labelled_approximate_with_its_deviation() {
+    let (height, wall) = (20.0, 1.0);
+    let sheet = build(KernelCommand::SurfaceExtrude {
+        frame: xy(),
+        chain: vec![arch()],
+        distance: height,
+    });
+    let thick = execute(
+        &sheet.snapshot,
+        KernelCommand::ThickenSheet { thickness: wall },
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_solid(&thick);
+    // Never presented as exact: the approximate rung, the tier that follows
+    // from it, and a warning that measures how far the offset strays.
+    assert_eq!(thick.report.rung.as_deref(), Some("thicken/approximate"));
+    assert_eq!(thick.report.tier(), Tier::Approximate);
+    let warning = thick
+        .report
+        .warnings
+        .iter()
+        .find(|warning| warning.code.as_str() == "SURFACE_OFFSET_APPROXIMATION")
+        .expect("the offset approximation is declared");
+    let measurement = warning
+        .measurement
+        .as_ref()
+        .expect("the deviation is measured");
+    assert_eq!(measurement.quantity, QuantityKind::Length);
+    let deviation = measurement.measured;
+    // Refined until the offset is within the approximation budget, the
+    // same budget the faceted tier tessellates to, and said against it.
+    let budget = precision().approximation_budget;
+    assert_eq!(measurement.allowed.max, Some(budget));
+    assert!(
+        deviation > 0.0 && deviation <= budget,
+        "deviation {deviation} against {budget}"
+    );
+    // The band between a plane curve and its offset by `d` has area
+    // `d·L ± d²·θ/2`, `θ` the curve's total turning: plus away from the
+    // centre of curvature, minus toward it. The sheet faces toward it
+    // (below the arch), which the offset's extent shows.
+    let bounds = thick.snapshot.measures().bounds.unwrap();
+    let toward = bounds.max.y < 5.0 + wall / 2.0;
+    let sign = if toward { -1.0 } else { 1.0 };
+    let expected = height * (wall * arch_length() + sign * wall * wall * arch_turning() / 2.0);
+    // The offset strays from the true offset by `deviation` at worst over
+    // the sheet's area, which bounds the volume the approximation moves.
+    let slack = 2.0 * deviation * sheet.snapshot.measures().surface_area;
+    let volume = thick.snapshot.measures().volume;
+    assert!(
+        (volume - expected).abs() <= slack,
+        "thickened spline volume: expected {expected} within {slack}, got {volume}"
+    );
+    // The same band the other way is thicker by the turning, and the two
+    // together are `2·d·L·h` whichever way the sheet faces.
+    let other = execute(
+        &sheet.snapshot,
+        KernelCommand::ThickenSheet { thickness: -wall },
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_solid(&other);
+    assert!(
+        (other.snapshot.measures().volume + volume - 2.0 * height * wall * arch_length()).abs()
+            <= 2.0 * slack
+    );
+}
+
+#[test]
 fn a_planar_patch_thickened_is_a_slab() {
     let patch = build(KernelCommand::PlanarPatch {
         frame: xy(),
         profile: polygon(&[(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]),
     });
-    let slab = execute(&patch.snapshot, KernelCommand::ThickenSheet { thickness: 3.0 })
-        .unwrap_or_else(|error| panic!("{error:?}"));
+    let slab = execute(
+        &patch.snapshot,
+        KernelCommand::ThickenSheet { thickness: 3.0 },
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
     assert_solid(&slab);
     assert_close(slab.snapshot.measures().volume, 180.0, "slab volume");
     assert_close(
@@ -665,8 +874,11 @@ fn a_cone_sheet_thickened_is_a_conical_shell() {
         axis: z_axis(),
         angle: RevolveAngle::FullTurn,
     });
-    let shell = execute(&sheet.snapshot, KernelCommand::ThickenSheet { thickness: wall })
-        .unwrap_or_else(|error| panic!("{error:?}"));
+    let shell = execute(
+        &sheet.snapshot,
+        KernelCommand::ThickenSheet { thickness: wall },
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
     assert_solid(&shell);
     // The section is the quadrilateral between the line and its offset;
     // by Pappus the volume is its area times the path of its centroid.
@@ -692,7 +904,11 @@ fn a_cone_sheet_thickened_is_a_conical_shell() {
     // either way round.
     let volume = 2.0 * PI * moment.abs();
     assert!(area.abs() > 0.0);
-    assert_close(shell.snapshot.measures().volume, volume, "conical shell volume");
+    assert_close(
+        shell.snapshot.measures().volume,
+        volume,
+        "conical shell volume",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +977,11 @@ fn a_planar_patch_trimmed_by_a_plane_keeps_the_polygon_on_the_kept_side() {
     )
     .unwrap_or_else(|error| panic!("{error:?}"));
     assert_sheet(&trimmed);
-    assert_close(trimmed.snapshot.measures().surface_area, 50.0, "half the square");
+    assert_close(
+        trimmed.snapshot.measures().surface_area,
+        50.0,
+        "half the square",
+    );
     assert_eq!(trimmed.snapshot.counts().faces, 1);
     assert_eq!(boundary_edges(&trimmed), 3);
 }
@@ -854,7 +1074,10 @@ fn a_sheet_exports_to_step_as_an_open_shell_surface_model() {
                 .take_while(char::is_ascii_digit)
                 .collect();
             let id: u64 = digits.parse().unwrap();
-            assert!(declared.contains(&id), "#{id} is referenced but not declared");
+            assert!(
+                declared.contains(&id),
+                "#{id} is referenced but not declared"
+            );
             rest = &rest[hash + 1..];
         }
     }
@@ -923,6 +1146,42 @@ fn scripts_stitch_patches_and_revolve_surfaces() {
         "revolved cone sheet",
     );
     assert_eq!(session.snapshot.counts().solids, 0);
+}
+
+#[test]
+fn scripts_thicken_a_spline_sheet_to_the_approximate_tier() {
+    let session = run(
+        "let s = sketch(on: \"XY\", entities: [spline(control_points: [[0, 0], [5, 10], [10, 0]], degree: 2)], label: \"s\");\n\
+         let sheet = surface_extrude(sketch: s, distance: 20, label: \"sheet\");\n\
+         let thick = thicken(thickness: 1, label: \"thick\");\n",
+    );
+    let report = session.report();
+    assert_eq!(report.tier, Tier::Approximate);
+    let steps: Vec<_> = report
+        .steps
+        .iter()
+        .map(|step| (step.rung.clone().unwrap_or_default(), step.tier))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            (String::new(), Tier::Exact),
+            ("surface/extrude".to_owned(), Tier::Exact),
+            ("thicken/approximate".to_owned(), Tier::Approximate),
+        ]
+    );
+    assert!(
+        report.steps[2]
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "SURFACE_OFFSET_APPROXIMATION"),
+        "{:?}",
+        report.steps[2].warnings
+    );
+    assert_eq!(session.snapshot.counts().solids, 1);
+    let body = report.body.as_ref().expect("a body");
+    assert_eq!(body.tier, Tier::Approximate);
+    assert_eq!(body.approximate_feature_count, 1);
 }
 
 #[test]
