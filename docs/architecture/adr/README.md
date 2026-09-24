@@ -67,7 +67,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0054](0054-a-sketch-dimension-can-follow-a-variable.md) | A sketch dimension can follow a variable | Implemented | 0021, 0052, 0053 |
 | [0055](0055-revolve-and-sweep-are-features.md) | Revolve and sweep are features | Accepted (R1–R3, S1–S3 and construction axes implemented) | 0023, 0026, 0041, 0049, 0050, 0051 |
 | [0056](0056-the-general-geometry-programme.md) | The general-geometry programme: Booleans, blends, surfacing, scale, and STEP import | Proposed | 0002, 0025, 0026, 0045, 0047, 0050 |
-| [0057](0057-cam-from-the-history.md) | CAM from the history: automatic toolpaths, tools and an exact stock simulation | Proposed | 0007, 0028, 0053, 0055, 0056 |
+| [0057](0057-cam-from-the-history.md) | CAM from the history: automatic toolpaths, tools and an exact stock simulation | Implemented (turned and 2.5D milled parts) | 0007, 0028, 0053, 0055, 0056 |
 | [0058](0058-a-simulation-tab.md) | A simulation tab: motion, voxel structural analysis, and experiments | Proposed | 0028, 0056 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering

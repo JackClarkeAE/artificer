@@ -1,6 +1,22 @@
 # ADR 0057: CAM from the history — automatic toolpaths, tools and an exact stock simulation
 
-Status: proposed
+Status: implemented for turned parts and 2.5D milled parts — `crates/cam`
+(recognition, turning, milling, the tool library, the post and the
+interpreter, the exact section stock and the heightmap stock), five kernel
+queries in `crates/kernel/src/cam_queries.rs`, and the CAM tab
+(`apps/workbench/src/cam.rs`) with its card, timeline and export. Deviations
+from the text below: (1) the kernel exposes a fifth query,
+`NativeKernel::profile_boolean`, because §2.3's stock update is the planar
+Boolean and it was `pub(crate)`; (2) the lathe finish pass is programmed on
+the theoretical tip point with `G42` asked of the control for the nose
+radius, and simulated as a sharp tip, because a nose radius applied in CAM
+leaves fillets at every sharp inside corner and gate 2 asks for the exact
+section; (3) a flat on a cylinder recognises as `Milled` along the cylinder's
+axis rather than `MillTurn`, since one mill setup reaches it, while a radial
+hole is `MillTurn` and is refused by name at planning; (4) a confirmed plan
+is kept in the tab's state for the session rather than in the document file,
+and mill-turn, arcs in the lathe stock (chorded to 5 µm) and the drill's cone
+in the heightmap are the approximations the card and the report name.
 Date: 2026-09-24
 Extends: [0007](0007-universal-model-operation-confirmation.md) (one pending-operation
 gate), [0028](0028-workbench-command-registry-and-contextual-properties.md) (commands are a table),
